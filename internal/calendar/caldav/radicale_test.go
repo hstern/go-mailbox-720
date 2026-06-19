@@ -159,6 +159,132 @@ func TestRadicaleIntegration(t *testing.T) {
 	}
 }
 
+// TestRadicaleWrite exercises the Writer capability end to end against Radicale:
+// CreateEvent into the seeded collection, confirm ListEvents/GetEvent surface it,
+// UpdateEvent changes its subject and a re-read reflects it, then DeleteEvent
+// removes it and a re-read no longer returns it.
+func TestRadicaleWrite(t *testing.T) {
+	if _, err := exec.LookPath("docker"); err != nil {
+		t.Skip("docker not available")
+	}
+	base := startRadicale(t)
+	seedCalendar(t, base)
+
+	cl, err := Dial(base, radicaleUser, radicalePass, nil)
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	defer func() { _ = cl.Close() }()
+	ctx := context.Background()
+
+	// The adapter must advertise the write capability.
+	w, ok := interface{}(cl).(calendar.Writer)
+	if !ok {
+		t.Fatal("*Client does not implement calendar.Writer")
+	}
+
+	cals, err := cl.ListCalendars(ctx)
+	if err != nil {
+		t.Fatalf("ListCalendars: %v", err)
+	}
+	var work *calendar.Calendar
+	for i := range cals {
+		if cals[i].Name == calendarName {
+			work = &cals[i]
+			break
+		}
+	}
+	if work == nil {
+		t.Fatalf("calendar %q not listed: %+v", calendarName, cals)
+	}
+
+	const createdSubject = "Sprint Review"
+	createStart := time.Date(2026, 7, 1, 14, 0, 0, 0, time.UTC)
+	created, err := w.CreateEvent(ctx, work.ID, calendar.Event{
+		Subject:   createdSubject,
+		Start:     createStart,
+		End:       createStart.Add(time.Hour),
+		Location:  "Room 7",
+		Organizer: calendar.Address{Name: "Alice", Email: "alice@example.com"},
+		Attendees: []calendar.Address{{Email: "bob@example.com"}},
+	})
+	if err != nil {
+		t.Fatalf("CreateEvent: %v", err)
+	}
+	if created.ID == "" {
+		t.Fatal("CreateEvent returned an event with no ID")
+	}
+	if created.UID == "" {
+		t.Fatal("CreateEvent returned an event with no UID")
+	}
+	if created.CalendarID != work.ID {
+		t.Errorf("created.CalendarID = %q, want %q", created.CalendarID, work.ID)
+	}
+
+	// ListEvents must now surface the created event alongside the seeded one.
+	events, err := cl.ListEvents(ctx, work.ID, calendar.Range{})
+	if err != nil {
+		t.Fatalf("ListEvents after create: %v", err)
+	}
+	if findSubject(events, createdSubject) == nil {
+		t.Fatalf("created event %q not in listing: %+v", createdSubject, events)
+	}
+
+	// GetEvent by the returned opaque ID must round-trip subject and start.
+	got, err := cl.GetEvent(ctx, created.ID)
+	if err != nil {
+		t.Fatalf("GetEvent after create: %v", err)
+	}
+	if got.Subject != createdSubject {
+		t.Errorf("GetEvent Subject = %q, want %q", got.Subject, createdSubject)
+	}
+	if !got.Start.Equal(createStart) {
+		t.Errorf("GetEvent Start = %v, want %v", got.Start, createStart)
+	}
+
+	// UpdateEvent changes the subject; the UID and ID are preserved so a re-read
+	// reflects the new subject at the same resource.
+	const updatedSubject = "Sprint Review (rescheduled)"
+	updated := got
+	updated.Subject = updatedSubject
+	if _, err := w.UpdateEvent(ctx, updated); err != nil {
+		t.Fatalf("UpdateEvent: %v", err)
+	}
+	reread, err := cl.GetEvent(ctx, created.ID)
+	if err != nil {
+		t.Fatalf("GetEvent after update: %v", err)
+	}
+	if reread.Subject != updatedSubject {
+		t.Errorf("after update Subject = %q, want %q", reread.Subject, updatedSubject)
+	}
+
+	// DeleteEvent removes the resource; neither GetEvent nor ListEvents should
+	// surface it afterwards.
+	if err := w.DeleteEvent(ctx, created.ID); err != nil {
+		t.Fatalf("DeleteEvent: %v", err)
+	}
+	if _, err := cl.GetEvent(ctx, created.ID); err == nil {
+		t.Error("GetEvent after delete returned no error, want a not-found error")
+	}
+	events, err = cl.ListEvents(ctx, work.ID, calendar.Range{})
+	if err != nil {
+		t.Fatalf("ListEvents after delete: %v", err)
+	}
+	if findSubject(events, updatedSubject) != nil {
+		t.Errorf("deleted event %q still in listing: %+v", updatedSubject, events)
+	}
+}
+
+// findSubject returns the first event with the given subject, or nil.
+func findSubject(events []calendar.Event, subject string) *calendar.Event {
+	for i := range events {
+		if events[i].Subject == subject {
+			return &events[i]
+		}
+	}
+	return nil
+}
+
 // startRadicale runs a Radicale container and returns its host CalDAV base URL
 // (http://127.0.0.1:<port>/). The container is removed via t.Cleanup.
 func startRadicale(t *testing.T) string {

@@ -1,6 +1,7 @@
 package caldav
 
 import (
+	"bytes"
 	"strings"
 	"testing"
 	"time"
@@ -161,6 +162,94 @@ func TestEventFromObjectNilCalendar(t *testing.T) {
 	}
 }
 
+// eventToICal builds the VEVENT the write path PUTs; round-tripping it back
+// through the read-path mapEvent must recover the event's fields, and the
+// encoded form must carry the required structural properties.
+func TestEventToICalRoundTrip(t *testing.T) {
+	want := calendar.Event{
+		UID:       "event-123@example.com",
+		Subject:   "Quarterly Planning",
+		Location:  "Conference Room B",
+		Start:     time.Date(2026, 6, 19, 13, 0, 0, 0, time.UTC),
+		End:       time.Date(2026, 6, 19, 14, 30, 0, 0, time.UTC),
+		Organizer: calendar.Address{Name: "Alice Smith", Email: "alice@example.com"},
+		Attendees: []calendar.Address{
+			{Name: "Bob Jones", Email: "bob@example.com"},
+			{Email: "carol@example.com"},
+		},
+		Body: calendar.Body{ContentType: "text", Content: "Discuss roadmap and OKRs."},
+	}
+
+	cal := eventToICal(want)
+
+	// The encoded object must be a single VEVENT carrying no METHOD (METHOD is
+	// reserved for iTIP scheduling objects, not stored calendar resources) and
+	// CRLF line endings per RFC 5545.
+	var buf strings.Builder
+	if err := ical.NewEncoder(&buf).Encode(cal); err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	out := buf.String()
+	if strings.Contains(out, "METHOD:") {
+		t.Errorf("encoded object carries a METHOD property:\n%s", out)
+	}
+	if !strings.Contains(out, "\r\n") {
+		t.Error("encoded object is not CRLF-terminated")
+	}
+	if !strings.Contains(out, "DTSTAMP:") {
+		t.Error("encoded object missing required DTSTAMP")
+	}
+
+	events := cal.Events()
+	if len(events) != 1 {
+		t.Fatalf("got %d events, want 1", len(events))
+	}
+	got := mapEvent(&events[0])
+
+	if got.Subject != want.Subject {
+		t.Errorf("Subject = %q, want %q", got.Subject, want.Subject)
+	}
+	if got.UID != want.UID {
+		t.Errorf("UID = %q, want %q", got.UID, want.UID)
+	}
+	if got.Location != want.Location {
+		t.Errorf("Location = %q, want %q", got.Location, want.Location)
+	}
+	if !got.Start.Equal(want.Start) {
+		t.Errorf("Start = %v, want %v", got.Start, want.Start)
+	}
+	if !got.End.Equal(want.End) {
+		t.Errorf("End = %v, want %v", got.End, want.End)
+	}
+	if got.Body.Content != want.Body.Content {
+		t.Errorf("Body = %q, want %q", got.Body.Content, want.Body.Content)
+	}
+	if got.Organizer != want.Organizer {
+		t.Errorf("Organizer = %+v, want %+v", got.Organizer, want.Organizer)
+	}
+	if len(got.Attendees) != len(want.Attendees) {
+		t.Fatalf("got %d attendees, want %d", len(got.Attendees), len(want.Attendees))
+	}
+	for i := range want.Attendees {
+		if got.Attendees[i] != want.Attendees[i] {
+			t.Errorf("Attendees[%d] = %+v, want %+v", i, got.Attendees[i], want.Attendees[i])
+		}
+	}
+}
+
+// CreateEvent mints a UID when the input event has none; eventToICal must then
+// still emit a UID (CalDAV resources require one).
+func TestEventToICalMintedUID(t *testing.T) {
+	cal := eventToICal(calendar.Event{UID: newUID(), Subject: "No UID supplied"})
+	events := cal.Events()
+	if len(events) != 1 {
+		t.Fatalf("got %d events, want 1", len(events))
+	}
+	if uid := propText(&events[0], ical.PropUID); uid == "" {
+		t.Error("encoded event has empty UID")
+	}
+}
+
 // A recurring series (override instance listed before the master) must be
 // represented by its master VEVENT, not whichever component appears first.
 func TestEventFromObjectPicksMaster(t *testing.T) {
@@ -189,5 +278,47 @@ END:VCALENDAR
 	}
 	if e.Subject != "Series master" {
 		t.Errorf("Subject = %q, want %q (must pick the master VEVENT, not the override)", e.Subject, "Series master")
+	}
+}
+
+// TestEventObjectNameRejectsUnsafe guards the write-path: a caller-supplied UID
+// must not be able to escape the calendar collection via the object filename.
+func TestEventObjectNameRejectsUnsafe(t *testing.T) {
+	for _, uid := range []string{"../../evil", "a/b", "..", ".", `x\y`, "has\x00null", "line\r\nbreak"} {
+		if _, err := eventObjectName(uid); err == nil {
+			t.Errorf("eventObjectName(%q) = nil, want rejection", uid)
+		}
+	}
+	for _, uid := range []string{"abc123@go-mailbox-720", "simple-uid", "UID.with.dots"} {
+		name, err := eventObjectName(uid)
+		if err != nil {
+			t.Errorf("eventObjectName(%q) = %v, want ok", uid, err)
+		}
+		if name != uid+".ics" {
+			t.Errorf("eventObjectName(%q) = %q, want %q", uid, name, uid+".ics")
+		}
+	}
+}
+
+// TestEventToICalSanitizesCN guards against iCalendar injection: CR/LF in a
+// display name (set as the CN parameter, which go-ical does not escape) must not
+// inject forged property lines into the encoded object.
+func TestEventToICalSanitizesCN(t *testing.T) {
+	e := calendar.Event{
+		UID:       "uid-1",
+		Subject:   "Meeting",
+		Start:     time.Date(2026, 6, 19, 9, 0, 0, 0, time.UTC),
+		End:       time.Date(2026, 6, 19, 10, 0, 0, 0, time.UTC),
+		Organizer: calendar.Address{Name: "Evil\r\nX-INJECTED:yes\r\nORGANIZER;CN=foo", Email: "evil@example.com"},
+	}
+	var buf bytes.Buffer
+	if err := ical.NewEncoder(&buf).Encode(eventToICal(e)); err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	// A forged property line would be a CRLF immediately followed by the property
+	// name; go-ical line folding only ever emits CRLF + a space, so this pattern
+	// can only come from un-sanitized CR/LF in the CN value.
+	if out := buf.String(); strings.Contains(out, "\r\nX-INJECTED") {
+		t.Errorf("CR/LF in organizer CN injected a forged property line:\n%s", out)
 	}
 }

@@ -81,3 +81,29 @@ type Backend interface {
 	// Close releases the backend connection.
 	Close() error
 }
+
+// Writer is the optional event write capability: create, update, and delete.
+// It is kept separate from Backend so that a read-only adapter (or the server's
+// read-path fakes) need not implement writes, and so that adding writes does not
+// disturb Backend's existing implementers. An adapter that supports writes
+// implements Writer in addition to Backend; consumers type-assert for it:
+//
+//	if w, ok := backend.(calendar.Writer); ok {
+//		created, err := w.CreateEvent(ctx, calendarID, e)
+//	}
+//
+// A Writer is bound to the same authenticated principal as its Backend.
+type Writer interface {
+	// CreateEvent creates a new event in the named calendar and returns it
+	// stamped with its assigned opaque ID (and, when the backend generates one,
+	// its UID). The input event's ID is ignored.
+	CreateEvent(ctx context.Context, calendarID string, e Event) (Event, error)
+	// UpdateEvent replaces the event identified by e.ID with e and returns the
+	// stored event. The opaque e.ID locates the backing resource; CalendarID is
+	// derived from it.
+	UpdateEvent(ctx context.Context, e Event) (Event, error)
+	// DeleteEvent removes the event with the given opaque ID. Deleting an event
+	// that does not exist returns a not-found error (mirroring Graph's DELETE
+	// semantics); a caller wanting idempotent cleanup can ignore it.
+	DeleteEvent(ctx context.Context, id string) error
+}
