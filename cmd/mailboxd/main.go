@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/hstern/go-mailbox-720/internal/auth"
+	"github.com/hstern/go-mailbox-720/internal/batch"
 	"github.com/hstern/go-mailbox-720/internal/calendar"
 	"github.com/hstern/go-mailbox-720/internal/calendar/caldav"
 	"github.com/hstern/go-mailbox-720/internal/contacts"
@@ -148,7 +149,20 @@ func run(addr string, authCfg auth.Config, provider server.MailProvider, calProv
 		log.Println("contacts: no backend configured — contacts operations return 501")
 	}
 
-	var handler http.Handler = h
+	// basePath is the Graph version segment the api.Server is mounted under.
+	// internal/server keeps its own basePath const unexported, so we repeat the
+	// literal here (per MB720-7); they must stay in sync.
+	const basePath = "/v1.0"
+
+	// Route POST {basePath}/$batch to the JSON batching handler and everything
+	// else to the api.Server. The whole mux is wrapped by the auth middleware
+	// below, so the outer /$batch request is authenticated and its sub-requests
+	// inherit its context (and thus the authenticated mailbox identity).
+	mux := http.NewServeMux()
+	mux.Handle("POST "+basePath+"/$batch", batch.Handler(h, basePath))
+	mux.Handle("/", h)
+
+	var handler http.Handler = mux
 	if len(authCfg.Issuers) > 0 {
 		startupCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
