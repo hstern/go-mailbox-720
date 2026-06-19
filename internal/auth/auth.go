@@ -1,13 +1,20 @@
 // Package auth provides the OIDC resource-server middleware for the mailbox
-// server. We validate bearer JWTs issued by one or more external IdPs (BYO:
+// server. We validate bearer tokens issued by one or more external IdPs (BYO:
 // Keycloak / Authentik / Dex / Entra / Kanidm); we are NOT an issuer and expose
 // no /authorize or /token endpoints of our own.
 //
 // Each configured issuer is discovered via .well-known/openid-configuration at
-// New time; its JWKS is fetched and cached (refreshed on demand) by go-oidc. On
-// every request the middleware validates the token's signature, issuer, audience
-// and expiry/not-before, enforces the required scopes, maps a configurable claim
-// to the mailbox identity ("me"), and stashes it in the request context.
+// New time. Two token shapes are supported:
+//
+//   - JWT access tokens are validated locally: signature against the issuer's
+//     JWKS (fetched + cached + refreshed by go-oidc), issuer, audience, and
+//     expiry/not-before.
+//   - Opaque access tokens (e.g. Kanidm's default) are validated via RFC 7662
+//     token introspection against the issuer's introspection endpoint, using the
+//     resource server's own client credentials.
+//
+// Either way the middleware enforces the required scopes, maps a configurable
+// claim to the mailbox identity ("me"), and stashes it in the request context.
 //
 // Reusing Henry's go-oidc-federation / go-authzen is a future option; this is the
 // minimal resource-server validation built directly on coreos/go-oidc.
@@ -19,9 +26,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 
 	"github.com/coreos/go-oidc/v3/oidc"
+	"github.com/hstern/go-subjectid"
 
 	"github.com/hstern/go-mailbox-720/internal/grapherr"
 )
@@ -38,11 +47,25 @@ type Config struct {
 	// SubjectClaim names the claim mapped to the mailbox identity ("me"), e.g.
 	// "sub", "oid", or "preferred_username". Defaults to "sub".
 	SubjectClaim string
+	// Introspection, when set, enables RFC 7662 validation of opaque (non-JWT)
+	// tokens against each issuer's introspection endpoint.
+	Introspection *IntrospectionConfig
 }
 
-// Authenticator validates bearer JWTs against the configured issuers.
+// IntrospectionConfig holds the resource server's own OAuth2 client credentials,
+// used to authenticate to the issuer's introspection endpoint.
+type IntrospectionConfig struct {
+	ClientID     string
+	ClientSecret string
+}
+
+// Authenticator validates bearer tokens against the configured issuers.
 type Authenticator struct {
-	verifiers      map[string]*oidc.IDTokenVerifier // keyed by issuer URL
+	verifiers      map[string]*oidc.IDTokenVerifier // JWT validation, keyed by issuer
+	introspectURLs map[string]string                // RFC 7662 endpoints, keyed by issuer
+	introspect     *IntrospectionConfig
+	httpClient     *http.Client
+	audience       string
 	requiredScopes []string
 	subjectClaim   string
 }
@@ -59,6 +82,10 @@ func New(ctx context.Context, cfg Config) (*Authenticator, error) {
 	}
 	a := &Authenticator{
 		verifiers:      make(map[string]*oidc.IDTokenVerifier, len(cfg.Issuers)),
+		introspectURLs: make(map[string]string),
+		introspect:     cfg.Introspection,
+		httpClient:     http.DefaultClient,
+		audience:       cfg.Audience,
 		requiredScopes: cfg.RequiredScopes,
 		subjectClaim:   subjectClaim,
 	}
@@ -71,6 +98,17 @@ func New(ctx context.Context, cfg Config) (*Authenticator, error) {
 			ClientID:          cfg.Audience,
 			SkipClientIDCheck: cfg.Audience == "",
 		})
+		if cfg.Introspection != nil {
+			var meta struct {
+				IntrospectionEndpoint string `json:"introspection_endpoint"`
+			}
+			if err := provider.Claims(&meta); err == nil && meta.IntrospectionEndpoint != "" {
+				a.introspectURLs[iss] = meta.IntrospectionEndpoint
+			}
+		}
+	}
+	if cfg.Introspection != nil && len(a.introspectURLs) == 0 {
+		return nil, fmt.Errorf("auth: introspection configured but no issuer advertises introspection_endpoint")
 	}
 	return a, nil
 }
@@ -83,26 +121,8 @@ func (a *Authenticator) Middleware(next http.Handler) http.Handler {
 			grapherr.Write(w, http.StatusUnauthorized)
 			return
 		}
-		// Route to the verifier by the token's (unverified) issuer; the verifier
-		// then re-checks iss against its provider and validates the signature, so
-		// a forged iss can only select a verifier that will reject the token.
-		iss, err := unverifiedIssuer(raw)
+		claims, issuer, err := a.validate(r.Context(), raw)
 		if err != nil {
-			grapherr.Write(w, http.StatusUnauthorized)
-			return
-		}
-		verifier, ok := a.verifiers[iss]
-		if !ok {
-			grapherr.Write(w, http.StatusUnauthorized)
-			return
-		}
-		tok, err := verifier.Verify(r.Context(), raw)
-		if err != nil {
-			grapherr.Write(w, http.StatusUnauthorized)
-			return
-		}
-		var claims claimSet
-		if err := tok.Claims(&claims); err != nil {
 			grapherr.Write(w, http.StatusUnauthorized)
 			return
 		}
@@ -110,13 +130,89 @@ func (a *Authenticator) Middleware(next http.Handler) http.Handler {
 			grapherr.Write(w, http.StatusForbidden)
 			return
 		}
-		mailbox := claims.string(a.subjectClaim)
-		if mailbox == "" {
+		// The mailbox identity is the RFC 9493 (issuer, subject) pair: a bare
+		// subject is unique only within its issuer, so scoping it to the issuer
+		// keeps mailboxes distinct (and unspoofable) across multiple BYO IdPs.
+		mailbox := subjectid.IssSubID{Iss: issuer, Sub: claims.string(a.subjectClaim)}
+		if mailbox.Validate() != nil {
 			grapherr.Write(w, http.StatusUnauthorized)
 			return
 		}
 		next.ServeHTTP(w, r.WithContext(withMailbox(r.Context(), mailbox)))
 	})
+}
+
+// validate resolves a bearer token to its claims. A JWT from a known issuer is
+// validated locally against that issuer's JWKS; anything else (an opaque token,
+// or a JWT whose issuer we only introspect) is validated via RFC 7662.
+func (a *Authenticator) validate(ctx context.Context, raw string) (claims claimSet, issuer string, err error) {
+	if looksLikeJWT(raw) {
+		if iss, err := unverifiedIssuer(raw); err == nil {
+			if verifier, ok := a.verifiers[iss]; ok {
+				tok, err := verifier.Verify(ctx, raw)
+				if err != nil {
+					return nil, "", err
+				}
+				var claims claimSet
+				if err := tok.Claims(&claims); err != nil {
+					return nil, "", err
+				}
+				return claims, iss, nil
+			}
+		}
+	}
+	if len(a.introspectURLs) > 0 {
+		return a.introspectToken(ctx, raw)
+	}
+	return nil, "", fmt.Errorf("auth: no validator for the presented token")
+}
+
+// introspectToken validates an opaque token against the configured introspection
+// endpoints, returning the claims and issuer of the first that reports it active.
+// Opaque tokens carry no readable issuer, so each endpoint is tried in turn.
+func (a *Authenticator) introspectToken(ctx context.Context, raw string) (claimSet, string, error) {
+	for iss, endpoint := range a.introspectURLs {
+		claims, err := introspect(ctx, a.httpClient, endpoint, a.introspect.ClientID, a.introspect.ClientSecret, raw)
+		if err != nil {
+			continue
+		}
+		if active, _ := claims["active"].(bool); active && claims.audienceAllows(a.audience) {
+			return claims, iss, nil
+		}
+	}
+	return nil, "", fmt.Errorf("auth: token not active for this resource per introspection")
+}
+
+// introspect performs an RFC 7662 introspection request, authenticating with the
+// resource server's client credentials.
+func introspect(ctx context.Context, client *http.Client, endpoint, clientID, clientSecret, token string) (claimSet, error) {
+	form := url.Values{"token": {token}, "token_type_hint": {"access_token"}}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(form.Encode()))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Accept", "application/json")
+	req.SetBasicAuth(clientID, clientSecret)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("introspection endpoint returned %s", resp.Status)
+	}
+	var claims claimSet
+	if err := json.NewDecoder(resp.Body).Decode(&claims); err != nil {
+		return nil, fmt.Errorf("decode introspection response: %w", err)
+	}
+	return claims, nil
+}
+
+// looksLikeJWT reports whether raw has the three dot-separated segments of a JWS.
+func looksLikeJWT(raw string) bool {
+	return strings.Count(raw, ".") == 2
 }
 
 // bearerToken extracts the token from an "Authorization: Bearer <token>" header.
@@ -154,8 +250,8 @@ func unverifiedIssuer(raw string) (string, error) {
 	return claims.Iss, nil
 }
 
-// claimSet is the decoded JWT claims, kept generic so the mailbox-identity claim
-// can be configured.
+// claimSet is the decoded token claims (from a JWT or an introspection response),
+// kept generic so the mailbox-identity claim can be configured.
 type claimSet map[string]any
 
 // scopes gathers the union of granted scopes from scp/scope (space-delimited
@@ -191,6 +287,30 @@ func (c claimSet) scopes() map[string]struct{} {
 	return set
 }
 
+// audienceAllows reports whether the token may be used for want. The JWT path
+// has the verifier enforce aud; for introspected tokens we check the response's
+// aud member when present (string or array). When aud is absent — as with
+// Kanidm, whose introspection omits it — the call is gated only by the resource
+// server's own introspection credentials, which is the best available binding.
+func (c claimSet) audienceAllows(want string) bool {
+	if want == "" {
+		return true
+	}
+	switch v := c["aud"].(type) {
+	case string:
+		return v == want
+	case []any:
+		for _, a := range v {
+			if s, ok := a.(string); ok && s == want {
+				return true
+			}
+		}
+		return false
+	default:
+		return true // aud absent or unrecognized shape: cannot check here.
+	}
+}
+
 // hasScopes reports whether every required scope is present.
 func (c claimSet) hasScopes(required []string) bool {
 	if len(required) == 0 {
@@ -213,13 +333,14 @@ func (c claimSet) string(key string) string {
 
 type ctxKey struct{}
 
-func withMailbox(ctx context.Context, id string) context.Context {
+func withMailbox(ctx context.Context, id subjectid.SubjectIdentifier) context.Context {
 	return context.WithValue(ctx, ctxKey{}, id)
 }
 
-// Mailbox returns the authenticated mailbox identity the middleware stored, and
-// whether a request was authenticated.
-func Mailbox(ctx context.Context) (string, bool) {
-	id, ok := ctx.Value(ctxKey{}).(string)
+// Mailbox returns the authenticated mailbox identity the middleware stored — an
+// RFC 9493 Subject Identifier (an IssSubID) — and whether the request was
+// authenticated.
+func Mailbox(ctx context.Context) (subjectid.SubjectIdentifier, bool) {
+	id, ok := ctx.Value(ctxKey{}).(subjectid.SubjectIdentifier)
 	return id, ok
 }

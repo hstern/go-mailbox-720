@@ -70,6 +70,15 @@ go run ./cmd/mailboxd \
 | `-auth-audience` | Expected token audience (`aud`). |
 | `-auth-scope` | Comma-separated required scopes (matched against `scp`/`scope`/`roles`). |
 | `-auth-subject-claim` | Token claim mapped to the mailbox identity (default `sub`). |
+| `-auth-introspect-client-id` | OAuth2 client id enabling RFC 7662 introspection of **opaque** tokens (secret via `MAILBOXD_INTROSPECT_CLIENT_SECRET`). |
+
+JWT access tokens are validated locally against the issuer's JWKS. Opaque access
+tokens (e.g. Kanidm's default) are validated via RFC 7662 introspection when
+`-auth-introspect-client-id` is set; for introspected tokens the audience is
+enforced when the introspection response carries an `aud` (otherwise the resource
+server's own introspection credentials are the binding). The mailbox identity is
+an RFC 9493 `iss_sub` Subject Identifier (issuer + subject), so mailboxes stay
+distinct across multiple issuers.
 
 With one or more issuers configured the server fails closed: it refuses to start
 if an issuer cannot be discovered, and rejects any request without a valid token.

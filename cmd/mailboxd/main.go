@@ -33,6 +33,7 @@ func main() {
 	audience := flag.String("auth-audience", "", "expected token audience (aud)")
 	scopes := flag.String("auth-scope", "", "comma-separated required scopes")
 	subjectClaim := flag.String("auth-subject-claim", "sub", "token claim mapped to the mailbox identity")
+	introspectID := flag.String("auth-introspect-client-id", "", "OAuth2 client id for RFC 7662 introspection of opaque tokens (enables introspection; secret from MAILBOXD_INTROSPECT_CLIENT_SECRET)")
 	flag.Parse()
 
 	cfg := auth.Config{
@@ -40,6 +41,14 @@ func main() {
 		Audience:       *audience,
 		RequiredScopes: splitList(*scopes),
 		SubjectClaim:   *subjectClaim,
+	}
+	if *introspectID != "" {
+		// The secret is taken from the environment, never a flag, so it does not
+		// appear in the process table.
+		cfg.Introspection = &auth.IntrospectionConfig{
+			ClientID:     *introspectID,
+			ClientSecret: os.Getenv("MAILBOXD_INTROSPECT_CLIENT_SECRET"),
+		}
 	}
 	if err := run(*addr, cfg); err != nil {
 		log.Fatalln("mailboxd:", err)

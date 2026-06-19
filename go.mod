@@ -7,6 +7,7 @@ require (
 	github.com/go-faster/errors v0.7.1
 	github.com/go-faster/jx v1.2.0
 	github.com/go-jose/go-jose/v4 v4.1.4
+	github.com/hstern/go-subjectid v0.0.0-20260525222327-b47140763585
 	github.com/ogen-go/ogen v1.22.0
 	go.opentelemetry.io/otel v1.44.0
 	go.opentelemetry.io/otel/metric v1.44.0

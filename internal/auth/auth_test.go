@@ -11,11 +11,24 @@ import (
 	"time"
 
 	jose "github.com/go-jose/go-jose/v4"
+	"github.com/hstern/go-subjectid"
 )
 
+// mailboxSub asserts the identity is an IssSubID and returns its (iss, sub).
+func mailboxSub(t *testing.T, id subjectid.SubjectIdentifier) (iss, sub string) {
+	t.Helper()
+	is, ok := id.(subjectid.IssSubID)
+	if !ok {
+		t.Fatalf("mailbox identity is %T, want subjectid.IssSubID", id)
+	}
+	return is.Iss, is.Sub
+}
+
 const (
-	testKID = "test-key"
-	testAud = "mailbox-api"
+	testKID      = "test-key"
+	testAud      = "mailbox-api"
+	testRSID     = "mailbox-rs"
+	testRSSecret = "rs-secret"
 )
 
 // idp is a minimal OIDC issuer for tests: it serves discovery + JWKS and mints
@@ -40,8 +53,27 @@ func newIDP(t *testing.T) *idp {
 			"jwks_uri":                              i.issuer + "/jwks",
 			"authorization_endpoint":                i.issuer + "/authorize",
 			"token_endpoint":                        i.issuer + "/token",
+			"introspection_endpoint":                i.issuer + "/introspect",
 			"id_token_signing_alg_values_supported": []string{"RS256"},
 		})
+	})
+	// RFC 7662 introspection: authenticates the RS by its client credentials and
+	// reports the opaque token "opaque-active" as active.
+	mux.HandleFunc("/introspect", func(w http.ResponseWriter, r *http.Request) {
+		if id, secret, _ := r.BasicAuth(); id != testRSID || secret != testRSSecret {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		resp := map[string]any{"active": false}
+		switch r.FormValue("token") {
+		case "opaque-active": // Kanidm-style: no aud member
+			resp = map[string]any{"active": true, "scope": "Mail.Read", "sub": "svc@example.com"}
+		case "opaque-good-aud":
+			resp = map[string]any{"active": true, "aud": testAud, "scope": "Mail.Read", "sub": "svc@example.com"}
+		case "opaque-wrong-aud":
+			resp = map[string]any{"active": true, "aud": "someone-else", "scope": "Mail.Read", "sub": "svc@example.com"}
+		}
+		_ = json.NewEncoder(w).Encode(resp)
 	})
 	mux.HandleFunc("/jwks", func(w http.ResponseWriter, _ *http.Request) {
 		_ = json.NewEncoder(w).Encode(jose.JSONWebKeySet{Keys: []jose.JSONWebKey{{
@@ -154,10 +186,10 @@ func TestMiddleware(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			var ranNext bool
-			var gotMailbox string
+			var gotID subjectid.SubjectIdentifier
 			next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				ranNext = true
-				gotMailbox, _ = Mailbox(r.Context())
+				gotID, _ = Mailbox(r.Context())
 				w.WriteHeader(http.StatusOK)
 			})
 
@@ -175,8 +207,12 @@ func TestMiddleware(t *testing.T) {
 				if !ranNext {
 					t.Error("next handler did not run for an accepted request")
 				}
-				if gotMailbox != tc.wantMailbox {
-					t.Errorf("mailbox = %q, want %q", gotMailbox, tc.wantMailbox)
+				iss, sub := mailboxSub(t, gotID)
+				if sub != tc.wantMailbox {
+					t.Errorf("mailbox sub = %q, want %q", sub, tc.wantMailbox)
+				}
+				if iss != idp.issuer {
+					t.Errorf("mailbox iss = %q, want %q", iss, idp.issuer)
 				}
 			} else if ranNext {
 				t.Error("next handler ran for a rejected request")
@@ -199,16 +235,70 @@ func TestSubjectClaimMapping(t *testing.T) {
 	c := baseClaims(idp.issuer)
 	c["preferred_username"] = "alice"
 
-	var gotMailbox string
+	var gotID subjectid.SubjectIdentifier
 	next := http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
-		gotMailbox, _ = Mailbox(r.Context())
+		gotID, _ = Mailbox(r.Context())
 	})
 	req := httptest.NewRequest(http.MethodGet, "/v1.0/me/messages", nil)
 	req.Header.Set("Authorization", "Bearer "+idp.sign(t, c))
 	a.Middleware(next).ServeHTTP(httptest.NewRecorder(), req)
 
-	if gotMailbox != "alice" {
-		t.Errorf("mailbox = %q, want alice (mapped from preferred_username)", gotMailbox)
+	if _, sub := mailboxSub(t, gotID); sub != "alice" {
+		t.Errorf("mailbox sub = %q, want alice (mapped from preferred_username)", sub)
+	}
+}
+
+func TestMiddlewareIntrospection(t *testing.T) {
+	idp := newIDP(t)
+	a, err := New(context.Background(), Config{
+		Issuers:        []string{idp.issuer},
+		Audience:       testAud,
+		RequiredScopes: []string{"Mail.Read"},
+		SubjectClaim:   "sub",
+		Introspection:  &IntrospectionConfig{ClientID: testRSID, ClientSecret: testRSSecret},
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	tests := []struct {
+		name        string
+		token       string
+		wantStatus  int
+		wantMailbox string
+	}{
+		{"active opaque token (no aud)", "opaque-active", http.StatusOK, "svc@example.com"},
+		{"active with matching aud", "opaque-good-aud", http.StatusOK, "svc@example.com"},
+		{"active with wrong aud", "opaque-wrong-aud", http.StatusUnauthorized, ""},
+		{"inactive opaque token", "opaque-bogus", http.StatusUnauthorized, ""},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var ranNext bool
+			var gotID subjectid.SubjectIdentifier
+			next := http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+				ranNext = true
+				gotID, _ = Mailbox(r.Context())
+			})
+			req := httptest.NewRequest(http.MethodGet, "/v1.0/me/messages", nil)
+			req.Header.Set("Authorization", "Bearer "+tc.token)
+			rec := httptest.NewRecorder()
+			a.Middleware(next).ServeHTTP(rec, req)
+
+			if rec.Code != tc.wantStatus {
+				t.Errorf("status = %d, want %d", rec.Code, tc.wantStatus)
+			}
+			if tc.wantStatus == http.StatusOK {
+				if !ranNext {
+					t.Error("next handler did not run for an accepted token")
+				}
+				if _, sub := mailboxSub(t, gotID); sub != tc.wantMailbox {
+					t.Errorf("mailbox sub = %q, want %q", sub, tc.wantMailbox)
+				}
+			} else if ranNext {
+				t.Error("next handler ran for a rejected token")
+			}
+		})
 	}
 }
 
