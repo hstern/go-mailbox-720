@@ -74,7 +74,11 @@ func TestOIDCEndToEnd(t *testing.T) {
 	dovecotAddr := startDovecot(t)
 	seedMessage(t, dovecotAddr, testMessage)
 
-	base := startMailboxd(t, dir, secret, dovecotAddr)
+	// Real calendar backend: Radicale (CalDAV) with one seeded calendar + event.
+	radicaleBase := startRadicale(t)
+	seedCalendar(t, radicaleBase)
+
+	base := startMailboxd(t, dir, secret, dovecotAddr, radicaleBase)
 	kanidm := caClient(caPool)
 	token := mintToken(t, kanidm, secret)
 
@@ -111,6 +115,28 @@ func TestOIDCEndToEnd(t *testing.T) {
 	}
 	if got := resp.Value[0].From.EmailAddress.Address; got != "alice@example.com" {
 		t.Errorf("from = %q, want alice@example.com", got)
+	}
+
+	// The calendar vertical slice: the same Kanidm token authorizes GET
+	// /me/events, the handler resolves the principal's default (first) calendar
+	// over CalDAV from Radicale, and the seeded event comes back as Graph JSON.
+	ecode, ebody := get(t, base+"/me/events", token)
+	if ecode != http.StatusOK {
+		t.Fatalf("authenticated /me/events: status = %d, body = %s", ecode, ebody)
+	}
+	var eresp struct {
+		Value []struct {
+			Subject string `json:"subject"`
+		} `json:"value"`
+	}
+	if err := json.Unmarshal(ebody, &eresp); err != nil {
+		t.Fatalf("decode events response: %v (%s)", err, ebody)
+	}
+	if len(eresp.Value) != 1 {
+		t.Fatalf("got %d events, want 1: %s", len(eresp.Value), ebody)
+	}
+	if got := eresp.Value[0].Subject; got != eventSummary {
+		t.Errorf("event subject = %q, want %q", got, eventSummary)
 	}
 }
 
@@ -250,8 +276,9 @@ func provision(t *testing.T, dir, adminPassword string) string {
 }
 
 // startMailboxd builds and runs the server with auth enforced against Kanidm,
-// trusting the test CA, and returns its /v1.0 base URL.
-func startMailboxd(t *testing.T, dir, secret, imapAddr string) string {
+// trusting the test CA, wired to both the IMAP mail backend and the CalDAV
+// calendar backend, and returns its /v1.0 base URL.
+func startMailboxd(t *testing.T, dir, secret, imapAddr, caldavURL string) string {
 	t.Helper()
 	bin := filepath.Join(t.TempDir(), "mailboxd")
 	build := exec.Command("go", "build", "-o", bin, "./cmd/mailboxd")
@@ -271,11 +298,14 @@ func startMailboxd(t *testing.T, dir, secret, imapAddr string) string {
 		"-mail-imap-addr", imapAddr,
 		"-mail-imap-username", dovecotUser,
 		"-mail-imap-tls=false",
+		"-cal-caldav-url", caldavURL,
+		"-cal-caldav-username", radicaleUser,
 	)
 	cmd.Env = append(os.Environ(),
 		"SSL_CERT_FILE="+filepath.Join(dir, "ca.pem"), // trust Kanidm's CA for discovery/introspection
 		"MAILBOXD_INTROSPECT_CLIENT_SECRET="+secret,
 		"MAILBOXD_IMAP_PASSWORD="+dovecotPass,
+		"MAILBOXD_CALDAV_PASSWORD="+radicalePass,
 	)
 	cmd.Stdout, cmd.Stderr = os.Stderr, os.Stderr
 	if err := cmd.Start(); err != nil {
