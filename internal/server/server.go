@@ -24,18 +24,19 @@ const basePath = "/v1.0"
 
 // Handler is the mailbox server's Graph handler. Embedding UnimplementedHandler
 // satisfies the full generated api.Handler interface; implemented operations
-// override it by defining methods on Handler (see handler.go). Operations that
-// need the mail backend return 501 when no provider is configured.
+// override it by defining methods on Handler (see handler.go, calendar.go).
+// Operations that need a backend return 501 when no provider is configured.
 type Handler struct {
 	api.UnimplementedHandler
-	mail MailProvider
+	mail     MailProvider
+	calendar CalendarProvider
 }
 
 // New builds the mailbox server's HTTP handler (an *api.Server, which is an
-// http.Handler). mailProvider may be nil, in which case mail operations report
-// "not implemented".
-func New(mailProvider MailProvider) (*api.Server, error) {
-	return api.NewServer(Handler{mail: mailProvider},
+// http.Handler). mailProvider and calendarProvider may each be nil, in which
+// case the corresponding operations report "not implemented".
+func New(mailProvider MailProvider, calendarProvider CalendarProvider) (*api.Server, error) {
+	return api.NewServer(Handler{mail: mailProvider, calendar: calendarProvider},
 		api.WithPathPrefix(basePath),
 		api.WithErrorHandler(graphErrorHandler),
 		api.WithNotFound(graphNotFoundHandler),

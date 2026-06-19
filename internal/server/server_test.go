@@ -9,7 +9,7 @@ import (
 
 func newTestServer(t *testing.T) http.Handler {
 	t.Helper()
-	h, err := New(nil)
+	h, err := New(nil, nil)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
