@@ -41,14 +41,42 @@ const (
 	fetchTimeout = 5 * time.Minute
 )
 
-// mailboxConfig is the Graph mailbox slice we generate. Validated end-to-end on
-// the messages paths (see HANDOFF.md); grow the slice by extending KeepPaths
-// (mailFolders, events, calendars, contacts, and the /users/{id}/... forms).
+// mailboxConfig is the Graph mailbox slice we generate: the five Exchange
+// entities (messages, mailFolders, events, calendars, contacts), each as its
+// collection and by-id item, under both /me and /users/{user-id}. We stop at the
+// direct item — nested navigation paths (mailFolders/{id}/messages,
+// calendars/{id}/events, messages/{id}/attachments) are deliberately out of
+// scope: they add navigation-property recursion and reopen the attachment
+// polymorphism question (see HANDOFF.md scaling caveats and DropSchemas below).
+//
+// Path keys are the parser's unquoted forms; in the source YAML the {…}-bearing
+// keys are single-quoted (braces are YAML flow indicators).
 var mailboxConfig = specsubset.Config{
 	KeepPaths: []string{
 		"/me/messages",
 		"/me/messages/{message-id}",
+		"/me/mailFolders",
+		"/me/mailFolders/{mailFolder-id}",
+		"/me/events",
+		"/me/events/{event-id}",
+		"/me/calendars",
+		"/me/calendars/{calendar-id}",
+		"/me/contacts",
+		"/me/contacts/{contact-id}",
+		"/users/{user-id}/messages",
+		"/users/{user-id}/messages/{message-id}",
+		"/users/{user-id}/mailFolders",
+		"/users/{user-id}/mailFolders/{mailFolder-id}",
+		"/users/{user-id}/events",
+		"/users/{user-id}/events/{event-id}",
+		"/users/{user-id}/calendars",
+		"/users/{user-id}/calendars/{calendar-id}",
+		"/users/{user-id}/contacts",
+		"/users/{user-id}/contacts/{contact-id}",
 	},
+	// Polymorphic attachment subtypes: dropped to keep the closure non-recursive
+	// even though the attachments nav-property is already pruned (belt and
+	// suspenders — itemAttachment.item chains back to message/event/contact).
 	DropSchemas: []string{
 		"microsoft.graph.itemAttachment",
 		"microsoft.graph.referenceAttachment",

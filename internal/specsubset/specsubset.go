@@ -15,13 +15,22 @@
 //   - strip all "x-ms-*" vendor extensions;
 //   - flatten the OData nullable-$ref idiom
 //     (anyOf: [{$ref: X}, {type: object, nullable: true}]) to a bare $ref, which
-//     ogen otherwise rejects as a "complex anyOf".
+//     ogen otherwise rejects as a "complex anyOf";
+//   - drop the constant "default" on "@odata.type" properties. Each level of an
+//     allOf inheritance chain tags itself with its own @odata.type default
+//     (attendee -> attendeeBase -> recipient); ogen flattens the allOf and errors
+//     with "schemes have different defaults" when merging them. The tag itself is
+//     kept as a plain optional string — only the conflicting default is removed;
+//   - collapse a scalar "oneOf" (MS Graph's Edm.Double-as-oneOf:[number, string,
+//     ReferenceNumeric] idiom, e.g. outlookGeoCoordinates) to its numeric member;
+//     ogen cannot infer a discriminator for such a oneOf and fails generation.
 //
 // Ported from the spike's subset.py; see HANDOFF.md "Pipeline validated".
 package specsubset
 
 import (
 	"fmt"
+	"maps"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -49,6 +58,10 @@ type Result struct {
 }
 
 const refPrefix = "#/components/"
+
+// odataTypeProp is the OData type-annotation property whose per-subtype constant
+// default breaks ogen's allOf merge; see the package doc and stripXMS.
+const odataTypeProp = "@odata.type"
 
 var componentKinds = []string{"schemas", "parameters", "responses", "requestBodies"}
 
@@ -188,19 +201,27 @@ func stripXMS(node any) {
 	switch n := node.(type) {
 	case map[string]any:
 		flattenNullableAnyOf(n)
+		flattenScalarOneOf(n)
 		for k := range n {
 			if strings.HasPrefix(k, "x-ms-") {
 				delete(n, k)
 			}
 		}
-		// Drop OData navigation properties — the main closure-explosion vector.
-		// Done before recursing, while the marker is still on the child node.
+		// Drop OData navigation properties — the main closure-explosion vector —
+		// and strip the conflicting default off the @odata.type tag. Done before
+		// recursing, while the markers are still on the child nodes.
 		if props, ok := n["properties"].(map[string]any); ok {
 			for pname, pval := range props {
-				if pv, ok := pval.(map[string]any); ok {
-					if nav, _ := pv["x-ms-navigationProperty"].(bool); nav {
-						delete(props, pname)
-					}
+				pv, ok := pval.(map[string]any)
+				if !ok {
+					continue
+				}
+				if nav, _ := pv["x-ms-navigationProperty"].(bool); nav {
+					delete(props, pname)
+					continue
+				}
+				if pname == odataTypeProp {
+					delete(pv, "default")
 				}
 			}
 		}
@@ -243,6 +264,75 @@ func flattenNullableAnyOf(node map[string]any) bool {
 		return true
 	}
 	return false
+}
+
+// scalarTypes are the OpenAPI primitive types flattenScalarOneOf collapses to.
+var scalarTypes = map[string]bool{"number": true, "integer": true, "string": true, "boolean": true}
+
+// flattenScalarOneOf collapses the MS Graph "scalar with alternate encodings"
+// oneOf to its numeric member, copying that member's keywords onto node and
+// dropping oneOf. Reports whether it rewrote the node.
+//
+// MS Graph models Edm.Double as oneOf:[{type:number}, {type:string},
+// {$ref:ReferenceNumeric}] so IEEE special values ("Infinity"/"NaN") can ride as
+// strings (e.g. every outlookGeoCoordinates field). ogen cannot infer a
+// discriminator for such a oneOf and fails generation outright. The subset is
+// deliberately non-polymorphic, so we keep the primary numeric form and drop the
+// string/ReferenceNumeric alternates — lossless for real coordinate data.
+//
+// Like flattenNullableAnyOf, it is conservative: it fires only when it can
+// account for every member as part of the idiom — a primitive scalar, or a bare
+// $ref alternate encoding — and only when a numeric (number/integer) arm exists,
+// which it selects explicitly so the result does not depend on member order. A
+// member with its own object/array shape is a genuine heterogeneous union, not
+// this idiom; we refuse to collapse it (return false) so it surfaces as a loud
+// ogen error rather than a silently dropped branch.
+func flattenScalarOneOf(node map[string]any) bool {
+	oneOf, ok := node["oneOf"].([]any)
+	if !ok {
+		return false
+	}
+	var numeric map[string]any
+	for _, m := range oneOf {
+		sm, ok := m.(map[string]any)
+		if !ok {
+			return false
+		}
+		switch {
+		case isScalarSchema(sm):
+			if t, _ := sm["type"].(string); (t == "number" || t == "integer") && numeric == nil {
+				numeric = sm
+			}
+		case isBareRef(sm):
+			// Alternate scalar encoding (ReferenceNumeric); intentionally dropped.
+		default:
+			return false // object/array/complex member: not the scalar idiom.
+		}
+	}
+	if numeric == nil {
+		return false
+	}
+	delete(node, "oneOf")
+	maps.Copy(node, numeric)
+	return true
+}
+
+// isScalarSchema reports whether s describes a primitive scalar (optionally
+// nullable, with a format) and carries no object/array structure.
+func isScalarSchema(s map[string]any) bool {
+	t, ok := s["type"].(string)
+	if !ok || !scalarTypes[t] {
+		return false
+	}
+	_, hasProps := s["properties"]
+	_, hasItems := s["items"]
+	return !hasProps && !hasItems
+}
+
+// isBareRef reports whether s is a lone $ref to another component.
+func isBareRef(s map[string]any) bool {
+	_, ok := s["$ref"]
+	return ok
 }
 
 func isNullObject(m map[string]any) bool {

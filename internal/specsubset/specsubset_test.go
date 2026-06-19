@@ -44,6 +44,9 @@ components:
         mapping:
           fake: '#/components/schemas/microsoft.graph.eventMessage'
       properties:
+        '@odata.type':
+          type: string
+          default: '#microsoft.graph.message'
         subject:
           type: string
         sender:
@@ -61,6 +64,15 @@ components:
       properties:
         emailAddress:
           type: string
+        latitude:
+          description: a ReferenceNumeric-idiom double
+          oneOf:
+            - format: double
+              nullable: true
+              type: number
+            - nullable: true
+              type: string
+            - $ref: '#/components/schemas/ReferenceNumeric'
     microsoft.graph.attachment:
       type: object
     microsoft.graph.event:
@@ -132,12 +144,72 @@ func TestSubsetPrunes(t *testing.T) {
 	if _, ok := props["attachments"]; ok {
 		t.Error("navigation property message.attachments was not dropped")
 	}
+	odata, ok := props["@odata.type"].(map[string]any)
+	if !ok {
+		t.Error("@odata.type property was removed; only its default should be stripped")
+	} else if _, ok := odata["default"]; ok {
+		t.Error("@odata.type default was not stripped (ogen allOf-merge conflict)")
+	}
 	sender, _ := props["sender"].(map[string]any)
 	if _, ok := sender["anyOf"]; ok {
 		t.Error("message.sender still has anyOf; nullable-anyOf was not flattened")
 	}
 	if ref, _ := sender["$ref"].(string); ref != "#/components/schemas/microsoft.graph.recipient" {
 		t.Errorf("message.sender $ref = %q, want the recipient ref", ref)
+	}
+
+	// recipient.latitude uses the scalar-oneOf (ReferenceNumeric) idiom: it must
+	// collapse to the numeric member, and the ReferenceNumeric ref must not be
+	// followed into the closure.
+	rcpt, _ := sc["microsoft.graph.recipient"].(map[string]any)
+	rprops, _ := rcpt["properties"].(map[string]any)
+	lat, _ := rprops["latitude"].(map[string]any)
+	if _, ok := lat["oneOf"]; ok {
+		t.Error("recipient.latitude still has oneOf; scalar-oneOf was not collapsed")
+	}
+	if typ, _ := lat["type"].(string); typ != "number" {
+		t.Errorf("recipient.latitude type = %q, want number", typ)
+	}
+	if _, ok := sc["ReferenceNumeric"]; ok {
+		t.Error("ReferenceNumeric present: the collapsed oneOf alternate must not be followed")
+	}
+}
+
+func TestFlattenScalarOneOf(t *testing.T) {
+	num := func() map[string]any { return map[string]any{"type": "number", "format": "double", "nullable": true} }
+	str := func() map[string]any { return map[string]any{"type": "string", "nullable": true} }
+	ref := func() map[string]any { return map[string]any{"$ref": "#/components/schemas/ReferenceNumeric"} }
+	obj := func() map[string]any { return map[string]any{"type": "object", "properties": map[string]any{}} }
+
+	cases := []struct {
+		name      string
+		oneOf     []any
+		collapsed bool // true => oneOf removed and node typed number
+	}{
+		{"reference-numeric idiom", []any{num(), str(), ref()}, true},
+		{"number not first", []any{str(), ref(), num()}, true},
+		{"object member refuses collapse", []any{num(), obj()}, false},
+		{"no numeric arm refuses collapse", []any{str(), ref()}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			node := map[string]any{"description": "x", "oneOf": tc.oneOf}
+			got := flattenScalarOneOf(node)
+			if got != tc.collapsed {
+				t.Fatalf("flattenScalarOneOf = %v, want %v", got, tc.collapsed)
+			}
+			_, stillOneOf := node["oneOf"]
+			if tc.collapsed {
+				if stillOneOf {
+					t.Error("oneOf not removed after collapse")
+				}
+				if node["type"] != "number" {
+					t.Errorf("collapsed node type = %v, want number", node["type"])
+				}
+			} else if !stillOneOf {
+				t.Error("oneOf removed despite refusing to collapse")
+			}
+		})
 	}
 }
 
