@@ -289,9 +289,11 @@ func (c claimSet) scopes() map[string]struct{} {
 
 // audienceAllows reports whether the token may be used for want. The JWT path
 // has the verifier enforce aud; for introspected tokens we check the response's
-// aud member when present (string or array). When aud is absent — as with
-// Kanidm, whose introspection omits it — the call is gated only by the resource
-// server's own introspection credentials, which is the best available binding.
+// aud member when present (string or array). Some IdPs omit aud from the
+// introspection response; when it is absent the call is gated only by the
+// resource server's own introspection credentials, the best available binding.
+// (Kanidm, for one, both returns aud=client_id and refuses to introspect another
+// client's token at all, so this fallback does not apply to it.)
 func (c claimSet) audienceAllows(want string) bool {
 	if want == "" {
 		return true
