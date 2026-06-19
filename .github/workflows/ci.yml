@@ -116,3 +116,21 @@ jobs:
       - name: IMAP adapter integration (Dovecot)
         run: go test -tags dockertest -timeout 180s -run TestDovecotIntegration ./internal/mail/imap/
 
+  caldav-e2e:
+    # Runs the CalDAV adapter against a real Radicale server in Docker (build tag
+    # dockertest), validating the adapter's network methods (principal discovery,
+    # calendar-query REPORT, GET) end-to-end against a real server rather than the
+    # unit tests' in-memory iCalendar fixtures. No `go generate` is needed: the
+    # calendar adapter does not import the generated Graph package. Docker is
+    # available on GitHub-hosted runners.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: CalDAV adapter integration (Radicale)
+        run: go test -tags dockertest -timeout 180s -run TestRadicaleIntegration ./internal/calendar/caldav/
+
