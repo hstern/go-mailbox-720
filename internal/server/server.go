@@ -30,13 +30,14 @@ type Handler struct {
 	api.UnimplementedHandler
 	mail     MailProvider
 	calendar CalendarProvider
+	contacts ContactsProvider
 }
 
 // New builds the mailbox server's HTTP handler (an *api.Server, which is an
-// http.Handler). mailProvider and calendarProvider may each be nil, in which
-// case the corresponding operations report "not implemented".
-func New(mailProvider MailProvider, calendarProvider CalendarProvider) (*api.Server, error) {
-	return api.NewServer(Handler{mail: mailProvider, calendar: calendarProvider},
+// http.Handler). mailProvider, calendarProvider, and contactsProvider may each
+// be nil, in which case the corresponding operations report "not implemented".
+func New(mailProvider MailProvider, calendarProvider CalendarProvider, contactsProvider ContactsProvider) (*api.Server, error) {
+	return api.NewServer(Handler{mail: mailProvider, calendar: calendarProvider, contacts: contactsProvider},
 		api.WithPathPrefix(basePath),
 		api.WithErrorHandler(graphErrorHandler),
 		api.WithNotFound(graphNotFoundHandler),

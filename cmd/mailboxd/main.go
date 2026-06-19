@@ -26,6 +26,8 @@ import (
 	"github.com/hstern/go-mailbox-720/internal/auth"
 	"github.com/hstern/go-mailbox-720/internal/calendar"
 	"github.com/hstern/go-mailbox-720/internal/calendar/caldav"
+	"github.com/hstern/go-mailbox-720/internal/contacts"
+	"github.com/hstern/go-mailbox-720/internal/contacts/carddav"
 	"github.com/hstern/go-mailbox-720/internal/mail"
 	"github.com/hstern/go-mailbox-720/internal/mail/imap"
 	"github.com/hstern/go-mailbox-720/internal/server"
@@ -43,6 +45,8 @@ func main() {
 	imapTLS := flag.Bool("mail-imap-tls", true, "use implicit TLS for the IMAP connection")
 	caldavURL := flag.String("cal-caldav-url", "", "CalDAV base URL for the calendar backend (empty: calendar operations return 501; password from MAILBOXD_CALDAV_PASSWORD). Use an https:// URL for TLS")
 	caldavUser := flag.String("cal-caldav-username", "", "CalDAV username for the calendar backend")
+	carddavURL := flag.String("contacts-carddav-url", "", "CardDAV base URL for the contacts backend (empty: contacts operations return 501; password from MAILBOXD_CARDDAV_PASSWORD). Use an https:// URL for TLS")
+	carddavUser := flag.String("contacts-carddav-username", "", "CardDAV username for the contacts backend")
 	flag.Parse()
 
 	cfg := auth.Config{
@@ -76,7 +80,15 @@ func main() {
 			password: os.Getenv("MAILBOXD_CALDAV_PASSWORD"),
 		}
 	}
-	if err := run(*addr, cfg, provider, calProvider); err != nil {
+	var contactsProvider server.ContactsProvider
+	if *carddavURL != "" {
+		contactsProvider = staticCardDAVProvider{
+			url:      *carddavURL,
+			username: *carddavUser,
+			password: os.Getenv("MAILBOXD_CARDDAV_PASSWORD"),
+		}
+	}
+	if err := run(*addr, cfg, provider, calProvider, contactsProvider); err != nil {
 		log.Fatalln("mailboxd:", err)
 	}
 }
@@ -104,8 +116,19 @@ func (p staticCalDAVProvider) Calendar(_ context.Context) (calendar.Backend, err
 	return caldav.Dial(p.url, p.username, p.password, nil)
 }
 
-func run(addr string, authCfg auth.Config, provider server.MailProvider, calProvider server.CalendarProvider) error {
-	h, err := server.New(provider, calProvider)
+// staticCardDAVProvider serves every request from one configured CardDAV
+// account. A per-identity provider (mapping the token's mailbox identity to
+// credentials) is future work, mirroring staticIMAPProvider.
+type staticCardDAVProvider struct {
+	url, username, password string
+}
+
+func (p staticCardDAVProvider) Contacts(_ context.Context) (contacts.Backend, error) {
+	return carddav.Dial(p.url, p.username, p.password, nil)
+}
+
+func run(addr string, authCfg auth.Config, provider server.MailProvider, calProvider server.CalendarProvider, contactsProvider server.ContactsProvider) error {
+	h, err := server.New(provider, calProvider, contactsProvider)
 	if err != nil {
 		return err
 	}
@@ -118,6 +141,11 @@ func run(addr string, authCfg auth.Config, provider server.MailProvider, calProv
 		log.Println("calendar: CalDAV backend enabled")
 	} else {
 		log.Println("calendar: no backend configured — calendar operations return 501")
+	}
+	if contactsProvider != nil {
+		log.Println("contacts: CardDAV backend enabled")
+	} else {
+		log.Println("contacts: no backend configured — contacts operations return 501")
 	}
 
 	var handler http.Handler = h
