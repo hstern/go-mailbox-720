@@ -1,0 +1,45 @@
+package server
+
+import (
+	"net/http"
+
+	"github.com/hstern/go-mailbox-720/internal/graph/api"
+	"github.com/hstern/go-mailbox-720/internal/odata"
+)
+
+// parseMessageFilter turns the optional $filter query option into a parsed,
+// validated odata.Filter. It returns (nil, nil) when no filter was supplied (the
+// caller then lists without filtering). On a malformed or unsupported filter it
+// returns (nil, errRes) where errRes is a Graph 400 response ready to return; on
+// success it returns (filter, nil).
+func parseMessageFilter(raw api.OptString) (*odata.Filter, *api.ErrorStatusCode) {
+	value, ok := raw.Get()
+	if !ok || value == "" {
+		return nil, nil
+	}
+	filter, err := odata.Parse(value)
+	if err != nil {
+		return nil, badFilterResponse(err)
+	}
+	if err := filter.Validate(messageFilterFields); err != nil {
+		return nil, badFilterResponse(err)
+	}
+	return filter, nil
+}
+
+// badFilterResponse builds the Graph 400 response for an invalid $filter. It
+// uses the Graph "BadRequest" error code and carries the parse/validation
+// message through verbatim so a client sees why the filter was rejected (the
+// odata sentinels — malformed, unsupported operator/function, unknown field —
+// all map to the same 400).
+func badFilterResponse(err error) *api.ErrorStatusCode {
+	return &api.ErrorStatusCode{
+		StatusCode: http.StatusBadRequest,
+		Response: api.MicrosoftGraphODataErrorsODataError{
+			Error: api.MicrosoftGraphODataErrorsMainError{
+				Code:    "BadRequest",
+				Message: err.Error(),
+			},
+		},
+	}
+}

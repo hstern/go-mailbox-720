@@ -62,7 +62,7 @@ func TestDovecotIntegration(t *testing.T) {
 		t.Skip("docker not available")
 	}
 	addr := startDovecot(t)
-	seedMessage(t, addr, testRawMessage)
+	appendToINBOX(t, addr, testRawMessage)
 
 	cl, err := Dial(addr, dovecotUser, dovecotPass, &Options{TLS: false})
 	if err != nil {
@@ -79,7 +79,7 @@ func TestDovecotIntegration(t *testing.T) {
 		t.Fatalf("INBOX not listed: %+v", folders)
 	}
 
-	msgs, err := cl.ListMessages(ctx, folderID("INBOX"), mail.Page{})
+	msgs, err := cl.ListMessages(ctx, folderID("INBOX"), mail.Page{}, nil)
 	if err != nil {
 		t.Fatalf("ListMessages: %v", err)
 	}
@@ -103,7 +103,7 @@ func TestDovecotIntegration(t *testing.T) {
 
 	// Peek validation: a real server sets \Seen on a non-peek BODY[] fetch.
 	// After GetMessage the message must still be unread.
-	after, err := cl.ListMessages(ctx, folderID("INBOX"), mail.Page{})
+	after, err := cl.ListMessages(ctx, folderID("INBOX"), mail.Page{}, nil)
 	if err != nil {
 		t.Fatalf("ListMessages (post-get): %v", err)
 	}
@@ -149,8 +149,8 @@ func startDovecot(t *testing.T) string {
 	return addr
 }
 
-// seedMessage appends raw to INBOX via a raw IMAP client.
-func seedMessage(t *testing.T, addr, raw string) {
+// appendToINBOX appends raw to INBOX via a raw IMAP client.
+func appendToINBOX(t *testing.T, addr, raw string) {
 	t.Helper()
 	c, err := imapclient.DialInsecure(addr, nil)
 	if err != nil {

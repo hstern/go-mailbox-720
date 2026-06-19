@@ -23,6 +23,7 @@ import (
 	gomail "github.com/emersion/go-message/mail"
 
 	"github.com/hstern/go-mailbox-720/internal/mail"
+	"github.com/hstern/go-mailbox-720/internal/odata"
 )
 
 // Options configures the IMAP connection.
@@ -102,7 +103,13 @@ func (cl *Client) ListMailFolders(_ context.Context) ([]mail.MailFolder, error) 
 // ListMessages returns messages in a folder newest-first, bounded by page. Only
 // envelope-level fields are populated (no body) — that is the cheap IMAP FETCH.
 // An empty folderID selects the inbox, so Graph's /me/messages maps onto it.
-func (cl *Client) ListMessages(_ context.Context, folderID string, page mail.Page) ([]mail.Message, error) {
+//
+// A non-nil filter restricts the result. The filter is run through the IMAP
+// SEARCH command for any predicate that maps onto SEARCH criteria, then every
+// candidate is re-checked client-side against the full filter AST so predicates
+// IMAP cannot express still apply (see filter.go). Paging (Top/Skip, newest
+// first) is applied after filtering.
+func (cl *Client) ListMessages(_ context.Context, folderID string, page mail.Page, filter *odata.Filter) ([]mail.Message, error) {
 	mailbox := "INBOX"
 	if folderID != "" {
 		var err error
@@ -114,6 +121,10 @@ func (cl *Client) ListMessages(_ context.Context, folderID string, page mail.Pag
 	if err != nil {
 		return nil, fmt.Errorf("imap: select %q: %w", mailbox, err)
 	}
+	if filter != nil && filter.Root != nil {
+		return cl.listFiltered(mailbox, sel.UIDValidity, page, filter)
+	}
+
 	n := sel.NumMessages
 	skip := uint32(max(page.Skip, 0))
 	if n == 0 || skip >= n {
@@ -140,6 +151,61 @@ func (cl *Client) ListMessages(_ context.Context, folderID string, page mail.Pag
 	}
 	slices.Reverse(msgs) // FETCH yields ascending seq; Graph wants newest first
 	return msgs, nil
+}
+
+// listFiltered lists messages matching filter. It narrows with an IMAP SEARCH
+// built from the translatable part of the filter, then evaluates the full AST
+// over each candidate's mapped mail.Message so non-translatable predicates still
+// apply, and finally pages the survivors newest-first.
+//
+// The mailbox is assumed already selected by the caller.
+func (cl *Client) listFiltered(mailbox string, uidValidity uint32, page mail.Page, filter *odata.Filter) ([]mail.Message, error) {
+	criteria := translateFilter(filter.Root)
+
+	data, err := cl.c.UIDSearch(criteria, nil).Wait()
+	if err != nil {
+		return nil, fmt.Errorf("imap: search: %w", err)
+	}
+	uids := data.AllUIDs()
+	if len(uids) == 0 {
+		return nil, nil
+	}
+
+	bufs, err := cl.c.Fetch(goimap.UIDSetNum(uids...), &goimap.FetchOptions{
+		Envelope:     true,
+		Flags:        true,
+		InternalDate: true,
+		UID:          true,
+	}).Collect()
+	if err != nil {
+		return nil, fmt.Errorf("imap: fetch: %w", err)
+	}
+
+	msgs := make([]mail.Message, 0, len(bufs))
+	for _, b := range bufs {
+		m := envelopeMessage(mailbox, uidValidity, b)
+		// IMAP SEARCH is best-effort: re-check the full filter client-side so
+		// predicates it could not express (or only approximated) are exact.
+		if evalFilter(filter.Root, m) {
+			msgs = append(msgs, m)
+		}
+	}
+	// FETCH yields messages in ascending UID order; Graph wants newest first.
+	slices.Reverse(msgs)
+	return pageMessages(msgs, page), nil
+}
+
+// pageMessages applies Top/Skip to an already-ordered (newest first) slice.
+func pageMessages(msgs []mail.Message, page mail.Page) []mail.Message {
+	skip := max(page.Skip, 0)
+	if skip >= len(msgs) {
+		return nil
+	}
+	msgs = msgs[skip:]
+	if page.Top > 0 && page.Top < len(msgs) {
+		msgs = msgs[:page.Top]
+	}
+	return msgs
 }
 
 // GetMessage fetches a single message, including its parsed body, by opaque ID.

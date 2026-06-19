@@ -3,14 +3,17 @@ package imap
 import (
 	"context"
 	"net"
+	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	goimap "github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/imapserver"
 	"github.com/emersion/go-imap/v2/imapserver/imapmemserver"
 
 	"github.com/hstern/go-mailbox-720/internal/mail"
+	"github.com/hstern/go-mailbox-720/internal/odata"
 )
 
 const (
@@ -91,7 +94,7 @@ func TestListMailFolders(t *testing.T) {
 
 func TestListMessages(t *testing.T) {
 	cl := dialTest(t)
-	msgs, err := cl.ListMessages(context.Background(), folderID("INBOX"), mail.Page{})
+	msgs, err := cl.ListMessages(context.Background(), folderID("INBOX"), mail.Page{}, nil)
 	if err != nil {
 		t.Fatalf("ListMessages: %v", err)
 	}
@@ -115,7 +118,7 @@ func TestListMessages(t *testing.T) {
 
 func TestGetMessage(t *testing.T) {
 	cl := dialTest(t)
-	msgs, err := cl.ListMessages(context.Background(), folderID("INBOX"), mail.Page{})
+	msgs, err := cl.ListMessages(context.Background(), folderID("INBOX"), mail.Page{}, nil)
 	if err != nil || len(msgs) != 1 {
 		t.Fatalf("ListMessages: %v (n=%d)", err, len(msgs))
 	}
@@ -175,4 +178,230 @@ func TestGetMessageStaleID(t *testing.T) {
 	if _, err := cl.GetMessage(context.Background(), stale); err == nil {
 		t.Error("GetMessage with stale UIDVALIDITY = nil error, want error")
 	}
+}
+
+// seedMessage describes one message to append to a fresh INBOX for filter tests.
+type seedMessage struct {
+	subject  string
+	from     string
+	to       string
+	received time.Time
+	read     bool
+}
+
+// raw renders the seed as an RFC 822 message.
+func (s seedMessage) raw() string {
+	return "From: " + s.from + "\r\n" +
+		"To: " + s.to + "\r\n" +
+		"Subject: " + s.subject + "\r\n" +
+		"Date: " + s.received.Format(time.RFC1123Z) + "\r\n" +
+		"Content-Type: text/plain; charset=utf-8\r\n" +
+		"\r\n" +
+		"body\r\n"
+}
+
+// dialFiltered starts a fresh in-process IMAP server seeded with the given
+// messages and returns a connected Client. Each message's INTERNALDATE is set to
+// its received time and its \Seen flag to its read state, so receivedDateTime and
+// isRead filters have something to act on.
+func dialFiltered(t *testing.T, seeds ...seedMessage) *Client {
+	t.Helper()
+	memServer := imapmemserver.New()
+	user := imapmemserver.NewUser(testUser, testPass)
+	if err := user.Create("INBOX", nil); err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range seeds {
+		opts := &goimap.AppendOptions{Time: s.received}
+		if s.read {
+			opts.Flags = []goimap.Flag{goimap.FlagSeen}
+		}
+		if _, err := user.Append("INBOX", strings.NewReader(s.raw()), opts); err != nil {
+			t.Fatal(err)
+		}
+	}
+	memServer.AddUser(user)
+
+	srv := imapserver.New(&imapserver.Options{
+		NewSession: func(*imapserver.Conn) (imapserver.Session, *imapserver.GreetingData, error) {
+			return memServer.NewSession(), nil, nil
+		},
+		InsecureAuth: true,
+	})
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() { _ = srv.Serve(ln) }()
+	t.Cleanup(func() { _ = srv.Close(); _ = ln.Close() })
+
+	cl, err := Dial(ln.Addr().String(), testUser, testPass, &Options{TLS: false})
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	t.Cleanup(func() { _ = cl.Close() })
+	return cl
+}
+
+// subjectsOf returns the message subjects, sorted, for set-wise comparison.
+func subjectsOf(msgs []mail.Message) []string {
+	out := make([]string, 0, len(msgs))
+	for _, m := range msgs {
+		out = append(out, m.Subject)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func mustParse(t *testing.T, s string) *odata.Filter {
+	t.Helper()
+	f, err := odata.Parse(s)
+	if err != nil {
+		t.Fatalf("odata.Parse(%q): %v", s, err)
+	}
+	return f
+}
+
+func TestListMessagesFilter(t *testing.T) {
+	t1 := time.Date(2025, 6, 1, 9, 0, 0, 0, time.UTC)
+	t2 := time.Date(2025, 6, 10, 9, 0, 0, 0, time.UTC)
+	t3 := time.Date(2025, 6, 20, 9, 0, 0, 0, time.UTC)
+	seeds := []seedMessage{
+		{subject: "Project update", from: "Alice <alice@example.com>", to: "Bob <bob@example.com>", received: t1, read: true},
+		{subject: "Lunch plans", from: "Carol <carol@other.com>", to: "Bob <bob@example.com>", received: t2, read: false},
+		{subject: "Project deadline", from: "Alice <alice@example.com>", to: "Dave <dave@example.com>", received: t3, read: false},
+	}
+
+	tests := []struct {
+		name   string
+		filter string
+		want   []string
+	}{
+		{
+			name:   "subject contains",
+			filter: "contains(subject,'Project')",
+			want:   []string{"Project deadline", "Project update"},
+		},
+		{
+			name:   "subject startswith",
+			filter: "startswith(subject,'Lunch')",
+			want:   []string{"Lunch plans"},
+		},
+		{
+			name:   "subject endswith (client-side only)",
+			filter: "endswith(subject,'update')",
+			want:   []string{"Project update"},
+		},
+		{
+			name:   "from equals via nested path",
+			filter: "from/emailAddress/address eq 'alice@example.com'",
+			want:   []string{"Project deadline", "Project update"},
+		},
+		{
+			name:   "isRead true",
+			filter: "isRead eq true",
+			want:   []string{"Project update"},
+		},
+		{
+			name:   "isRead false",
+			filter: "isRead eq false",
+			want:   []string{"Lunch plans", "Project deadline"},
+		},
+		{
+			name:   "received on or after",
+			filter: "receivedDateTime ge 2025-06-10T00:00:00Z",
+			want:   []string{"Lunch plans", "Project deadline"},
+		},
+		{
+			name:   "received before",
+			filter: "receivedDateTime lt 2025-06-10T00:00:00Z",
+			want:   []string{"Project update"},
+		},
+		{
+			name:   "and combines predicates",
+			filter: "contains(subject,'Project') and isRead eq false",
+			want:   []string{"Project deadline"},
+		},
+		{
+			name:   "or combines predicates",
+			filter: "startswith(subject,'Lunch') or isRead eq true",
+			want:   []string{"Lunch plans", "Project update"},
+		},
+		{
+			name:   "not negates",
+			filter: "not contains(subject,'Project')",
+			want:   []string{"Lunch plans"},
+		},
+		{
+			name:   "no match",
+			filter: "contains(subject,'Invoice')",
+			want:   []string{},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cl := dialFiltered(t, seeds...)
+			msgs, err := cl.ListMessages(context.Background(), folderID("INBOX"), mail.Page{}, mustParse(t, tc.filter))
+			if err != nil {
+				t.Fatalf("ListMessages: %v", err)
+			}
+			got := subjectsOf(msgs)
+			if !equalStrings(got, tc.want) {
+				t.Errorf("subjects = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestListMessagesFilterNilIsUnfiltered(t *testing.T) {
+	seeds := []seedMessage{
+		{subject: "one", from: "a@x.com", to: "b@x.com", received: time.Date(2025, 6, 1, 0, 0, 0, 0, time.UTC)},
+		{subject: "two", from: "a@x.com", to: "b@x.com", received: time.Date(2025, 6, 2, 0, 0, 0, 0, time.UTC)},
+	}
+	cl := dialFiltered(t, seeds...)
+	msgs, err := cl.ListMessages(context.Background(), folderID("INBOX"), mail.Page{}, nil)
+	if err != nil {
+		t.Fatalf("ListMessages: %v", err)
+	}
+	if len(msgs) != 2 {
+		t.Fatalf("got %d messages, want 2 (nil filter must not filter)", len(msgs))
+	}
+}
+
+func TestListMessagesFilterPaging(t *testing.T) {
+	var seeds []seedMessage
+	base := time.Date(2025, 6, 1, 0, 0, 0, 0, time.UTC)
+	for i := 0; i < 5; i++ {
+		seeds = append(seeds, seedMessage{
+			subject:  "Project " + string(rune('A'+i)),
+			from:     "a@x.com",
+			to:       "b@x.com",
+			received: base.AddDate(0, 0, i),
+		})
+	}
+	cl := dialFiltered(t, seeds...)
+	// All five match; Top=2 newest-first should yield the two latest received.
+	msgs, err := cl.ListMessages(context.Background(), folderID("INBOX"), mail.Page{Top: 2}, mustParse(t, "contains(subject,'Project')"))
+	if err != nil {
+		t.Fatalf("ListMessages: %v", err)
+	}
+	if len(msgs) != 2 {
+		t.Fatalf("got %d messages, want 2", len(msgs))
+	}
+	if msgs[0].Subject != "Project E" || msgs[1].Subject != "Project D" {
+		t.Errorf("got %q,%q; want newest-first Project E, Project D", msgs[0].Subject, msgs[1].Subject)
+	}
+}
+
+func equalStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }

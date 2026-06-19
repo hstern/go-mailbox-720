@@ -11,6 +11,20 @@ import (
 	"github.com/hstern/go-mailbox-720/internal/mail"
 )
 
+// messageFilterFields is the allow-list of message properties a $filter on
+// /me/messages may reference. A filter that names anything else is rejected with
+// a Graph 400 before it reaches the backend.
+var messageFilterFields = []string{
+	"subject",
+	"from",
+	"from/emailAddress/address",
+	"to",
+	"to/emailAddress/address",
+	"receivedDateTime",
+	"isRead",
+	"hasAttachments",
+}
+
 // MailProvider yields a mail.Backend for an authenticated request. The static
 // implementation lives in cmd/mailboxd; per-identity providers (mapping the
 // token's mailbox identity to backend credentials) come later.
@@ -27,15 +41,23 @@ func (h Handler) backend(ctx context.Context) (mail.Backend, error) {
 	return h.mail.Mail(ctx)
 }
 
-// MeListMessages implements GET /me/messages by listing the inbox.
+// MeListMessages implements GET /me/messages by listing the inbox. A $filter
+// query option, if present, is parsed and validated against the supported
+// message fields; a malformed or unsupported filter returns a Graph 400 without
+// touching the backend.
 func (h Handler) MeListMessages(ctx context.Context, params api.MeListMessagesParams) (api.MeListMessagesRes, error) {
+	filter, errRes := parseMessageFilter(params.Filter)
+	if errRes != nil {
+		return errRes, nil
+	}
+
 	b, err := h.backend(ctx)
 	if err != nil {
 		return nil, err
 	}
 	defer func() { _ = b.Close() }()
 
-	msgs, err := b.ListMessages(ctx, "", mail.Page{Top: params.Top.Or(0), Skip: params.Skip.Or(0)})
+	msgs, err := b.ListMessages(ctx, "", mail.Page{Top: params.Top.Or(0), Skip: params.Skip.Or(0)}, filter)
 	if err != nil {
 		return nil, fmt.Errorf("list messages: %w", err)
 	}
