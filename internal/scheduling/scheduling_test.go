@@ -285,3 +285,209 @@ func TestReplyErrors(t *testing.T) {
 		t.Error("Reply(no UID) error = nil, want error")
 	}
 }
+
+// sampleInvite is an organizer-side Invite with two attendees, used to drive the
+// Request/Cancel generation tests.
+func sampleInvite() Invite {
+	return Invite{
+		UID:       "abc-123@example.com",
+		Sequence:  0,
+		Summary:   "Project sync",
+		Start:     time.Date(2026, 6, 15, 15, 0, 0, 0, time.UTC),
+		End:       time.Date(2026, 6, 15, 16, 0, 0, 0, time.UTC),
+		Organizer: Address{Name: "Olivia Organizer", Email: "olivia@example.com"},
+		Attendees: []Attendee{
+			{Address: Address{Name: "Andy Attendee", Email: "andy@example.com"}},
+			{Address: Address{Name: "Bea Backup", Email: "bea@example.com"}},
+		},
+	}
+}
+
+func TestRequestRoundTrip(t *testing.T) {
+	out, err := Request(sampleInvite())
+	if err != nil {
+		t.Fatalf("Request() error = %v", err)
+	}
+	if !bytes.Contains(out, []byte("\r\n")) {
+		t.Error("Request() output is not CRLF-delimited")
+	}
+
+	// Round-trip through Parse: a REQUEST we generate must parse back faithfully.
+	inv, err := Parse(mimeMessage(t, "REQUEST", string(out)))
+	if err != nil {
+		t.Fatalf("Parse(Request) error = %v", err)
+	}
+	if inv.Method != MethodRequest {
+		t.Errorf("Method = %q, want %q", inv.Method, MethodRequest)
+	}
+	if inv.UID != "abc-123@example.com" {
+		t.Errorf("UID = %q, want %q", inv.UID, "abc-123@example.com")
+	}
+	if inv.Summary != "Project sync" {
+		t.Errorf("Summary = %q, want %q", inv.Summary, "Project sync")
+	}
+	if want := time.Date(2026, 6, 15, 15, 0, 0, 0, time.UTC); !inv.Start.Equal(want) {
+		t.Errorf("Start = %v, want %v", inv.Start, want)
+	}
+	if want := time.Date(2026, 6, 15, 16, 0, 0, 0, time.UTC); !inv.End.Equal(want) {
+		t.Errorf("End = %v, want %v", inv.End, want)
+	}
+	if inv.Organizer.Email != "olivia@example.com" {
+		t.Errorf("Organizer.Email = %q, want %q", inv.Organizer.Email, "olivia@example.com")
+	}
+
+	if len(inv.Attendees) != 2 {
+		t.Fatalf("Attendees len = %d, want 2", len(inv.Attendees))
+	}
+	wantEmails := map[string]bool{"andy@example.com": false, "bea@example.com": false}
+	for _, att := range inv.Attendees {
+		if _, ok := wantEmails[att.Email]; !ok {
+			t.Errorf("unexpected attendee %q", att.Email)
+		}
+		wantEmails[att.Email] = true
+		if att.PartStat != PartStatNeedsAction {
+			t.Errorf("attendee %q PartStat = %q, want %q", att.Email, att.PartStat, PartStatNeedsAction)
+		}
+	}
+	for email, seen := range wantEmails {
+		if !seen {
+			t.Errorf("attendee %q missing from request", email)
+		}
+	}
+
+	// RSVP=TRUE must be set on each ATTENDEE so recipients are prompted to reply.
+	cal, err := ical.NewDecoder(bytes.NewReader(out)).Decode()
+	if err != nil {
+		t.Fatalf("decode request: %v", err)
+	}
+	ev := &cal.Events()[0]
+	atts := ev.Props.Values(ical.PropAttendee)
+	if len(atts) != 2 {
+		t.Fatalf("encoded ATTENDEE count = %d, want 2", len(atts))
+	}
+	for _, p := range atts {
+		if rsvp := p.Params.Get(ical.ParamRSVP); rsvp != "TRUE" {
+			t.Errorf("ATTENDEE %q RSVP = %q, want TRUE", p.Value, rsvp)
+		}
+	}
+}
+
+func TestRequestErrors(t *testing.T) {
+	noUID := sampleInvite()
+	noUID.UID = ""
+	if _, err := Request(noUID); err == nil {
+		t.Error("Request(no UID) error = nil, want error")
+	}
+
+	noOrg := sampleInvite()
+	noOrg.Organizer = Address{}
+	if _, err := Request(noOrg); err == nil {
+		t.Error("Request(no organizer) error = nil, want error")
+	}
+
+	noAtt := sampleInvite()
+	noAtt.Attendees = nil
+	if _, err := Request(noAtt); err == nil {
+		t.Error("Request(no attendees) error = nil, want error")
+	}
+}
+
+func TestCancelRoundTrip(t *testing.T) {
+	inv := sampleInvite()
+	inv.Sequence = 3
+	out, err := Cancel(inv)
+	if err != nil {
+		t.Fatalf("Cancel() error = %v", err)
+	}
+	if !bytes.Contains(out, []byte("\r\n")) {
+		t.Error("Cancel() output is not CRLF-delimited")
+	}
+
+	parsed, err := Parse(mimeMessage(t, "CANCEL", string(out)))
+	if err != nil {
+		t.Fatalf("Parse(Cancel) error = %v", err)
+	}
+	if parsed.Method != MethodCancel {
+		t.Errorf("Method = %q, want %q", parsed.Method, MethodCancel)
+	}
+	if parsed.UID != "abc-123@example.com" {
+		t.Errorf("UID = %q, want %q", parsed.UID, "abc-123@example.com")
+	}
+	if parsed.Organizer.Email != "olivia@example.com" {
+		t.Errorf("Organizer.Email = %q, want %q", parsed.Organizer.Email, "olivia@example.com")
+	}
+	if len(parsed.Attendees) != 2 {
+		t.Errorf("Attendees len = %d, want 2", len(parsed.Attendees))
+	}
+
+	// STATUS:CANCELLED must be present on the VEVENT.
+	cal, err := ical.NewDecoder(bytes.NewReader(out)).Decode()
+	if err != nil {
+		t.Fatalf("decode cancel: %v", err)
+	}
+	ev := &cal.Events()[0]
+	if got := propText(ev.Props, ical.PropStatus); got != string(StatusCancelled) {
+		t.Errorf("STATUS = %q, want %q", got, StatusCancelled)
+	}
+	if seq := ev.Props.Get(ical.PropSequence); seq == nil || seq.Value != "3" {
+		t.Errorf("SEQUENCE = %v, want 3", seq)
+	}
+}
+
+func TestCancelErrors(t *testing.T) {
+	noUID := sampleInvite()
+	noUID.UID = ""
+	if _, err := Cancel(noUID); err == nil {
+		t.Error("Cancel(no UID) error = nil, want error")
+	}
+
+	noOrg := sampleInvite()
+	noOrg.Organizer = Address{}
+	if _, err := Cancel(noOrg); err == nil {
+		t.Error("Cancel(no organizer) error = nil, want error")
+	}
+}
+
+// TestRequestCNInjection verifies a display name carrying CR/LF cannot inject a
+// forged property line into the encoded REQUEST: the control characters are
+// stripped from the CN before encoding.
+func TestRequestCNInjection(t *testing.T) {
+	inv := sampleInvite()
+	// A malicious name that, unsanitized, would close the ORGANIZER line and
+	// inject a forged ATTENDEE granting an extra participant.
+	inv.Organizer.Name = "Olivia\r\nATTENDEE:mailto:evil@example.com"
+
+	out, err := Request(inv)
+	if err != nil {
+		t.Fatalf("Request() error = %v", err)
+	}
+
+	if bytes.Contains(out, []byte("evil@example.com")) {
+		// The literal text may legitimately survive folded inside the CN value;
+		// what must NOT happen is a standalone forged ATTENDEE line.
+		for _, line := range bytes.Split(out, []byte("\r\n")) {
+			trimmed := bytes.TrimLeft(line, " \t")
+			if bytes.HasPrefix(trimmed, []byte("ATTENDEE:mailto:evil@example.com")) {
+				t.Fatalf("forged ATTENDEE line injected via CN: %q", line)
+			}
+		}
+	}
+
+	// The encoded object must still parse cleanly and expose exactly the two
+	// legitimate attendees, not a third smuggled one.
+	cal, err := ical.NewDecoder(bytes.NewReader(out)).Decode()
+	if err != nil {
+		t.Fatalf("decode request: %v", err)
+	}
+	ev := &cal.Events()[0]
+	if got := len(ev.Props.Values(ical.PropAttendee)); got != 2 {
+		t.Errorf("ATTENDEE count = %d, want 2 (CN injection leaked a forged attendee)", got)
+	}
+	org := ev.Props.Get(ical.PropOrganizer)
+	if org == nil {
+		t.Fatal("request has no ORGANIZER")
+	}
+	if cn := org.Params.Get(ical.ParamCommonName); strings.ContainsAny(cn, "\r\n") {
+		t.Errorf("ORGANIZER CN retains control characters: %q", cn)
+	}
+}

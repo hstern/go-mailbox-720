@@ -60,6 +60,19 @@ const (
 	PartStatDeclined PartStat = "DECLINED"
 	// PartStatTentative means the attendee tentatively accepted the invitation.
 	PartStatTentative PartStat = "TENTATIVE"
+	// PartStatNeedsAction means the attendee has not yet responded; it is the
+	// status set on every ATTENDEE of an outbound REQUEST.
+	PartStatNeedsAction PartStat = "NEEDS-ACTION"
+)
+
+// Status is an event's overall status (the iCalendar STATUS property). Only the
+// CANCELLED value, set on the VEVENT of an outbound CANCEL, is modelled.
+type Status string
+
+const (
+	// StatusCancelled marks an event as withdrawn; a METHOD:CANCEL VEVENT carries
+	// it per RFC 5546 §3.2.5.
+	StatusCancelled Status = "CANCELLED"
 )
 
 // Address is a calendar-user address: a display name plus an email. It mirrors
@@ -211,15 +224,7 @@ func Reply(req *Invite, attendee Address, partStat PartStat) ([]byte, error) {
 		return nil, fmt.Errorf("scheduling: request has no UID")
 	}
 
-	cal := ical.NewCalendar()
-	cal.Props.SetText(ical.PropVersion, "2.0")
-	cal.Props.SetText(ical.PropProductID, productID)
-	cal.Props.SetText(ical.PropMethod, string(MethodReply))
-
-	ev := ical.NewEvent()
-	ev.Props.SetText(ical.PropUID, req.UID)
-	ev.Props.SetDateTime(ical.PropDateTimeStamp, time.Now().UTC())
-	setInt(ev.Props, ical.PropSequence, req.Sequence)
+	cal, ev := newScheduling(MethodReply, req.UID, req.Sequence)
 	// RFC 5546 §3.2.3 requires DTSTART in a REPLY VEVENT.
 	if !req.Start.IsZero() {
 		ev.Props.SetDateTime(ical.PropDateTimeStart, req.Start)
@@ -227,14 +232,7 @@ func Reply(req *Invite, attendee Address, partStat PartStat) ([]byte, error) {
 	if req.Summary != "" {
 		ev.Props.SetText(ical.PropSummary, req.Summary)
 	}
-	// Echo RECURRENCE-ID from the preserved property so its DATE-TIME value type
-	// and TZID/RANGE parameters survive — SetText would force an incorrect
-	// VALUE=TEXT.
-	if req.recurrenceProp != nil {
-		rid := *req.recurrenceProp
-		rid.Params = cloneParams(req.recurrenceProp.Params)
-		ev.Props.Set(&rid)
-	}
+	echoRecurrenceID(ev, req)
 	if org := buildAddress(ical.PropOrganizer, req.Organizer, ""); org != nil {
 		ev.Props.Set(org)
 	}
@@ -243,9 +241,138 @@ func Reply(req *Invite, attendee Address, partStat PartStat) ([]byte, error) {
 	}
 	cal.Children = append(cal.Children, ev.Component)
 
+	return encodeCalendar(cal, "reply")
+}
+
+// Request builds a METHOD:REQUEST VCALENDAR/VEVENT — the organizer's invitation,
+// mailed to attendees when an event with attendees is created or updated
+// (RFC 5546 §3.2.2). It carries the event's UID, SEQUENCE, DTSTART/DTEND,
+// SUMMARY, the ORGANIZER, and every ATTENDEE marked PARTSTAT=NEEDS-ACTION with
+// RSVP=TRUE so each recipient is prompted to respond. The result is serialized
+// as iCalendar bytes (CRLF line endings) for the "text/calendar; method=REQUEST"
+// body.
+//
+// It returns an error if the invite has no UID, no ORGANIZER, or no ATTENDEE: a
+// REQUEST without an organizer and at least one attendee is not a meaningful
+// scheduling object.
+func Request(inv Invite) ([]byte, error) {
+	if inv.UID == "" {
+		return nil, fmt.Errorf("scheduling: request has no UID")
+	}
+	if inv.Organizer.Email == "" {
+		return nil, fmt.Errorf("scheduling: request has no organizer")
+	}
+	if len(inv.Attendees) == 0 {
+		return nil, fmt.Errorf("scheduling: request has no attendees")
+	}
+
+	cal, ev := newScheduling(MethodRequest, inv.UID, inv.Sequence)
+	// RFC 5546 §3.2.2 requires DTSTART; DTEND/SUMMARY round out the event.
+	if !inv.Start.IsZero() {
+		ev.Props.SetDateTime(ical.PropDateTimeStart, inv.Start)
+	}
+	if !inv.End.IsZero() {
+		ev.Props.SetDateTime(ical.PropDateTimeEnd, inv.End)
+	}
+	if inv.Summary != "" {
+		ev.Props.SetText(ical.PropSummary, inv.Summary)
+	}
+	echoRecurrenceID(ev, &inv)
+	if org := buildAddress(ical.PropOrganizer, inv.Organizer, ""); org != nil {
+		ev.Props.Set(org)
+	}
+	// Each ATTENDEE is invited fresh: NEEDS-ACTION participation status and
+	// RSVP=TRUE ask the recipient to reply.
+	for _, att := range inv.Attendees {
+		prop := buildAddress(ical.PropAttendee, att.Address, PartStatNeedsAction)
+		if prop == nil {
+			continue
+		}
+		prop.Params.Set(ical.ParamRSVP, "TRUE")
+		ev.Props.Add(prop)
+	}
+	cal.Children = append(cal.Children, ev.Component)
+
+	return encodeCalendar(cal, "request")
+}
+
+// Cancel builds a METHOD:CANCEL VCALENDAR/VEVENT withdrawing a previously
+// requested event, mailed to attendees when the organizer deletes it
+// (RFC 5546 §3.2.5). It echoes the event's UID, carries STATUS:CANCELLED, the
+// ORGANIZER, and every ATTENDEE, and bumps SEQUENCE — using the invite's
+// Sequence when set, otherwise one past the requested value — so recipients see
+// it supersedes the original REQUEST. The result is serialized as iCalendar
+// bytes (CRLF line endings) for the "text/calendar; method=CANCEL" body.
+//
+// It returns an error if the invite has no UID or no ORGANIZER.
+func Cancel(inv Invite) ([]byte, error) {
+	if inv.UID == "" {
+		return nil, fmt.Errorf("scheduling: cancel has no UID")
+	}
+	if inv.Organizer.Email == "" {
+		return nil, fmt.Errorf("scheduling: cancel has no organizer")
+	}
+
+	cal, ev := newScheduling(MethodCancel, inv.UID, inv.Sequence)
+	// A CANCEL must be marked STATUS:CANCELLED (RFC 5546 §3.2.5).
+	ev.Props.SetText(ical.PropStatus, string(StatusCancelled))
+	if !inv.Start.IsZero() {
+		ev.Props.SetDateTime(ical.PropDateTimeStart, inv.Start)
+	}
+	if inv.Summary != "" {
+		ev.Props.SetText(ical.PropSummary, inv.Summary)
+	}
+	echoRecurrenceID(ev, &inv)
+	if org := buildAddress(ical.PropOrganizer, inv.Organizer, ""); org != nil {
+		ev.Props.Set(org)
+	}
+	for _, att := range inv.Attendees {
+		if prop := buildAddress(ical.PropAttendee, att.Address, ""); prop != nil {
+			ev.Props.Add(prop)
+		}
+	}
+	cal.Children = append(cal.Children, ev.Component)
+
+	return encodeCalendar(cal, "cancel")
+}
+
+// newScheduling builds a fresh VCALENDAR carrying the given iTIP method plus an
+// empty VEVENT seeded with the shared properties every scheduling object needs:
+// UID, a current DTSTAMP, and SEQUENCE. Callers add the method-specific
+// properties (times, SUMMARY, STATUS, ORGANIZER/ATTENDEE) and append the event
+// to the calendar's children.
+func newScheduling(method Method, uid string, sequence int) (*ical.Calendar, *ical.Event) {
+	cal := ical.NewCalendar()
+	cal.Props.SetText(ical.PropVersion, "2.0")
+	cal.Props.SetText(ical.PropProductID, productID)
+	cal.Props.SetText(ical.PropMethod, string(method))
+
+	ev := ical.NewEvent()
+	ev.Props.SetText(ical.PropUID, uid)
+	ev.Props.SetDateTime(ical.PropDateTimeStamp, time.Now().UTC())
+	setInt(ev.Props, ical.PropSequence, sequence)
+	return cal, ev
+}
+
+// echoRecurrenceID copies a preserved RECURRENCE-ID property from inv onto ev so
+// its DATE-TIME value type and TZID/RANGE parameters survive — SetText would
+// force an incorrect VALUE=TEXT. It is a no-op for a master (non-instance)
+// invite.
+func echoRecurrenceID(ev *ical.Event, inv *Invite) {
+	if inv.recurrenceProp == nil {
+		return
+	}
+	rid := *inv.recurrenceProp
+	rid.Params = cloneParams(inv.recurrenceProp.Params)
+	ev.Props.Set(&rid)
+}
+
+// encodeCalendar serializes a VCALENDAR to iCalendar bytes (CRLF line endings),
+// wrapping any encode error with the scheduling method's name for context.
+func encodeCalendar(cal *ical.Calendar, what string) ([]byte, error) {
 	var buf bytes.Buffer
 	if err := ical.NewEncoder(&buf).Encode(cal); err != nil {
-		return nil, fmt.Errorf("scheduling: encode reply: %w", err)
+		return nil, fmt.Errorf("scheduling: encode %s: %w", what, err)
 	}
 	return buf.Bytes(), nil
 }
@@ -278,12 +405,30 @@ func buildAddress(name string, addr Address, partStat PartStat) *ical.Prop {
 	prop := ical.NewProp(name)
 	prop.Value = "mailto:" + addr.Email
 	if addr.Name != "" {
-		prop.Params.Set(ical.ParamCommonName, addr.Name)
+		// SECURITY: sanitize the caller-supplied display name. go-ical escapes
+		// TEXT property *values* but not parameter values, so a CN containing
+		// CR/LF would otherwise inject forged property lines into the encoded
+		// object (the same bug fixed in the CalDAV write path).
+		prop.Params.Set(ical.ParamCommonName, sanitizeParam(addr.Name))
 	}
 	if partStat != "" {
 		prop.Params.Set(ical.ParamParticipationStatus, string(partStat))
 	}
 	return prop
+}
+
+// sanitizeParam strips characters unsafe in an iCalendar property parameter
+// value. go-ical escapes TEXT property values but not parameter values, so
+// without this a CN (display name) containing CR/LF could inject forged property
+// lines into the encoded object, and a double quote could break out of a quoted
+// parameter value.
+func sanitizeParam(s string) string {
+	return strings.Map(func(r rune) rune {
+		if r < 0x20 || r == '"' {
+			return -1
+		}
+		return r
+	}, s)
 }
 
 // cloneParams deep-copies an iCalendar parameter set so a copied property does
