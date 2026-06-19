@@ -183,13 +183,16 @@ func resourceAllowed(resource string, allowed []string) bool {
 // /subscriptions handler calls it to prove the client owns the endpoint.
 //
 // SECURITY: notificationURL is client-supplied, so this is a server-side request
-// forgery (SSRF) primitive. It MUST NOT be reachable from a live POST
-// /subscriptions handler until host filtering is added — reject private,
-// loopback, link-local, ULA and cloud-metadata (169.254.169.254) destinations,
-// enforced at dial time (an http.Transport DialContext/Control hook) so DNS
-// rebinding is caught as well. As a baseline this function refuses redirects, so
-// an https URL cannot 302 to an internal http target and bypass the scheme gate;
-// it does NOT yet IP-filter (tracked on MB720-9). client must be non-nil.
+// forgery (SSRF) primitive. Production callers (a live POST /subscriptions
+// handler) MUST pass the client returned by [GuardedClient]: its dialer carries
+// a Control hook that rejects private, loopback, link-local, ULA and
+// cloud-metadata (169.254.169.254, fd00:ec2::254) destinations at dial time, on
+// the resolved IP, so DNS rebinding and redirect targets are caught as well.
+// This function also refuses redirects (on a copy of the client), so an https
+// URL cannot 302 to an internal http target and bypass the scheme gate. The unit
+// tests deliberately pass a permissive client (httptest's, which dials
+// 127.0.0.1) to exercise the handshake itself; the IP filtering lives in
+// [GuardedClient], which those tests do not use. client must be non-nil.
 func VerifyNotificationURL(ctx context.Context, client *http.Client, notificationURL string) error {
 	if client == nil {
 		return errors.New("subscriptions: nil http client")
