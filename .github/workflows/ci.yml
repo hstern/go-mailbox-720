@@ -57,3 +57,24 @@ jobs:
         uses: golangci/golangci-lint-action@v7
         with:
           version: v2.12.2
+
+  conformance:
+    # Drives the real mailboxd binary with Microsoft's official msgraph-sdk-go
+    # client (a separate module, so its large dependency graph stays out of the
+    # library's go.mod). Compiling msgraph-sdk-go is memory-heavy — it needs a
+    # full-size runner.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # The conformance test builds mailboxd, which imports the generated package.
+      - name: Generate (fetch upstream spec + ogen)
+        run: go generate ./internal/graph
+
+      - name: Conformance (msgraph-sdk-go vs mailboxd)
+        working-directory: test/conformance
+        run: go test ./...
