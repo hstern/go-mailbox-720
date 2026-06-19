@@ -23,16 +23,19 @@ import "github.com/hstern/go-mailbox-720/internal/graph/api"
 const basePath = "/v1.0"
 
 // Handler is the mailbox server's Graph handler. Embedding UnimplementedHandler
-// satisfies the full generated api.Handler interface; operations are implemented
-// incrementally by defining methods on Handler in later issues.
+// satisfies the full generated api.Handler interface; implemented operations
+// override it by defining methods on Handler (see handler.go). Operations that
+// need the mail backend return 501 when no provider is configured.
 type Handler struct {
 	api.UnimplementedHandler
+	mail MailProvider
 }
 
 // New builds the mailbox server's HTTP handler (an *api.Server, which is an
-// http.Handler).
-func New() (*api.Server, error) {
-	return api.NewServer(Handler{},
+// http.Handler). mailProvider may be nil, in which case mail operations report
+// "not implemented".
+func New(mailProvider MailProvider) (*api.Server, error) {
+	return api.NewServer(Handler{mail: mailProvider},
 		api.WithPathPrefix(basePath),
 		api.WithErrorHandler(graphErrorHandler),
 		api.WithNotFound(graphNotFoundHandler),

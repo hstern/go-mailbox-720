@@ -24,6 +24,8 @@ import (
 	"time"
 
 	"github.com/hstern/go-mailbox-720/internal/auth"
+	"github.com/hstern/go-mailbox-720/internal/mail"
+	"github.com/hstern/go-mailbox-720/internal/mail/imap"
 	"github.com/hstern/go-mailbox-720/internal/server"
 )
 
@@ -34,6 +36,9 @@ func main() {
 	scopes := flag.String("auth-scope", "", "comma-separated required scopes")
 	subjectClaim := flag.String("auth-subject-claim", "sub", "token claim mapped to the mailbox identity")
 	introspectID := flag.String("auth-introspect-client-id", "", "OAuth2 client id for RFC 7662 introspection of opaque tokens (enables introspection; secret from MAILBOXD_INTROSPECT_CLIENT_SECRET)")
+	imapAddr := flag.String("mail-imap-addr", "", "IMAP server address host:port for the mail backend (empty: mail operations return 501; password from MAILBOXD_IMAP_PASSWORD)")
+	imapUser := flag.String("mail-imap-username", "", "IMAP username for the mail backend")
+	imapTLS := flag.Bool("mail-imap-tls", true, "use implicit TLS for the IMAP connection")
 	flag.Parse()
 
 	cfg := auth.Config{
@@ -50,15 +55,41 @@ func main() {
 			ClientSecret: os.Getenv("MAILBOXD_INTROSPECT_CLIENT_SECRET"),
 		}
 	}
-	if err := run(*addr, cfg); err != nil {
+	var provider server.MailProvider
+	if *imapAddr != "" {
+		provider = staticIMAPProvider{
+			addr:     *imapAddr,
+			username: *imapUser,
+			password: os.Getenv("MAILBOXD_IMAP_PASSWORD"),
+			tls:      *imapTLS,
+		}
+	}
+	if err := run(*addr, cfg, provider); err != nil {
 		log.Fatalln("mailboxd:", err)
 	}
 }
 
-func run(addr string, authCfg auth.Config) error {
-	h, err := server.New()
+// staticIMAPProvider serves every request from one configured IMAP account. A
+// per-identity provider (mapping the token's mailbox identity to credentials,
+// e.g. via Dovecot master users) is future work.
+type staticIMAPProvider struct {
+	addr, username, password string
+	tls                      bool
+}
+
+func (p staticIMAPProvider) Mail(_ context.Context) (mail.Backend, error) {
+	return imap.Dial(p.addr, p.username, p.password, &imap.Options{TLS: p.tls})
+}
+
+func run(addr string, authCfg auth.Config, provider server.MailProvider) error {
+	h, err := server.New(provider)
 	if err != nil {
 		return err
+	}
+	if provider != nil {
+		log.Println("mail: IMAP backend enabled")
+	} else {
+		log.Println("mail: no backend configured — mail operations return 501")
 	}
 
 	var handler http.Handler = h

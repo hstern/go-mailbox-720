@@ -1,19 +1,19 @@
-// Package e2e is a black-box OIDC integration test: it stands up a real Kanidm
-// IdP in a container, provisions an OAuth2 resource server, runs the real
-// mailboxd against it, and asserts that a Kanidm-issued bearer token is accepted
-// (reaching the not-yet-implemented handler, 501) while an unauthenticated
-// request is rejected (401).
+// Package e2e is a black-box vertical-slice integration test. It stands up a real
+// Kanidm IdP and a real Dovecot IMAP server in containers, provisions an OAuth2
+// resource server, seeds a message into the mailbox, and runs the real mailboxd
+// wired to both. It then asserts the whole path: a Kanidm-issued (opaque) token
+// is validated by introspection, the handler pulls the inbox from Dovecot, and
+// GET /v1.0/me/messages returns the seeded message as Graph JSON (200) — while an
+// unauthenticated request is rejected (401).
 //
-// Kanidm issues OPAQUE access tokens, so this exercises the RFC 7662
-// introspection path of internal/auth end to end against a real IdP. It is a
-// separate module (no extra deps on the library) and drives everything over HTTP
-// — the orchestration is plain Go + the docker CLI, no shell or Python scripts.
-//
-// The test self-skips when docker is unavailable. mailboxd is built from the
-// parent module, which must have run `go generate ./internal/graph` first.
+// Everything is driven over HTTP with plain Go + the docker CLI (no shell or
+// Python scripts). The test self-skips when docker is unavailable; mailboxd is
+// built from the parent module, which must have run `go generate ./internal/graph`
+// first.
 package e2e
 
 import (
+	"bufio"
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
@@ -35,6 +35,9 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	goimap "github.com/emersion/go-imap/v2"
+	"github.com/emersion/go-imap/v2/imapclient"
 )
 
 const (
@@ -67,18 +70,47 @@ func TestOIDCEndToEnd(t *testing.T) {
 	adminPassword := recoverAdmin(t)
 	secret := provision(t, dir, adminPassword)
 
-	base := startMailboxd(t, dir, secret)
-	kanidm := caClient(caPool)
+	// Real mail backend: Dovecot with one seeded message in the inbox.
+	dovecotAddr := startDovecot(t)
+	seedMessage(t, dovecotAddr, testMessage)
 
+	base := startMailboxd(t, dir, secret, dovecotAddr)
+	kanidm := caClient(caPool)
 	token := mintToken(t, kanidm, secret)
 
-	// A valid Kanidm token reaches the (unimplemented) handler: 501, not 401.
-	if got := status(t, base+"/me/messages", token); got != http.StatusNotImplemented {
-		t.Errorf("authenticated request: status = %d, want 501 (token rejected by auth?)", got)
-	}
 	// No token is rejected by the middleware.
 	if got := status(t, base+"/me/messages", ""); got != http.StatusUnauthorized {
 		t.Errorf("unauthenticated request: status = %d, want 401", got)
+	}
+
+	// The full vertical slice: the Kanidm token is introspected, the handler
+	// pulls the inbox from Dovecot, and the seeded message comes back as Graph
+	// JSON with a 200.
+	code, body := get(t, base+"/me/messages", token)
+	if code != http.StatusOK {
+		t.Fatalf("authenticated /me/messages: status = %d, body = %s", code, body)
+	}
+	var resp struct {
+		Value []struct {
+			Subject string `json:"subject"`
+			From    struct {
+				EmailAddress struct {
+					Address string `json:"address"`
+				} `json:"emailAddress"`
+			} `json:"from"`
+		} `json:"value"`
+	}
+	if err := json.Unmarshal(body, &resp); err != nil {
+		t.Fatalf("decode response: %v (%s)", err, body)
+	}
+	if len(resp.Value) != 1 {
+		t.Fatalf("got %d messages, want 1: %s", len(resp.Value), body)
+	}
+	if got := resp.Value[0].Subject; got != "Hello there" {
+		t.Errorf("subject = %q, want %q", got, "Hello there")
+	}
+	if got := resp.Value[0].From.EmailAddress.Address; got != "alice@example.com" {
+		t.Errorf("from = %q, want alice@example.com", got)
 	}
 }
 
@@ -219,7 +251,7 @@ func provision(t *testing.T, dir, adminPassword string) string {
 
 // startMailboxd builds and runs the server with auth enforced against Kanidm,
 // trusting the test CA, and returns its /v1.0 base URL.
-func startMailboxd(t *testing.T, dir, secret string) string {
+func startMailboxd(t *testing.T, dir, secret, imapAddr string) string {
 	t.Helper()
 	bin := filepath.Join(t.TempDir(), "mailboxd")
 	build := exec.Command("go", "build", "-o", bin, "./cmd/mailboxd")
@@ -236,10 +268,14 @@ func startMailboxd(t *testing.T, dir, secret string) string {
 		"-auth-audience", rsClientID,
 		"-auth-scope", rsScope,
 		"-auth-introspect-client-id", rsClientID,
+		"-mail-imap-addr", imapAddr,
+		"-mail-imap-username", dovecotUser,
+		"-mail-imap-tls=false",
 	)
 	cmd.Env = append(os.Environ(),
 		"SSL_CERT_FILE="+filepath.Join(dir, "ca.pem"), // trust Kanidm's CA for discovery/introspection
 		"MAILBOXD_INTROSPECT_CLIENT_SECRET="+secret,
+		"MAILBOXD_IMAP_PASSWORD="+dovecotPass,
 	)
 	cmd.Stdout, cmd.Stderr = os.Stderr, os.Stderr
 	if err := cmd.Start(); err != nil {
@@ -306,6 +342,125 @@ func status(t *testing.T, url, token string) int {
 	}
 	_ = resp.Body.Close()
 	return resp.StatusCode
+}
+
+// get issues GET url with an optional bearer token and returns status + body.
+func get(t *testing.T, url, token string) (int, []byte) {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	body, _ := io.ReadAll(resp.Body)
+	return resp.StatusCode, body
+}
+
+// --- Dovecot (the mail backend) ---
+
+const (
+	dovecotImage = "dovecot/dovecot:2.3.21"
+	dovecotCtr   = "mailbox-e2e-oidc-dovecot"
+	dovecotUser  = "test"
+	dovecotPass  = "testpass"
+
+	testMessage = "From: Alice <alice@example.com>\r\n" +
+		"To: Bob <bob@example.com>\r\n" +
+		"Subject: Hello there\r\n" +
+		"Date: Wed, 11 Jun 2025 12:00:00 +0000\r\n" +
+		"Content-Type: text/plain; charset=utf-8\r\n\r\n" +
+		"This is the body of the message.\r\n"
+
+	dovecotConf = `mail_location = maildir:/srv/mail/%u/Maildir
+mail_uid = 1000
+mail_gid = 1000
+first_valid_uid = 1000
+ssl = no
+disable_plaintext_auth = no
+auth_mechanisms = plain login
+passdb {
+  driver = static
+  args = password=testpass
+}
+userdb {
+  driver = static
+  args = uid=1000 gid=1000 home=/srv/mail/%u
+}
+protocols = imap
+service imap-login {
+  inet_listener imap {
+    port = 143
+  }
+}
+listen = *
+log_path = /dev/stderr
+`
+)
+
+func startDovecot(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	conf := filepath.Join(dir, "dovecot.conf")
+	if err := os.WriteFile(conf, []byte(dovecotConf), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_ = exec.Command("docker", "rm", "-f", dovecotCtr).Run()
+
+	addr := freeAddr(t)
+	_, port, _ := net.SplitHostPort(addr)
+	out, err := exec.Command("docker", "run", "-d", "--name", dovecotCtr,
+		"-v", conf+":/etc/dovecot/dovecot.conf:ro",
+		"-p", "127.0.0.1:"+port+":143",
+		dovecotImage).CombinedOutput()
+	if err != nil {
+		t.Fatalf("docker run dovecot: %v\n%s", err, out)
+	}
+	t.Cleanup(func() { _ = exec.Command("docker", "rm", "-f", dovecotCtr).Run() })
+
+	waitFor(t, "dovecot", 30*time.Second, func() bool {
+		conn, err := net.DialTimeout("tcp", addr, time.Second)
+		if err != nil {
+			return false
+		}
+		line, _ := bufio.NewReader(conn).ReadString('\n')
+		_ = conn.Close()
+		return strings.Contains(line, "OK")
+	})
+	return addr
+}
+
+// seedMessage appends raw to INBOX via a raw IMAP client.
+func seedMessage(t *testing.T, addr, raw string) {
+	t.Helper()
+	c, err := imapclient.DialInsecure(addr, nil)
+	if err != nil {
+		t.Fatalf("seed dial: %v", err)
+	}
+	defer func() { _ = c.Close() }()
+	if err := c.Login(dovecotUser, dovecotPass).Wait(); err != nil {
+		t.Fatalf("seed login: %v", err)
+	}
+	ac := c.Append("INBOX", int64(len(raw)), &goimap.AppendOptions{})
+	if _, err := ac.Write([]byte(raw)); err != nil {
+		t.Fatalf("seed write: %v", err)
+	}
+	if err := ac.Close(); err != nil {
+		t.Fatalf("seed close: %v", err)
+	}
+	if _, err := ac.Wait(); err != nil {
+		t.Fatalf("seed append: %v", err)
+	}
+	_ = c.Logout().Wait()
 }
 
 func caClient(pool *x509.CertPool) *http.Client {

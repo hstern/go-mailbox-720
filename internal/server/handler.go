@@ -1,0 +1,90 @@
+package server
+
+import (
+	"context"
+	"fmt"
+	"net/http"
+
+	ht "github.com/ogen-go/ogen/http"
+
+	"github.com/hstern/go-mailbox-720/internal/graph/api"
+	"github.com/hstern/go-mailbox-720/internal/mail"
+)
+
+// MailProvider yields a mail.Backend for an authenticated request. The static
+// implementation lives in cmd/mailboxd; per-identity providers (mapping the
+// token's mailbox identity to backend credentials) come later.
+type MailProvider interface {
+	Mail(ctx context.Context) (mail.Backend, error)
+}
+
+// backend resolves the request's mail backend, or reports "not implemented" when
+// no provider is configured (the skeleton posture).
+func (h Handler) backend(ctx context.Context) (mail.Backend, error) {
+	if h.mail == nil {
+		return nil, ht.ErrNotImplemented
+	}
+	return h.mail.Mail(ctx)
+}
+
+// MeListMessages implements GET /me/messages by listing the inbox.
+func (h Handler) MeListMessages(ctx context.Context, params api.MeListMessagesParams) (api.MeListMessagesRes, error) {
+	b, err := h.backend(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = b.Close() }()
+
+	msgs, err := b.ListMessages(ctx, "", mail.Page{Top: params.Top.Or(0), Skip: params.Skip.Or(0)})
+	if err != nil {
+		return nil, fmt.Errorf("list messages: %w", err)
+	}
+	value := make([]api.MicrosoftGraphMessage, 0, len(msgs))
+	for _, m := range msgs {
+		value = append(value, toGraphMessage(m))
+	}
+	return &api.MicrosoftGraphMessageCollectionResponseStatusCode{
+		StatusCode: http.StatusOK,
+		Response:   api.MicrosoftGraphMessageCollectionResponse{Value: value},
+	}, nil
+}
+
+// MeGetMessages implements GET /me/messages/{message-id}.
+func (h Handler) MeGetMessages(ctx context.Context, params api.MeGetMessagesParams) (api.MeGetMessagesRes, error) {
+	b, err := h.backend(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = b.Close() }()
+
+	m, err := b.GetMessage(ctx, params.MessageID)
+	if err != nil {
+		return nil, fmt.Errorf("get message: %w", err)
+	}
+	return &api.MicrosoftGraphMessageStatusCode{
+		StatusCode: http.StatusOK,
+		Response:   toGraphMessage(m),
+	}, nil
+}
+
+// MeListMailFolders implements GET /me/mailFolders.
+func (h Handler) MeListMailFolders(ctx context.Context, _ api.MeListMailFoldersParams) (api.MeListMailFoldersRes, error) {
+	b, err := h.backend(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = b.Close() }()
+
+	folders, err := b.ListMailFolders(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("list mail folders: %w", err)
+	}
+	value := make([]api.MicrosoftGraphMailFolder, 0, len(folders))
+	for _, f := range folders {
+		value = append(value, toGraphFolder(f))
+	}
+	return &api.MicrosoftGraphMailFolderCollectionResponseStatusCode{
+		StatusCode: http.StatusOK,
+		Response:   api.MicrosoftGraphMailFolderCollectionResponse{Value: value},
+	}, nil
+}

@@ -101,10 +101,14 @@ func (cl *Client) ListMailFolders(_ context.Context) ([]mail.MailFolder, error) 
 
 // ListMessages returns messages in a folder newest-first, bounded by page. Only
 // envelope-level fields are populated (no body) — that is the cheap IMAP FETCH.
+// An empty folderID selects the inbox, so Graph's /me/messages maps onto it.
 func (cl *Client) ListMessages(_ context.Context, folderID string, page mail.Page) ([]mail.Message, error) {
-	mailbox, err := decodeFolderID(folderID)
-	if err != nil {
-		return nil, err
+	mailbox := "INBOX"
+	if folderID != "" {
+		var err error
+		if mailbox, err = decodeFolderID(folderID); err != nil {
+			return nil, err
+		}
 	}
 	sel, err := cl.c.Select(mailbox, nil).Wait()
 	if err != nil {
