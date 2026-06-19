@@ -163,7 +163,7 @@ func fetchSpec(ctx context.Context, url, dest string) error {
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("unexpected status %s", resp.Status)
 	}
@@ -173,10 +173,10 @@ func fetchSpec(ctx context.Context, url, dest string) error {
 		return err
 	}
 	tmpName := tmp.Name()
-	defer os.Remove(tmpName) // no-op once the rename has moved it away
+	defer func() { _ = os.Remove(tmpName) }() // no-op once the rename has moved it away
 
 	if _, err := io.Copy(tmp, resp.Body); err != nil {
-		tmp.Close()
+		_ = tmp.Close()
 		return err
 	}
 	if err := tmp.Close(); err != nil {

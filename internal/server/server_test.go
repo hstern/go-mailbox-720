@@ -42,7 +42,7 @@ func TestUnimplementedOperationReturnsGraphError(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusNotImplemented {
 		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusNotImplemented)
@@ -60,7 +60,7 @@ func TestUnroutedPathReturnsGraphNotFound(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusNotFound {
 		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusNotFound)
@@ -80,7 +80,7 @@ func TestMissingBasePathDoesNotRoute(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusNotFound {
 		t.Errorf("status = %d, want %d (unprefixed path must not match)", resp.StatusCode, http.StatusNotFound)

@@ -13,7 +13,7 @@ import (
 func TestFetchSpec(t *testing.T) {
 	const body = "openapi: 3.0.4\n"
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(body))
+		_, _ = w.Write([]byte(body))
 	}))
 	defer srv.Close()
 
