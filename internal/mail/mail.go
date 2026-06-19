@@ -84,3 +84,26 @@ type Backend interface {
 	// Close releases the backend connection.
 	Close() error
 }
+
+// Writer is the optional message write capability: change a message's read
+// state and delete a message. It is kept separate from Backend so that a
+// read-only adapter (or the server's read-path fakes) need not implement
+// writes, and so that adding writes does not disturb Backend's existing
+// implementers. An adapter that supports writes implements Writer in addition
+// to Backend; consumers type-assert for it:
+//
+//	if w, ok := backend.(mail.Writer); ok {
+//		err := w.SetRead(ctx, id, true)
+//	}
+//
+// These map onto Microsoft Graph's PATCH /me/messages/{id} (isRead) and
+// DELETE /me/messages/{id}. A Writer is bound to the same authenticated mailbox
+// identity as its Backend.
+type Writer interface {
+	// SetRead sets (read=true) or clears (read=false) the message's read state,
+	// the backing for Graph's PATCH of isRead. The opaque id locates the message.
+	SetRead(ctx context.Context, id string, read bool) error
+	// DeleteMessage removes the message with the given opaque id, the backing for
+	// Graph's DELETE.
+	DeleteMessage(ctx context.Context, id string) error
+}

@@ -180,6 +180,84 @@ func TestGetMessageStaleID(t *testing.T) {
 	}
 }
 
+func TestSetRead(t *testing.T) {
+	cl := dialTest(t)
+	ctx := context.Background()
+
+	msgs, err := cl.ListMessages(ctx, folderID("INBOX"), mail.Page{}, nil)
+	if err != nil || len(msgs) != 1 {
+		t.Fatalf("ListMessages: %v (n=%d)", err, len(msgs))
+	}
+	id := msgs[0].ID
+	if msgs[0].IsRead {
+		t.Fatal("freshly appended message is read")
+	}
+
+	// Mark read, then confirm both re-list and GetMessage report IsRead true.
+	if err := cl.SetRead(ctx, id, true); err != nil {
+		t.Fatalf("SetRead(true): %v", err)
+	}
+	after, err := cl.ListMessages(ctx, folderID("INBOX"), mail.Page{}, nil)
+	if err != nil || len(after) != 1 {
+		t.Fatalf("ListMessages (post-set): %v (n=%d)", err, len(after))
+	}
+	if !after[0].IsRead {
+		t.Error("after SetRead(true), IsRead = false, want true")
+	}
+	full, err := cl.GetMessage(ctx, id)
+	if err != nil {
+		t.Fatalf("GetMessage: %v", err)
+	}
+	if !full.IsRead {
+		t.Error("after SetRead(true), GetMessage IsRead = false, want true")
+	}
+
+	// Clear it again.
+	if err := cl.SetRead(ctx, id, false); err != nil {
+		t.Fatalf("SetRead(false): %v", err)
+	}
+	cleared, err := cl.ListMessages(ctx, folderID("INBOX"), mail.Page{}, nil)
+	if err != nil || len(cleared) != 1 {
+		t.Fatalf("ListMessages (post-clear): %v (n=%d)", err, len(cleared))
+	}
+	if cleared[0].IsRead {
+		t.Error("after SetRead(false), IsRead = true, want false")
+	}
+}
+
+func TestDeleteMessage(t *testing.T) {
+	cl := dialTest(t)
+	ctx := context.Background()
+
+	msgs, err := cl.ListMessages(ctx, folderID("INBOX"), mail.Page{}, nil)
+	if err != nil || len(msgs) != 1 {
+		t.Fatalf("ListMessages: %v (n=%d)", err, len(msgs))
+	}
+
+	if err := cl.DeleteMessage(ctx, msgs[0].ID); err != nil {
+		t.Fatalf("DeleteMessage: %v", err)
+	}
+	after, err := cl.ListMessages(ctx, folderID("INBOX"), mail.Page{}, nil)
+	if err != nil {
+		t.Fatalf("ListMessages (post-delete): %v", err)
+	}
+	if len(after) != 0 {
+		t.Errorf("after DeleteMessage, got %d messages, want 0", len(after))
+	}
+}
+
+func TestWriteStaleID(t *testing.T) {
+	cl := dialTest(t)
+	ctx := context.Background()
+	stale := messageID("INBOX", 999999, 1)
+	if err := cl.SetRead(ctx, stale, true); err == nil {
+		t.Error("SetRead with stale UIDVALIDITY = nil error, want error")
+	}
+	if err := cl.DeleteMessage(ctx, stale); err == nil {
+		t.Error("DeleteMessage with stale UIDVALIDITY = nil error, want error")
+	}
+}
+
 // seedMessage describes one message to append to a fresh INBOX for filter tests.
 type seedMessage struct {
 	subject  string

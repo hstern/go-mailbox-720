@@ -110,6 +110,31 @@ func TestDovecotIntegration(t *testing.T) {
 	if len(after) == 1 && after[0].IsRead {
 		t.Error("GetMessage marked the message read — BODY[] fetch is missing PEEK")
 	}
+
+	// Write round-trip against real Dovecot: mark the seeded message read, verify
+	// via re-list, then delete it and verify it is gone.
+	id := msgs[0].ID
+	if err := cl.SetRead(ctx, id, true); err != nil {
+		t.Fatalf("SetRead(true): %v", err)
+	}
+	read, err := cl.ListMessages(ctx, folderID("INBOX"), mail.Page{}, nil)
+	if err != nil {
+		t.Fatalf("ListMessages (post-setread): %v", err)
+	}
+	if len(read) != 1 || !read[0].IsRead {
+		t.Fatalf("after SetRead(true), got %d messages, IsRead=%v; want 1 read", len(read), len(read) == 1 && read[0].IsRead)
+	}
+
+	if err := cl.DeleteMessage(ctx, id); err != nil {
+		t.Fatalf("DeleteMessage: %v", err)
+	}
+	gone, err := cl.ListMessages(ctx, folderID("INBOX"), mail.Page{}, nil)
+	if err != nil {
+		t.Fatalf("ListMessages (post-delete): %v", err)
+	}
+	if len(gone) != 0 {
+		t.Errorf("after DeleteMessage, got %d messages, want 0", len(gone))
+	}
 }
 
 func hasFolder(folders []mail.MailFolder, name string) bool {
