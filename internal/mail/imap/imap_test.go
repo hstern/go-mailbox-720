@@ -318,6 +318,15 @@ func TestListMessagesFilter(t *testing.T) {
 			want:   []string{"Project update"},
 		},
 		{
+			// le with a non-midnight bound must still include same-day messages
+			// (t2 is 2025-06-10 09:00): IMAP BEFORE is date-only, so the candidate
+			// window must cover all of that day. Regression for the SEARCH-superset
+			// bug where BEFORE 10-Jun excluded the whole 10th.
+			name:   "received on or before non-midnight bound",
+			filter: "receivedDateTime le 2025-06-10T10:00:00Z",
+			want:   []string{"Lunch plans", "Project update"},
+		},
+		{
 			name:   "and combines predicates",
 			filter: "contains(subject,'Project') and isRead eq false",
 			want:   []string{"Project deadline"},

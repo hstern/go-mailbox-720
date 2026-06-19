@@ -151,9 +151,14 @@ func dateCriteria(c *odata.Comparison) *goimap.SearchCriteria {
 	out := &goimap.SearchCriteria{}
 	switch c.Op {
 	case odata.OpGe, odata.OpGt:
+		// SINCE <day> includes the whole day — already a superset.
 		out.Since = ts
 	case odata.OpLe, odata.OpLt:
-		out.Before = ts
+		// BEFORE <day> is date-only and EXCLUDES the whole day, so a non-midnight
+		// le/lt bound would drop same-day messages the filter keeps. Widen to the
+		// next day so the candidate set covers all of ts's day; evalFilter then
+		// tightens to the exact instant.
+		out.Before = ts.Truncate(24 * time.Hour).Add(24 * time.Hour)
 	default:
 		return nil
 	}
