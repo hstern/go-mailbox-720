@@ -34,20 +34,35 @@ EMAIL;TYPE=work:alice@example.com
 TEL;TYPE=cell:+1-555-0100
 END:VCARD`
 
-// memBackend is a minimal read-only gocarddav.Backend backed by a single
-// address book holding one card. Write methods panic; the Client under test
-// never calls them.
-type memBackend struct{}
+// memBackend is a minimal mutable gocarddav.Backend backed by a single address
+// book whose address objects live in an in-memory map keyed by object path. It
+// is seeded with one card and supports PUT/DELETE so the write round-trip tests
+// exercise the Client's real network methods end-to-end. Not safe for concurrent
+// use; the httptest server processes one request at a time in these tests.
+type memBackend struct {
+	cards map[string]vcard.Card
+}
 
-func (memBackend) CurrentUserPrincipal(ctx context.Context) (string, error) {
+// newMemBackend returns a backend seeded with the read-test card at
+// testCardPath.
+func newMemBackend(t *testing.T) *memBackend {
+	t.Helper()
+	card, err := vcard.NewDecoder(strings.NewReader(serverCard)).Decode()
+	if err != nil {
+		t.Fatalf("seed card: %v", err)
+	}
+	return &memBackend{cards: map[string]vcard.Card{testCardPath: card}}
+}
+
+func (*memBackend) CurrentUserPrincipal(ctx context.Context) (string, error) {
 	return testPrincipal, nil
 }
 
-func (memBackend) AddressBookHomeSetPath(ctx context.Context) (string, error) {
+func (*memBackend) AddressBookHomeSetPath(ctx context.Context) (string, error) {
 	return testHomeSet, nil
 }
 
-func (memBackend) ListAddressBooks(ctx context.Context) ([]gocarddav.AddressBook, error) {
+func (*memBackend) ListAddressBooks(ctx context.Context) ([]gocarddav.AddressBook, error) {
 	return []gocarddav.AddressBook{{
 		Path:        testAddressBook,
 		Name:        "Default",
@@ -55,7 +70,7 @@ func (memBackend) ListAddressBooks(ctx context.Context) ([]gocarddav.AddressBook
 	}}, nil
 }
 
-func (b memBackend) GetAddressBook(ctx context.Context, path string) (*gocarddav.AddressBook, error) {
+func (b *memBackend) GetAddressBook(ctx context.Context, path string) (*gocarddav.AddressBook, error) {
 	books, _ := b.ListAddressBooks(ctx)
 	for i := range books {
 		if books[i].Path == path {
@@ -65,44 +80,57 @@ func (b memBackend) GetAddressBook(ctx context.Context, path string) (*gocarddav
 	return nil, webdav.NewHTTPError(404, fmt.Errorf("not found"))
 }
 
-func (memBackend) CreateAddressBook(ctx context.Context, ab *gocarddav.AddressBook) error {
+func (*memBackend) CreateAddressBook(ctx context.Context, ab *gocarddav.AddressBook) error {
 	panic("unused")
 }
-func (memBackend) DeleteAddressBook(ctx context.Context, path string) error { panic("unused") }
+func (*memBackend) DeleteAddressBook(ctx context.Context, path string) error { panic("unused") }
 
-func (memBackend) GetAddressObject(ctx context.Context, path string, req *gocarddav.AddressDataRequest) (*gocarddav.AddressObject, error) {
-	if path != testCardPath {
+func (b *memBackend) GetAddressObject(ctx context.Context, path string, req *gocarddav.AddressDataRequest) (*gocarddav.AddressObject, error) {
+	card, ok := b.cards[path]
+	if !ok {
 		return nil, webdav.NewHTTPError(404, fmt.Errorf("not found"))
-	}
-	card, err := vcard.NewDecoder(strings.NewReader(serverCard)).Decode()
-	if err != nil {
-		return nil, err
 	}
 	return &gocarddav.AddressObject{Path: path, Card: card}, nil
 }
 
-func (b memBackend) ListAddressObjects(ctx context.Context, path string, req *gocarddav.AddressDataRequest) ([]gocarddav.AddressObject, error) {
-	obj, err := b.GetAddressObject(ctx, testCardPath, req)
-	if err != nil {
-		return nil, err
+func (b *memBackend) ListAddressObjects(ctx context.Context, path string, req *gocarddav.AddressDataRequest) ([]gocarddav.AddressObject, error) {
+	out := make([]gocarddav.AddressObject, 0, len(b.cards))
+	for p, card := range b.cards {
+		out = append(out, gocarddav.AddressObject{Path: p, Card: card})
 	}
-	return []gocarddav.AddressObject{*obj}, nil
+	return out, nil
 }
 
-func (b memBackend) QueryAddressObjects(ctx context.Context, path string, query *gocarddav.AddressBookQuery) ([]gocarddav.AddressObject, error) {
+func (b *memBackend) QueryAddressObjects(ctx context.Context, path string, query *gocarddav.AddressBookQuery) ([]gocarddav.AddressObject, error) {
 	return b.ListAddressObjects(ctx, path, &query.DataRequest)
 }
 
-func (memBackend) PutAddressObject(ctx context.Context, path string, card vcard.Card, opts *gocarddav.PutAddressObjectOptions) (*gocarddav.AddressObject, error) {
-	panic("unused")
+func (b *memBackend) PutAddressObject(ctx context.Context, path string, card vcard.Card, opts *gocarddav.PutAddressObjectOptions) (*gocarddav.AddressObject, error) {
+	b.cards[path] = card
+	return &gocarddav.AddressObject{Path: path, Card: card}, nil
 }
-func (memBackend) DeleteAddressObject(ctx context.Context, path string) error { panic("unused") }
+
+func (b *memBackend) DeleteAddressObject(ctx context.Context, path string) error {
+	if _, ok := b.cards[path]; !ok {
+		return webdav.NewHTTPError(404, fmt.Errorf("not found"))
+	}
+	delete(b.cards, path)
+	return nil
+}
 
 // newTestClient stands up the in-process server and returns a Client pointed at
 // its well-known CardDAV URL.
 func newTestClient(t *testing.T) *Client {
 	t.Helper()
-	h := &gocarddav.Handler{Backend: memBackend{}}
+	return newTestClientWithBackend(t, newMemBackend(t))
+}
+
+// newTestClientWithBackend stands up the in-process server over the given
+// backend and returns a Client pointed at its well-known CardDAV URL, letting a
+// caller retain a handle to the backend to assert on stored state.
+func newTestClientWithBackend(t *testing.T, b *memBackend) *Client {
+	t.Helper()
+	h := &gocarddav.Handler{Backend: b}
 	ts := httptest.NewServer(h)
 	t.Cleanup(ts.Close)
 

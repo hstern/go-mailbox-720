@@ -70,3 +70,29 @@ type Backend interface {
 	// Close releases the backend connection.
 	Close() error
 }
+
+// Writer is the optional contact write capability: create, update, and delete.
+// It is kept separate from Backend so that a read-only adapter (or the server's
+// read-path fakes) need not implement writes, and so that adding writes does not
+// disturb Backend's existing implementers. An adapter that supports writes
+// implements Writer in addition to Backend; consumers type-assert for it:
+//
+//	if w, ok := backend.(contacts.Writer); ok {
+//		created, err := w.CreateContact(ctx, addressBookID, c)
+//	}
+//
+// A Writer is bound to the same authenticated principal as its Backend.
+type Writer interface {
+	// CreateContact creates a new contact in the named address book and returns
+	// it stamped with its assigned opaque ID (and, when the backend generates
+	// one, its UID). The input contact's ID is ignored.
+	CreateContact(ctx context.Context, addressBookID string, c Contact) (Contact, error)
+	// UpdateContact replaces the contact identified by c.ID with c and returns
+	// the stored contact. The opaque c.ID locates the backing resource;
+	// AddressBookID is derived from it.
+	UpdateContact(ctx context.Context, c Contact) (Contact, error)
+	// DeleteContact removes the contact with the given opaque ID. Deleting a
+	// contact that does not exist returns a not-found error (mirroring Graph's
+	// DELETE semantics); a caller wanting idempotent cleanup can ignore it.
+	DeleteContact(ctx context.Context, id string) error
+}
