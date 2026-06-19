@@ -44,6 +44,14 @@ go build ./...
 go test ./...
 ```
 
+Some integration tests need Docker and are behind a build tag so the default
+`go test ./...` stays fast. The IMAP adapter has a Dovecot-backed integration
+test:
+
+```sh
+go test -tags dockertest ./internal/mail/imap/
+```
+
 Run the server (auth disabled — all requests allowed; for local experimentation
 only):
 
@@ -93,6 +101,8 @@ if an issuer cannot be discovered, and rejects any request without a valid token
 | `internal/server` | HTTP server implementing the generated handler. |
 | `internal/auth` | OIDC resource-server middleware. |
 | `internal/grapherr` | Graph error-object response shape. |
+| `internal/mail` | Mailbox backing-store port (backend-neutral, Graph/JMAP-shaped). |
+| `internal/mail/imap` | IMAP adapter implementing the mail port (go-imap v2 + go-message). |
 | `cmd/mailboxd` | The server binary. |
 | `test/conformance` | Black-box conformance test driving mailboxd with the official `msgraph-sdk-go` client (separate module). |
 | `test/e2e-oidc` | OIDC end-to-end test: a real Kanidm IdP (Docker) issues a token that mailboxd accepts via introspection (separate module; needs Docker). |

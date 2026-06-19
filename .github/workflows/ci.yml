@@ -99,3 +99,20 @@ jobs:
       - name: OIDC e2e (Kanidm + mailboxd)
         working-directory: test/e2e-oidc
         run: go test -timeout 360s ./...
+
+  mail-imap-e2e:
+    # Runs the IMAP adapter against a real Dovecot server in Docker (build tag
+    # dockertest), validating real-server behaviour the in-process memserver
+    # can't (e.g. BODY[].PEEK not marking messages read). Docker is available on
+    # GitHub-hosted runners.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: IMAP adapter integration (Dovecot)
+        run: go test -tags dockertest -timeout 180s -run TestDovecotIntegration ./internal/mail/imap/
+
