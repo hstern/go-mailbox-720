@@ -22,7 +22,12 @@ func decodeGraphError(t *testing.T, resp *http.Response) string {
 	if ct := resp.Header.Get("Content-Type"); ct != "application/json" {
 		t.Errorf("Content-Type = %q, want application/json", ct)
 	}
-	var ge graphError
+	var ge struct {
+		Error struct {
+			Code    string `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
 	if err := json.NewDecoder(resp.Body).Decode(&ge); err != nil {
 		t.Fatalf("decode body: %v", err)
 	}
