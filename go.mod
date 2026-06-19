@@ -3,9 +3,12 @@ module github.com/hstern/go-mailbox-720
 go 1.26.4
 
 require (
+	github.com/CiscoM31/godata v1.0.11
 	github.com/coreos/go-oidc/v3 v3.19.0
+	github.com/emersion/go-ical v0.0.0-20250609112844-439c63cef608
 	github.com/emersion/go-imap/v2 v2.0.0-beta.8
 	github.com/emersion/go-message v0.18.2
+	github.com/emersion/go-webdav v0.7.0
 	github.com/go-faster/errors v0.7.1
 	github.com/go-faster/jx v1.2.0
 	github.com/go-jose/go-jose/v4 v4.1.4
@@ -31,6 +34,7 @@ require (
 	github.com/mattn/go-isatty v0.0.22 // indirect
 	github.com/segmentio/asm v1.2.1 // indirect
 	github.com/shopspring/decimal v1.4.0 // indirect
+	github.com/teambition/rrule-go v1.8.2 // indirect
 	go.opentelemetry.io/auto/sdk v1.2.1 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
 	go.uber.org/zap v1.28.0 // indirect
