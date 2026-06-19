@@ -78,3 +78,24 @@ jobs:
       - name: Conformance (msgraph-sdk-go vs mailboxd)
         working-directory: test/conformance
         run: go test ./...
+
+  oidc-e2e:
+    # Stands up a real Kanidm IdP in a container, provisions an OAuth2 resource
+    # server, and asserts mailboxd accepts a Kanidm-issued (opaque) token via
+    # RFC 7662 introspection (-> 501) and rejects an unauthenticated request
+    # (-> 401). Docker is available on GitHub-hosted runners.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # The e2e builds mailboxd, which imports the generated package.
+      - name: Generate (fetch upstream spec + ogen)
+        run: go generate ./internal/graph
+
+      - name: OIDC e2e (Kanidm + mailboxd)
+        working-directory: test/e2e-oidc
+        run: go test -timeout 360s ./...

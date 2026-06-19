@@ -94,6 +94,8 @@ if an issuer cannot be discovered, and rejects any request without a valid token
 | `internal/auth` | OIDC resource-server middleware. |
 | `internal/grapherr` | Graph error-object response shape. |
 | `cmd/mailboxd` | The server binary. |
+| `test/conformance` | Black-box conformance test driving mailboxd with the official `msgraph-sdk-go` client (separate module). |
+| `test/e2e-oidc` | OIDC end-to-end test: a real Kanidm IdP (Docker) issues a token that mailboxd accepts via introspection (separate module; needs Docker). |
 
 ## License
 
