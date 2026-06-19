@@ -1,0 +1,6 @@
+# No Microsoft intellectual property in git.
+# The Graph OpenAPI spec, any derived subset, and ogen-generated code (a derivative
+# of the spec) are fetched + generated at BUILD time, never checked in. These
+# patterns guard against accidental commits wherever the build places them.
+openapi-full.yaml
+openapi-subset.yaml
