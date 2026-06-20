@@ -165,6 +165,10 @@ func toGraphEvent(e calendar.Event) api.MicrosoftGraphEvent {
 			ContentType: api.NewOptMicrosoftGraphBodyType(graphBodyType(e.Body.ContentType)),
 		})
 	}
+	if pr, ok := graphRecurrence(e.Recurrence, e.Start); ok {
+		ge.Recurrence = api.NewOptMicrosoftGraphPatternedRecurrence(pr)
+	}
+	ge.Type = api.NewOptMicrosoftGraphEventType(graphEventType(e))
 	return ge
 }
 

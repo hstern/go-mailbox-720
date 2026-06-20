@@ -69,6 +69,11 @@ var mailboxConfig = specsubset.Config{
 		"/me/events/{event-id}/accept",
 		"/me/events/{event-id}/decline",
 		"/me/events/{event-id}/tentativelyAccept",
+		// Recurring-event instance surfacing (MB720-16): expand a series into its
+		// occurrences, and the time-windowed calendar view that includes them.
+		"/me/events/{event-id}/instances",
+		"/me/calendarView",
+		"/users/{user-id}/events/{event-id}/instances",
 		"/users/{user-id}/messages",
 		"/users/{user-id}/messages/{message-id}",
 		"/users/{user-id}/mailFolders",

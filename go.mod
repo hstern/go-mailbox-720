@@ -28,6 +28,7 @@ require (
 	github.com/hstern/go-bearer-token v0.2.0
 	github.com/hstern/go-protected-resource-metadata v0.1.0
 	github.com/hstern/go-token-introspection v0.1.0
+	github.com/teambition/rrule-go v1.8.2
 )
 
 require (
@@ -43,7 +44,6 @@ require (
 	github.com/mattn/go-isatty v0.0.22 // indirect
 	github.com/segmentio/asm v1.2.1 // indirect
 	github.com/shopspring/decimal v1.4.0 // indirect
-	github.com/teambition/rrule-go v1.8.2 // indirect
 	go.opentelemetry.io/auto/sdk v1.2.1 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
 	go.uber.org/zap v1.28.0 // indirect
