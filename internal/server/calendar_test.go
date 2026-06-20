@@ -70,7 +70,7 @@ func newCalendarFixture() *fakeCalendarBackend {
 					End:       end,
 					Location:  "Room 1",
 					Organizer: calendar.Address{Name: "Alice", Email: "alice@example.com"},
-					Attendees: []calendar.Address{{Name: "Bob", Email: "bob@example.com"}},
+					Attendees: []calendar.Attendee{{Name: "Bob", Email: "bob@example.com"}},
 				},
 			},
 		},
