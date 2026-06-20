@@ -329,6 +329,166 @@ func TestRespondSenderError(t *testing.T) {
 	}
 }
 
+// sampleEvent builds a stored calendar.Event of the shape the future
+// accept/decline endpoints would load: an organizer to reply to and a couple of
+// attendees, with no original REQUEST mail retained.
+func sampleEvent() calendar.Event {
+	return calendar.Event{
+		UID:       "evt-123@example.com",
+		Subject:   "Project sync",
+		Start:     time.Date(2026, 6, 15, 15, 0, 0, 0, time.UTC),
+		End:       time.Date(2026, 6, 15, 16, 0, 0, 0, time.UTC),
+		Organizer: calendar.Address{Name: "Olivia Organizer", Email: "org@example.com"},
+		Attendees: []calendar.Address{
+			{Name: "Andy Attendee", Email: "andy@example.com"},
+			{Name: "Bea Attendee", Email: "bea@example.com"},
+		},
+	}
+}
+
+func TestInviteFromEvent(t *testing.T) {
+	ev := sampleEvent()
+
+	got := InviteFromEvent(ev)
+
+	if got.Method != scheduling.MethodRequest {
+		t.Errorf("Method = %q, want REQUEST", got.Method)
+	}
+	if got.UID != ev.UID {
+		t.Errorf("UID = %q, want %q", got.UID, ev.UID)
+	}
+	if got.Summary != ev.Subject {
+		t.Errorf("Summary = %q, want %q", got.Summary, ev.Subject)
+	}
+	if !got.Start.Equal(ev.Start) {
+		t.Errorf("Start = %v, want %v", got.Start, ev.Start)
+	}
+	if !got.End.Equal(ev.End) {
+		t.Errorf("End = %v, want %v", got.End, ev.End)
+	}
+	wantOrg := scheduling.Address{Name: "Olivia Organizer", Email: "org@example.com"}
+	if got.Organizer != wantOrg {
+		t.Errorf("Organizer = %+v, want %+v", got.Organizer, wantOrg)
+	}
+	if len(got.Attendees) != 2 {
+		t.Fatalf("Attendees len = %d, want 2", len(got.Attendees))
+	}
+	for i, want := range []scheduling.Attendee{
+		{Address: scheduling.Address{Name: "Andy Attendee", Email: "andy@example.com"}},
+		{Address: scheduling.Address{Name: "Bea Attendee", Email: "bea@example.com"}},
+	} {
+		if got.Attendees[i] != want {
+			t.Errorf("Attendees[%d] = %+v, want %+v (empty PARTSTAT)", i, got.Attendees[i], want)
+		}
+	}
+	// Detail not reconstructable from the neutral event: defaults.
+	if got.Sequence != 0 {
+		t.Errorf("Sequence = %d, want 0 (not stored on event)", got.Sequence)
+	}
+	if got.RecurrenceID != "" {
+		t.Errorf("RecurrenceID = %q, want empty (not stored on event)", got.RecurrenceID)
+	}
+}
+
+func TestRespondToEvent(t *testing.T) {
+	ev := sampleEvent()
+	s := &fakeSender{}
+	attendee := scheduling.Address{Name: "Andy Attendee", Email: "andy@example.com"}
+
+	err := RespondToEvent(context.Background(), s, ev, attendee, scheduling.PartStatAccepted, fixedDate)
+	if err != nil {
+		t.Fatalf("RespondToEvent: %v", err)
+	}
+
+	if s.sendCalls != 1 {
+		t.Fatalf("Send calls = %d, want 1", s.sendCalls)
+	}
+	if s.gotFrom != "andy@example.com" {
+		t.Errorf("from = %q, want andy@example.com", s.gotFrom)
+	}
+	if len(s.gotTo) != 1 || s.gotTo[0] != "org@example.com" {
+		t.Errorf("to = %v, want [org@example.com]", s.gotTo)
+	}
+
+	// The sent bytes must Parse back to a REPLY carrying the attendee's decision.
+	reply, err := scheduling.Parse(s.gotRaw)
+	if err != nil {
+		t.Fatalf("parse sent reply: %v", err)
+	}
+	if reply.Method != scheduling.MethodReply {
+		t.Errorf("sent method = %q, want REPLY", reply.Method)
+	}
+	if reply.UID != "evt-123@example.com" {
+		t.Errorf("reply UID = %q, want evt-123@example.com", reply.UID)
+	}
+	if len(reply.Attendees) != 1 {
+		t.Fatalf("reply attendees = %d, want 1", len(reply.Attendees))
+	}
+	if reply.Attendees[0].Email != "andy@example.com" {
+		t.Errorf("reply attendee = %q", reply.Attendees[0].Email)
+	}
+	if reply.Attendees[0].PartStat != scheduling.PartStatAccepted {
+		t.Errorf("reply PARTSTAT = %q, want ACCEPTED", reply.Attendees[0].PartStat)
+	}
+}
+
+func TestRespondToEventPartStats(t *testing.T) {
+	ev := sampleEvent()
+	attendee := scheduling.Address{Name: "Andy Attendee", Email: "andy@example.com"}
+
+	for _, ps := range []scheduling.PartStat{
+		scheduling.PartStatAccepted,
+		scheduling.PartStatDeclined,
+		scheduling.PartStatTentative,
+	} {
+		t.Run(string(ps), func(t *testing.T) {
+			s := &fakeSender{}
+			if err := RespondToEvent(context.Background(), s, ev, attendee, ps, fixedDate); err != nil {
+				t.Fatalf("RespondToEvent: %v", err)
+			}
+			if s.gotFrom != "andy@example.com" {
+				t.Errorf("from = %q, want andy@example.com", s.gotFrom)
+			}
+			if len(s.gotTo) != 1 || s.gotTo[0] != "org@example.com" {
+				t.Errorf("to = %v, want [org@example.com]", s.gotTo)
+			}
+			reply, err := scheduling.Parse(s.gotRaw)
+			if err != nil {
+				t.Fatalf("parse reply: %v", err)
+			}
+			if reply.Method != scheduling.MethodReply {
+				t.Errorf("method = %q, want REPLY", reply.Method)
+			}
+			if reply.Attendees[0].PartStat != ps {
+				t.Errorf("PARTSTAT = %q, want %q", reply.Attendees[0].PartStat, ps)
+			}
+		})
+	}
+}
+
+func TestRespondToEventNoOrganizer(t *testing.T) {
+	ev := sampleEvent()
+	ev.Organizer = calendar.Address{} // no organizer to reply to
+
+	s := &fakeSender{}
+	err := RespondToEvent(context.Background(), s, ev, scheduling.Address{Email: "andy@example.com"}, scheduling.PartStatAccepted, fixedDate)
+	if err == nil {
+		t.Fatal("RespondToEvent without organizer: want error, got nil")
+	}
+	if s.sendCalls != 0 {
+		t.Errorf("Send calls = %d, want 0", s.sendCalls)
+	}
+}
+
+func TestRespondToEventSenderError(t *testing.T) {
+	s := &fakeSender{sendErr: errors.New("smtp down")}
+	attendee := scheduling.Address{Email: "andy@example.com"}
+	err := RespondToEvent(context.Background(), s, sampleEvent(), attendee, scheduling.PartStatAccepted, fixedDate)
+	if err == nil {
+		t.Fatal("want sender error, got nil")
+	}
+}
+
 func TestInvite(t *testing.T) {
 	inv := &scheduling.Invite{
 		UID:       "new-1@example.com",

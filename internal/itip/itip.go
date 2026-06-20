@@ -94,6 +94,52 @@ func EventFromInvite(inv *scheduling.Invite) calendar.Event {
 	}
 }
 
+// InviteFromEvent maps a stored backend-neutral [calendar.Event] onto a
+// scheduling [Invite] carrying just enough for a REPLY. It is the inverse of
+// [EventFromInvite] for the fields a reply needs, and performs no I/O.
+//
+// It exists so the user can answer an invitation from the STORED event (the only
+// thing the future accept/decline Graph endpoints have — an event id) rather than
+// from the original raw REQUEST mail, which is not retained.
+//
+// Field mapping (calendar.Event -> scheduling.Invite):
+//
+//   - UID        -> UID        (the correlation key the REPLY echoes)
+//   - Subject    -> Summary
+//   - Start      -> Start      (RFC 5546 §3.2.3 requires DTSTART in a REPLY)
+//   - End        -> End
+//   - Organizer  -> Organizer  (calendar.Address -> scheduling.Address; the
+//     address the REPLY is sent to)
+//   - Attendees  -> Attendees  (each calendar.Address -> scheduling.Attendee with
+//     an empty PARTSTAT; per-attendee participation status is not stored on the
+//     neutral Event, so it cannot be reconstructed here)
+//
+// Method is set to [scheduling.MethodRequest] because the returned Invite stands
+// in for the original request the user is replying to.
+//
+// FIRST-CUT LIMITATION: the neutral Event does not carry an iCalendar SEQUENCE or
+// RECURRENCE-ID, so neither is reconstructable here — Sequence defaults to 0 and
+// RecurrenceID is empty. A reply built from this Invite therefore addresses the
+// master event at SEQUENCE 0; replying to a specific overridden instance of a
+// recurring series, or echoing the request's true sequence, needs that detail
+// preserved on the event (a follow-up once the store models it).
+func InviteFromEvent(ev calendar.Event) *scheduling.Invite {
+	attendees := make([]scheduling.Attendee, 0, len(ev.Attendees))
+	for _, a := range ev.Attendees {
+		attendees = append(attendees, scheduling.Attendee{Address: toSchedulingAddress(a)})
+	}
+
+	return &scheduling.Invite{
+		Method:    scheduling.MethodRequest,
+		UID:       ev.UID,
+		Summary:   ev.Subject,
+		Start:     ev.Start,
+		End:       ev.End,
+		Organizer: toSchedulingAddress(ev.Organizer),
+		Attendees: attendees,
+	}
+}
+
 // ProcessRequest is the inbound-REQUEST orchestration: it parses a raw iMIP
 // message, verifies it is a METHOD:REQUEST, maps it onto a tentative
 // [calendar.Event] via [EventFromInvite], and creates that event in the named
@@ -158,6 +204,40 @@ func Respond(ctx context.Context, sender smtp.Sender, attendee scheduling.Addres
 	return nil
 }
 
+// RespondToEvent is the event-based analog of [Respond]: it lets the responding
+// attendee answer an invitation from the STORED [calendar.Event] rather than from
+// the original raw REQUEST mail (which is not retained). It builds the reply
+// invite via [InviteFromEvent], composes the METHOD:REPLY iMIP message conveying
+// the attendee's participation status (via [scheduling.ComposeReply]), and submits
+// it to the organizer through the [smtp.Sender] — from the attendee's address, to
+// the organizer's.
+//
+// attendee is the responding mailbox owner; the endpoint layer determines who
+// "me" is, so the caller supplies it. partStat is the user's decision
+// ([scheduling.PartStatAccepted], PartStatDeclined, or PartStatTentative). date is
+// passed in so the composed message is deterministic (no time.Now). It returns an
+// error if the event carries no organizer to reply to, the REPLY cannot be
+// composed, or the send fails.
+//
+// It shares [Respond]'s SEQUENCE/RECURRENCE-ID first-cut limitation via
+// [InviteFromEvent]: the reply addresses the master event at SEQUENCE 0.
+func RespondToEvent(ctx context.Context, sender smtp.Sender, ev calendar.Event, attendee scheduling.Address, partStat scheduling.PartStat, date time.Time) error {
+	inv := InviteFromEvent(ev)
+	if inv.Organizer.Email == "" {
+		return fmt.Errorf("itip: respond to event: event has no organizer to reply to")
+	}
+
+	msg, err := scheduling.ComposeReply(inv, attendee, partStat, date)
+	if err != nil {
+		return fmt.Errorf("itip: compose reply: %w", err)
+	}
+
+	if err := sender.Send(ctx, attendee.Email, []string{inv.Organizer.Email}, msg); err != nil {
+		return fmt.Errorf("itip: send reply: %w", err)
+	}
+	return nil
+}
+
 // Invite is the organizer-side orchestration: it builds a METHOD:REQUEST iMIP
 // message for the given invite (via [scheduling.Request] + [scheduling.Compose])
 // and submits it to every attendee through the [smtp.Sender], from the
@@ -208,4 +288,12 @@ func Invite(ctx context.Context, sender smtp.Sender, organizer scheduling.Addres
 // separate packages, so the bridge is explicit.
 func toCalendarAddress(a scheduling.Address) calendar.Address {
 	return calendar.Address{Name: a.Name, Email: a.Email}
+}
+
+// toSchedulingAddress maps a calendar.Address onto the scheduling engine's
+// Address — the reverse of toCalendarAddress. The two types are structurally
+// identical (display name + email) but live in separate packages, so the bridge
+// is explicit.
+func toSchedulingAddress(a calendar.Address) scheduling.Address {
+	return scheduling.Address{Name: a.Name, Email: a.Email}
 }
