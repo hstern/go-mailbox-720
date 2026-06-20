@@ -453,6 +453,13 @@ func graphToEvent(ge *api.MicrosoftGraphEvent) (calendar.Event, error) {
 			ContentType: neutralBodyType(v.ContentType),
 		}
 	}
+	if v, ok := ge.Recurrence.Get(); ok {
+		rp, err := recurrenceFromGraph(v)
+		if err != nil {
+			return calendar.Event{}, fmt.Errorf("recurrence: %w", err)
+		}
+		e.Recurrence = rp
+	}
 	return e, nil
 }
 
