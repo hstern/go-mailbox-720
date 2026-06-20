@@ -600,3 +600,101 @@ func TestMeDeleteEventsCancelSendFailureStillReturns204(t *testing.T) {
 		t.Errorf("deleted id = %q, want evt-1", backend.deletedID)
 	}
 }
+
+// A PATCH that significantly changes a meeting (here, its start) re-sends a
+// METHOD:REQUEST with a bumped SEQUENCE and records the per-attendee
+// SCHEDULE-STATUS, on the dumb-backend tier.
+func TestMeUpdateEventsSignificantChangeReinvites(t *testing.T) {
+	backend := newWritableCalendarBackendSeeded() // seededEvent: Start 09:00, attendee Bob, Sequence 0
+	sender := &fakeSender{}
+	h := Handler{
+		calendar:   writableCalendarProvider{backend: backend},
+		scheduling: fakeSchedulingProvider{sender: sender, addr: "me@example.com"},
+	}
+
+	req := &api.MicrosoftGraphEvent{
+		Start: api.NewOptMicrosoftGraphDateTimeTimeZone(api.MicrosoftGraphDateTimeTimeZone{DateTime: api.NewOptString("2026-06-21T11:00:00.0000000")}),
+	}
+	res, err := h.MeUpdateEvents(context.Background(), req, api.MeUpdateEventsParams{EventID: "evt-1"})
+	if err != nil {
+		t.Fatalf("MeUpdateEvents: %v", err)
+	}
+	if ok, isOK := res.(*api.MicrosoftGraphEventStatusCode); !isOK || ok.StatusCode != 200 {
+		t.Fatalf("response = %T, want 200", res)
+	}
+	if sender.from != "me@example.com" {
+		t.Errorf("REQUEST from = %q, want me@example.com", sender.from)
+	}
+	if len(sender.to) != 1 || sender.to[0] != "bob@example.com" {
+		t.Errorf("REQUEST to = %v, want [bob@example.com]", sender.to)
+	}
+	inv, err := scheduling.Parse(sender.raw)
+	if err != nil {
+		t.Fatalf("parse REQUEST: %v", err)
+	}
+	if inv.Method != scheduling.MethodRequest {
+		t.Errorf("sent method = %q, want REQUEST", inv.Method)
+	}
+	if inv.Sequence != 1 {
+		t.Errorf("sent SEQUENCE = %d, want 1 (bumped from 0)", inv.Sequence)
+	}
+	if backend.updatedEvent.Sequence != 1 {
+		t.Errorf("persisted SEQUENCE = %d, want 1", backend.updatedEvent.Sequence)
+	}
+	for _, a := range backend.updatedEvent.Attendees {
+		if a.Email == "bob@example.com" && a.ScheduleStatus != "1.1" {
+			t.Errorf("Bob SCHEDULE-STATUS = %q, want 1.1", a.ScheduleStatus)
+		}
+	}
+}
+
+// A PATCH that changes only an insignificant field (the subject) re-sends nothing
+// and does not bump SEQUENCE.
+func TestMeUpdateEventsInsignificantChangeDoesNotReinvite(t *testing.T) {
+	backend := newWritableCalendarBackendSeeded()
+	sender := &fakeSender{}
+	h := Handler{
+		calendar:   writableCalendarProvider{backend: backend},
+		scheduling: fakeSchedulingProvider{sender: sender, addr: "me@example.com"},
+	}
+
+	req := &api.MicrosoftGraphEvent{Subject: api.NewOptNilString("Renamed")}
+	res, err := h.MeUpdateEvents(context.Background(), req, api.MeUpdateEventsParams{EventID: "evt-1"})
+	if err != nil {
+		t.Fatalf("MeUpdateEvents: %v", err)
+	}
+	if ok, isOK := res.(*api.MicrosoftGraphEventStatusCode); !isOK || ok.StatusCode != 200 {
+		t.Fatalf("response = %T, want 200", res)
+	}
+	if sender.from != "" {
+		t.Error("re-sent a REQUEST for a subject-only change")
+	}
+	if backend.updatedEvent.Sequence != 0 {
+		t.Errorf("SEQUENCE = %d, want 0 (unchanged)", backend.updatedEvent.Sequence)
+	}
+}
+
+// A native-scheduling backend re-issues invitations itself, so a significant PATCH
+// must not also email a REQUEST (though SEQUENCE still advances on the write).
+func TestMeUpdateEventsNativeSchedulerDoesNotReinvite(t *testing.T) {
+	backend := &nativeCalendarBackend{writableCalendarBackend: *newWritableCalendarBackendSeeded()}
+	sender := &fakeSender{}
+	h := Handler{
+		calendar:   nativeCalendarProvider{backend: backend},
+		scheduling: fakeSchedulingProvider{sender: sender, addr: "me@example.com"},
+	}
+
+	req := &api.MicrosoftGraphEvent{
+		Start: api.NewOptMicrosoftGraphDateTimeTimeZone(api.MicrosoftGraphDateTimeTimeZone{DateTime: api.NewOptString("2026-06-21T11:00:00.0000000")}),
+	}
+	res, err := h.MeUpdateEvents(context.Background(), req, api.MeUpdateEventsParams{EventID: "evt-1"})
+	if err != nil {
+		t.Fatalf("MeUpdateEvents: %v", err)
+	}
+	if ok, isOK := res.(*api.MicrosoftGraphEventStatusCode); !isOK || ok.StatusCode != 200 {
+		t.Fatalf("response = %T, want 200", res)
+	}
+	if sender.from != "" {
+		t.Error("emailed a REQUEST even though the server schedules natively")
+	}
+}

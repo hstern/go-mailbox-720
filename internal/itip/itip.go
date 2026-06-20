@@ -122,12 +122,13 @@ func EventFromInvite(inv *scheduling.Invite) calendar.Event {
 // Method is set to [scheduling.MethodRequest] because the returned Invite stands
 // in for the original request the user is replying to.
 //
-// FIRST-CUT LIMITATION: the neutral Event does not carry an iCalendar SEQUENCE or
-// RECURRENCE-ID, so neither is reconstructable here — Sequence defaults to 0 and
-// RecurrenceID is empty. A reply built from this Invite therefore addresses the
-// master event at SEQUENCE 0; replying to a specific overridden instance of a
-// recurring series, or echoing the request's true sequence, needs that detail
-// preserved on the event (a follow-up once the store models it).
+// The event's SEQUENCE is carried through, so a re-issued REQUEST/CANCEL or a REPLY
+// addresses the event at its true revision.
+//
+// FIRST-CUT LIMITATION: the neutral Event does not carry an iCalendar RECURRENCE-ID,
+// so it cannot be reconstructed here (RecurrenceID is empty) — this Invite addresses
+// the master event, not a single overridden instance of a recurring series (a
+// follow-up once the store models per-instance overrides).
 func InviteFromEvent(ev calendar.Event) *scheduling.Invite {
 	attendees := make([]scheduling.Attendee, 0, len(ev.Attendees))
 	for _, a := range ev.Attendees {
@@ -143,6 +144,7 @@ func InviteFromEvent(ev calendar.Event) *scheduling.Invite {
 		Summary:   ev.Subject,
 		Start:     ev.Start,
 		End:       ev.End,
+		Sequence:  ev.Sequence,
 		Organizer: toSchedulingAddress(ev.Organizer),
 		Attendees: attendees,
 	}
@@ -227,8 +229,9 @@ func Respond(ctx context.Context, sender smtp.Sender, attendee scheduling.Addres
 // error if the event carries no organizer to reply to, the REPLY cannot be
 // composed, or the send fails.
 //
-// It shares [Respond]'s SEQUENCE/RECURRENCE-ID first-cut limitation via
-// [InviteFromEvent]: the reply addresses the master event at SEQUENCE 0.
+// It shares [Respond]'s RECURRENCE-ID first-cut limitation via [InviteFromEvent]:
+// the reply addresses the master event (no per-instance RECURRENCE-ID), at the
+// stored event's SEQUENCE.
 func RespondToEvent(ctx context.Context, sender smtp.Sender, ev calendar.Event, attendee scheduling.Address, partStat scheduling.PartStat, date time.Time) error {
 	inv := InviteFromEvent(ev)
 	if inv.Organizer.Email == "" {

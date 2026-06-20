@@ -348,6 +348,7 @@ func sampleEvent() calendar.Event {
 
 func TestInviteFromEvent(t *testing.T) {
 	ev := sampleEvent()
+	ev.Sequence = 5
 
 	got := InviteFromEvent(ev)
 
@@ -381,10 +382,10 @@ func TestInviteFromEvent(t *testing.T) {
 			t.Errorf("Attendees[%d] = %+v, want %+v (empty PARTSTAT)", i, got.Attendees[i], want)
 		}
 	}
-	// Detail not reconstructable from the neutral event: defaults.
-	if got.Sequence != 0 {
-		t.Errorf("Sequence = %d, want 0 (not stored on event)", got.Sequence)
+	if got.Sequence != 5 {
+		t.Errorf("Sequence = %d, want 5 (carried from the event)", got.Sequence)
 	}
+	// RECURRENCE-ID is not reconstructable from the neutral event: defaults to empty.
 	if got.RecurrenceID != "" {
 		t.Errorf("RecurrenceID = %q, want empty (not stored on event)", got.RecurrenceID)
 	}

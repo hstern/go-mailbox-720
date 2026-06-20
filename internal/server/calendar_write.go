@@ -83,18 +83,9 @@ func (h Handler) inviteAttendees(ctx context.Context, b calendar.Backend, w cale
 	}
 
 	status := h.sendRequest(ctx, organizer, event)
-
-	// Record the outcome where RFC 6638 puts it — a per-attendee SCHEDULE-STATUS —
-	// and stamp the creator as organizer (you organize events you invite others to).
-	// Persisted via UpdateEvent so a later CalDAV read reflects it.
-	if !strings.EqualFold(event.Organizer.Email, organizer) {
-		event.Organizer = calendar.Address{Email: organizer}
-	}
-	for i := range event.Attendees {
-		if isSchedulingRecipient(event.Attendees[i], organizer) {
-			event.Attendees[i].ScheduleStatus = string(status)
-		}
-	}
+	// Record the outcome where RFC 6638 puts it — per-attendee SCHEDULE-STATUS, plus
+	// the creator stamped as organizer — persisted via UpdateEvent for a later read.
+	recordSchedulingOutcome(&event, organizer, status)
 	updated, err := w.UpdateEvent(ctx, event)
 	if err != nil {
 		log.Printf("calendar: persist SCHEDULE-STATUS for event %s: %v", event.ID, err)
@@ -215,6 +206,52 @@ func organizerFor(eventOrganizer scheduling.Address, mailbox string) scheduling.
 	return scheduling.Address{Email: mailbox}
 }
 
+// recordSchedulingOutcome stamps the configured mailbox as organizer (preserving a
+// client-supplied display name) and writes the SCHEDULE-STATUS of the scheduling
+// message just sent onto each recipient attendee, so the persisted event reflects
+// delivery. Shared by the create (REQUEST) and update (re-invite) paths.
+func recordSchedulingOutcome(event *calendar.Event, organizer string, status scheduling.ScheduleStatus) {
+	if !strings.EqualFold(event.Organizer.Email, organizer) {
+		event.Organizer = calendar.Address{Email: organizer}
+	}
+	for i := range event.Attendees {
+		if isSchedulingRecipient(event.Attendees[i], organizer) {
+			event.Attendees[i].ScheduleStatus = string(status)
+		}
+	}
+}
+
+// reinviteOnUpdate re-sends a METHOD:REQUEST to a meeting's attendees when a PATCH
+// makes a significant change to it, bumping SEQUENCE so the re-issued invitation
+// supersedes the prior one and recording the per-attendee SCHEDULE-STATUS. Like the
+// create path it is gated by the capability switch (no-op for a native scheduler)
+// and only fires for a real meeting; it returns the event to persist — unchanged
+// when nothing is re-sent.
+func (h Handler) reinviteOnUpdate(ctx context.Context, b calendar.Backend, current, merged calendar.Event) calendar.Event {
+	if !significantChange(current, merged) {
+		return merged
+	}
+	organizer, send := h.shouldSelfSchedule(ctx, b, merged)
+	if !send {
+		return merged
+	}
+	merged.Sequence = current.Sequence + 1
+	status := h.sendRequest(ctx, organizer, merged)
+	recordSchedulingOutcome(&merged, organizer, status)
+	return merged
+}
+
+// significantChange reports whether a PATCH altered a field that, per RFC 5546,
+// warrants re-inviting attendees and bumping SEQUENCE: the start, end, or location.
+// A summary- or body-only edit is not significant and re-sends no REQUEST. Deferred:
+// differential handling of an added attendee (a fresh REQUEST) or a removed one (a
+// CANCEL), and resetting PARTSTAT to NEEDS-ACTION on the change.
+func significantChange(current, merged calendar.Event) bool {
+	return !current.Start.Equal(merged.Start) ||
+		!current.End.Equal(merged.End) ||
+		current.Location != merged.Location
+}
+
 // MeUpdateEvents implements PATCH /me/events/{event-id}. PATCH is a partial
 // update: the current event is read via GetEvent and only the fields present in
 // the inbound Graph body overlay it (absent fields are left unchanged), then the
@@ -243,6 +280,10 @@ func (h Handler) MeUpdateEvents(ctx context.Context, req *api.MicrosoftGraphEven
 	if err != nil {
 		return badRequest(err.Error()), nil
 	}
+
+	// Organizer side: a significant change to a meeting re-sends the REQUEST (with a
+	// bumped SEQUENCE) so attendees see the update — gated by the capability switch.
+	merged = h.reinviteOnUpdate(ctx, b, current, merged)
 
 	updated, err := w.UpdateEvent(ctx, merged)
 	if err != nil {
