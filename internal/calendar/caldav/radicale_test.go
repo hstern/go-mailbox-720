@@ -262,6 +262,7 @@ func TestRadicaleWrite(t *testing.T) {
 	const updatedSubject = "Sprint Review (rescheduled)"
 	updated := got
 	updated.Subject = updatedSubject
+	updated.Attendees[0].Status = "declined" // flip the attendee PARTSTAT too
 	if _, err := w.UpdateEvent(ctx, updated); err != nil {
 		t.Fatalf("UpdateEvent: %v", err)
 	}
@@ -271,6 +272,9 @@ func TestRadicaleWrite(t *testing.T) {
 	}
 	if reread.Subject != updatedSubject {
 		t.Errorf("after update Subject = %q, want %q", reread.Subject, updatedSubject)
+	}
+	if len(reread.Attendees) != 1 || reread.Attendees[0].Status != "declined" {
+		t.Errorf("after update attendee = %+v, want status declined", reread.Attendees)
 	}
 
 	// DeleteEvent removes the resource; neither GetEvent nor ListEvents should

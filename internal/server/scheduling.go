@@ -93,6 +93,13 @@ func (h Handler) respondToInvite(ctx context.Context, eventID string, sendRespon
 
 	// Graph's sendResponse defaults to true; only an explicit false suppresses the
 	// reply (the user records their status without notifying the organizer).
+	//
+	// NOTE: the generated request type carries a spec-level `default: false` that
+	// ogen applies on decode, so an OMITTED sendResponse currently arrives as
+	// Set=true/Value=false and is treated as false here — meaning a client that
+	// omits the field gets no reply. Correcting that needs the subsetter to strip
+	// the default (tracked separately); a client can force the reply with an
+	// explicit sendResponse:true.
 	if !sendResponse.Or(true) {
 		return nil, nil
 	}
