@@ -15,15 +15,16 @@ import (
 )
 
 type fakeSender struct {
-	from   string
-	to     []string
-	raw    []byte
-	closed bool
+	from    string
+	to      []string
+	raw     []byte
+	closed  bool
+	sendErr error // when set, Send records the attempt then returns this error
 }
 
 func (s *fakeSender) Send(_ context.Context, from string, to []string, raw []byte) error {
 	s.from, s.to, s.raw = from, to, raw
-	return nil
+	return s.sendErr
 }
 func (s *fakeSender) Close() error { s.closed = true; return nil }
 

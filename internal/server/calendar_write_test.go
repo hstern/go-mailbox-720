@@ -2,11 +2,13 @@ package server
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
 	"github.com/hstern/go-mailbox-720/internal/calendar"
 	"github.com/hstern/go-mailbox-720/internal/graph/api"
+	"github.com/hstern/go-mailbox-720/internal/scheduling"
 )
 
 // writableCalendarBackend implements BOTH calendar.Backend and calendar.Writer,
@@ -24,7 +26,8 @@ type writableCalendarBackend struct {
 func (f *writableCalendarBackend) CreateEvent(_ context.Context, calendarID string, e calendar.Event) (calendar.Event, error) {
 	f.createdCalID = calendarID
 	f.createdEvent = e
-	e.ID = "evt-new" // the backend stamps an opaque ID.
+	e.ID = "evt-new"  // the backend stamps an opaque ID...
+	e.UID = "uid-new" // ...and an iCalendar UID, as the real CalDAV adapter does.
 	return e, nil
 }
 
@@ -359,5 +362,134 @@ func TestMeUpdateEventsIgnoresBodyID(t *testing.T) {
 	}
 	if backend.updatedEvent.ID != seededEvent.ID {
 		t.Errorf("updated event ID = %q, want %q (body ID must be ignored)", backend.updatedEvent.ID, seededEvent.ID)
+	}
+}
+
+// createEventReqWithAttendee builds a minimal POST /me/events body inviting one
+// attendee — the organizer-side scheduling tests below.
+func createEventReqWithAttendee(email string) *api.MicrosoftGraphEvent {
+	return &api.MicrosoftGraphEvent{
+		Subject: api.NewOptNilString("Planning"),
+		Start:   api.NewOptMicrosoftGraphDateTimeTimeZone(api.MicrosoftGraphDateTimeTimeZone{DateTime: api.NewOptString("2026-06-20T09:00:00.0000000")}),
+		Attendees: []api.MicrosoftGraphAttendee{{
+			EmailAddress: api.NewOptMicrosoftGraphEmailAddress(api.MicrosoftGraphEmailAddress{Address: api.NewOptNilString(email)}),
+		}},
+	}
+}
+
+// On the dumb-backend tier, creating an event with attendees emails them a
+// METHOD:REQUEST and persists the delivery outcome (SCHEDULE-STATUS) plus the
+// creator as organizer — while the create still returns 201.
+func TestMeCreateEventsEmailsInvitationOnDumbBackend(t *testing.T) {
+	backend := newWritableCalendarBackend()
+	sender := &fakeSender{}
+	h := Handler{
+		calendar:   writableCalendarProvider{backend: backend},
+		scheduling: fakeSchedulingProvider{sender: sender, addr: "me@example.com"},
+	}
+
+	res, err := h.MeCreateEvents(context.Background(), createEventReqWithAttendee("bob@example.com"))
+	if err != nil {
+		t.Fatalf("MeCreateEvents: %v", err)
+	}
+	if ok, isOK := res.(*api.MicrosoftGraphEventStatusCode); !isOK || ok.StatusCode != 201 {
+		t.Fatalf("response = %T, want 201 MicrosoftGraphEventStatusCode", res)
+	}
+	if sender.from != "me@example.com" {
+		t.Errorf("REQUEST from = %q, want me@example.com", sender.from)
+	}
+	if len(sender.to) != 1 || sender.to[0] != "bob@example.com" {
+		t.Errorf("REQUEST to = %v, want [bob@example.com]", sender.to)
+	}
+	inv, err := scheduling.Parse(sender.raw)
+	if err != nil {
+		t.Fatalf("parse REQUEST: %v", err)
+	}
+	if inv.Method != scheduling.MethodRequest {
+		t.Errorf("sent method = %q, want REQUEST", inv.Method)
+	}
+	if backend.updatedEvent.Organizer.Email != "me@example.com" {
+		t.Errorf("persisted organizer = %q, want me@example.com", backend.updatedEvent.Organizer.Email)
+	}
+	if n := len(backend.updatedEvent.Attendees); n != 1 {
+		t.Fatalf("persisted attendees = %d, want 1", n)
+	}
+	if got := backend.updatedEvent.Attendees[0].ScheduleStatus; got != "1.1" {
+		t.Errorf("SCHEDULE-STATUS = %q, want 1.1 (sent)", got)
+	}
+}
+
+// When the backend schedules natively (RFC 6638) the server must NOT also email a
+// REQUEST, nor write a SCHEDULE-STATUS — the calendar server does both itself.
+func TestMeCreateEventsNativeSchedulerDoesNotEmail(t *testing.T) {
+	backend := &nativeCalendarBackend{writableCalendarBackend: *newWritableCalendarBackend()}
+	sender := &fakeSender{}
+	h := Handler{
+		calendar:   nativeCalendarProvider{backend: backend},
+		scheduling: fakeSchedulingProvider{sender: sender, addr: "me@example.com"},
+	}
+
+	res, err := h.MeCreateEvents(context.Background(), createEventReqWithAttendee("bob@example.com"))
+	if err != nil {
+		t.Fatalf("MeCreateEvents: %v", err)
+	}
+	if ok, isOK := res.(*api.MicrosoftGraphEventStatusCode); !isOK || ok.StatusCode != 201 {
+		t.Fatalf("response = %T, want 201", res)
+	}
+	if sender.from != "" {
+		t.Error("emailed a REQUEST even though the server schedules natively")
+	}
+	if backend.updatedEvent.ID != "" {
+		t.Error("native path must not UpdateEvent to record SCHEDULE-STATUS")
+	}
+}
+
+// A REQUEST that fails to send does not fail the create (still 201); the failure
+// is recorded as SCHEDULE-STATUS=5.1 rather than swallowed.
+func TestMeCreateEventsSendFailureRecordsNoDelivery(t *testing.T) {
+	backend := newWritableCalendarBackend()
+	sender := &fakeSender{sendErr: errors.New("smtp unavailable")}
+	h := Handler{
+		calendar:   writableCalendarProvider{backend: backend},
+		scheduling: fakeSchedulingProvider{sender: sender, addr: "me@example.com"},
+	}
+
+	res, err := h.MeCreateEvents(context.Background(), createEventReqWithAttendee("bob@example.com"))
+	if err != nil {
+		t.Fatalf("MeCreateEvents: %v", err)
+	}
+	if ok, isOK := res.(*api.MicrosoftGraphEventStatusCode); !isOK || ok.StatusCode != 201 {
+		t.Fatalf("response = %T, want 201 despite the send failure", res)
+	}
+	if n := len(backend.updatedEvent.Attendees); n != 1 {
+		t.Fatalf("persisted attendees = %d, want 1", n)
+	}
+	if got := backend.updatedEvent.Attendees[0].ScheduleStatus; got != "5.1" {
+		t.Errorf("SCHEDULE-STATUS = %q, want 5.1 (undeliverable)", got)
+	}
+}
+
+// An event whose only attendee is the organizer invites no one (you do not invite
+// yourself) and records no SCHEDULE-STATUS.
+func TestMeCreateEventsSelfOnlyDoesNotEmail(t *testing.T) {
+	backend := newWritableCalendarBackend()
+	sender := &fakeSender{}
+	h := Handler{
+		calendar:   writableCalendarProvider{backend: backend},
+		scheduling: fakeSchedulingProvider{sender: sender, addr: "me@example.com"},
+	}
+
+	res, err := h.MeCreateEvents(context.Background(), createEventReqWithAttendee("me@example.com"))
+	if err != nil {
+		t.Fatalf("MeCreateEvents: %v", err)
+	}
+	if ok, isOK := res.(*api.MicrosoftGraphEventStatusCode); !isOK || ok.StatusCode != 201 {
+		t.Fatalf("response = %T, want 201", res)
+	}
+	if sender.from != "" {
+		t.Error("emailed a REQUEST to the organizer's own address")
+	}
+	if backend.updatedEvent.ID != "" {
+		t.Error("no UpdateEvent expected when there are no real recipients")
 	}
 }

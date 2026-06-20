@@ -211,9 +211,10 @@ func mapEvent(ev *ical.Event) calendar.Event {
 	for _, p := range ev.Props.Values(ical.PropAttendee) {
 		if a := calAddress(&p); a != (calendar.Address{}) {
 			e.Attendees = append(e.Attendees, calendar.Attendee{
-				Name:   a.Name,
-				Email:  a.Email,
-				Status: attendeeStatus(&p),
+				Name:           a.Name,
+				Email:          a.Email,
+				Status:         attendeeStatus(&p),
+				ScheduleStatus: p.Params.Get(paramScheduleStatus),
 			})
 		}
 	}

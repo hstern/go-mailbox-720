@@ -129,6 +129,9 @@ func eventToICal(e calendar.Event) *ical.Calendar {
 		if ps := statusToPartStat[a.Status]; ps != "" {
 			att.Params.Set(ical.ParamParticipationStatus, ps)
 		}
+		if a.ScheduleStatus != "" {
+			att.Params.Set(paramScheduleStatus, a.ScheduleStatus)
+		}
 		ev.Props.Add(att)
 	}
 
