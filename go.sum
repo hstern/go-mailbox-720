@@ -46,6 +46,8 @@ github.com/hstern/go-access-tokens v0.3.0 h1:4attcXhFUknd9G1XP0WH5AQdgTC+Ji4lxSW
 github.com/hstern/go-access-tokens v0.3.0/go.mod h1:HMzTcCo34WY9vtAjqx0hIIW3tlVCK9dveopIrZdo+NQ=
 github.com/hstern/go-bearer-token v0.1.0 h1:/bPnjtej+as++UP+F/ZQ/yLXGFbDGnxQr50FTIzvlS0=
 github.com/hstern/go-bearer-token v0.1.0/go.mod h1:HQGn4hNyOl0LHfN2LVqp49waBc/uCjNmwI+oTlU2LhA=
+github.com/hstern/go-bearer-token v0.2.0 h1:pmG0Llvjg7Ou1uB73FySpskFZC1DEMM2D7QHYcjmYwE=
+github.com/hstern/go-bearer-token v0.2.0/go.mod h1:HQGn4hNyOl0LHfN2LVqp49waBc/uCjNmwI+oTlU2LhA=
 github.com/hstern/go-imap/v2 v2.0.0-beta.8.0.20260620025710-a2d23bc67297 h1:DEmzcK0km+tQ8OWsWl0Xt6j3QcWna+tVkyyGbYsSgw0=
 github.com/hstern/go-imap/v2 v2.0.0-beta.8.0.20260620025710-a2d23bc67297/go.mod h1:dhoFe2Q0PwLrMD7oZw8ODuaD0vLYPe5uj2wcOMnvh48=
 github.com/hstern/go-subjectid v0.0.0-20260525222327-b47140763585 h1:dDFXd9djpbmlAOSlzIbFunmu6YVnzMcOnxPH+ySINZ0=
