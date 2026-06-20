@@ -49,6 +49,7 @@ func main() {
 	subjectClaim := flag.String("auth-subject-claim", "sub", "token claim mapped to the mailbox identity")
 	scopeClaims := flag.String("auth-scope-claims", "scope,roles", "comma-separated claims that carry granted scopes (Microsoft Entra/Azure AD: \"scope,scp,roles\" — scp is Entra's non-standard delegated-scope claim)")
 	introspectID := flag.String("auth-introspect-client-id", "", "OAuth2 client id for RFC 7662 introspection of opaque tokens (enables introspection; secret from MAILBOXD_INTROSPECT_CLIENT_SECRET)")
+	resourceID := flag.String("auth-resource", "", "this resource's identifier URL (RFC 8707); when set, publishes RFC 9728 protected-resource metadata at /.well-known/oauth-protected-resource")
 	imapAddr := flag.String("mail-imap-addr", "", "IMAP server address host:port for the mail backend (empty: mail operations return 501; password from MAILBOXD_IMAP_PASSWORD)")
 	imapUser := flag.String("mail-imap-username", "", "IMAP username for the mail backend")
 	imapTLS := flag.Bool("mail-imap-tls", true, "use implicit TLS for the IMAP connection")
@@ -70,6 +71,7 @@ func main() {
 		RequiredScopes: splitList(*scopes),
 		SubjectClaim:   *subjectClaim,
 		ScopeClaims:    splitList(*scopeClaims),
+		ResourceID:     *resourceID,
 	}
 	if *introspectID != "" {
 		// The secret is taken from the environment, never a flag, so it does not
@@ -241,6 +243,16 @@ func run(addr string, authCfg auth.Config, provider server.MailProvider, calProv
 		}
 		handler = authn.Middleware(handler)
 		log.Println("auth: enforcing OIDC for issuers", authCfg.Issuers)
+		// RFC 9728: publish protected-resource metadata PUBLICLY (outside the auth
+		// middleware) so a client can discover the authorization servers + scopes
+		// before it has a token.
+		if authCfg.ResourceID != "" {
+			outer := http.NewServeMux()
+			outer.Handle(auth.WellKnownProtectedResource, auth.MetadataHandler(authCfg))
+			outer.Handle("/", handler)
+			handler = outer
+			log.Println("auth: publishing RFC 9728 protected-resource metadata at", auth.WellKnownProtectedResource)
+		}
 	} else {
 		log.Println("auth: DISABLED (no -auth-issuer configured) — all requests allowed")
 	}

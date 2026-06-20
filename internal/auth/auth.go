@@ -64,6 +64,11 @@ type Config struct {
 	// Introspection, when set, enables RFC 7662 validation of opaque (non-JWT)
 	// tokens against each issuer's introspection endpoint.
 	Introspection *IntrospectionConfig
+	// ResourceID is this resource's identifier URL (RFC 8707), published as the
+	// "resource" member of the RFC 9728 protected-resource metadata. When non-empty,
+	// the server serves that metadata at /.well-known/oauth-protected-resource so
+	// clients can discover the authorization servers and scopes.
+	ResourceID string
 }
 
 // IntrospectionConfig holds the resource server's own OAuth2 client credentials,

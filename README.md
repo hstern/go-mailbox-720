@@ -131,6 +131,7 @@ go run ./cmd/mailboxd \
 | `-auth-scope-claims` | Comma-separated claims that carry granted scopes (default `scope,roles`; Microsoft Entra: `scope,scp,roles`). |
 | `-auth-subject-claim` | Token claim mapped to the mailbox identity (default `sub`). |
 | `-auth-introspect-client-id` | OAuth2 client id enabling RFC 7662 introspection of **opaque** tokens (secret via `MAILBOXD_INTROSPECT_CLIENT_SECRET`). |
+| `-auth-resource` | This resource's identifier URL (RFC 8707); when set, publishes RFC 9728 protected-resource metadata at `/.well-known/oauth-protected-resource`. |
 | `-mail-imap-addr` / `-mail-imap-username` / `-mail-imap-tls` | IMAP mail backend (password via `MAILBOXD_IMAP_PASSWORD`). |
 | `-cal-caldav-url` / `-cal-caldav-username` | CalDAV calendar backend (password via `MAILBOXD_CALDAV_PASSWORD`). |
 | `-contacts-carddav-url` / `-contacts-carddav-username` | CardDAV contacts backend (password via `MAILBOXD_CARDDAV_PASSWORD`). |
@@ -157,6 +158,12 @@ mailboxes stay distinct across multiple issuers. (JWT decode/validation uses
 
 With one or more issuers configured the server fails closed: it refuses to start
 if an issuer cannot be discovered, and rejects any request without a valid token.
+A rejection carries an **RFC 6750** `WWW-Authenticate: Bearer` challenge
+(`invalid_token` / `insufficient_scope`), and — with `-auth-resource` set — the
+server publishes **RFC 9728** protected-resource metadata so a client can discover
+the trusted issuers and scopes. (Both are served inline today; they will move to the
+dedicated `hstern/go-bearer-token` and `hstern/go-protected-resource-metadata`
+libraries once those ship.)
 
 ## Layout
 
