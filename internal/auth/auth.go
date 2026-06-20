@@ -34,6 +34,7 @@ import (
 	"github.com/coreos/go-oidc/v3/oidc"
 	accesstoken "github.com/hstern/go-access-tokens"
 	bearer "github.com/hstern/go-bearer-token"
+	prm "github.com/hstern/go-protected-resource-metadata"
 	subjectid "github.com/hstern/go-subjectid"
 	introspection "github.com/hstern/go-token-introspection"
 
@@ -87,6 +88,9 @@ type Authenticator struct {
 	requiredScopes []string
 	subjectClaim   string
 	scopeClaims    []string
+	// resourceMetadataURL, when set, is this resource's RFC 9728 metadata URL,
+	// added to the WWW-Authenticate challenge as the §5.1 resource_metadata param.
+	resourceMetadataURL string
 }
 
 // New discovers each configured issuer and builds the Authenticator. It errors
@@ -110,6 +114,13 @@ func New(ctx context.Context, cfg Config) (*Authenticator, error) {
 		requiredScopes: cfg.RequiredScopes,
 		subjectClaim:   subjectClaim,
 		scopeClaims:    scopeClaims,
+	}
+	if cfg.ResourceID != "" {
+		// Best-effort: a malformed resource id just omits the §5.1 link; the
+		// metadata endpoint (auth.MetadataEndpoint) surfaces the error at mount.
+		if url, err := prm.WellKnownPath(cfg.ResourceID); err == nil {
+			a.resourceMetadataURL = url
+		}
 	}
 	for _, iss := range cfg.Issuers {
 		provider, err := oidc.NewProvider(ctx, iss)
@@ -199,6 +210,11 @@ func (a *Authenticator) challenge(w http.ResponseWriter, errCode string) {
 	c := bearer.Challenge{Realm: a.audience, Error: errCode}
 	if errCode == bearer.ErrorInsufficientScope {
 		c.Scope = strings.Join(a.requiredScopes, " ")
+	}
+	if a.resourceMetadataURL != "" {
+		// RFC 9728 §5.1: point the client at our protected-resource metadata.
+		name, value := prm.ChallengeParam(a.resourceMetadataURL)
+		c.Extra = map[string]string{name: value}
 	}
 	c.SetHeader(w)
 }

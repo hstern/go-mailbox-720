@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -420,5 +421,33 @@ func TestWWWAuthenticateChallenge(t *testing.T) {
 				t.Errorf("WWW-Authenticate = %q, want %q", got, tc.header)
 			}
 		})
+	}
+}
+
+// With a ResourceID configured, the WWW-Authenticate challenge carries the RFC 9728
+// §5.1 resource_metadata parameter pointing at the protected-resource metadata.
+func TestChallengeIncludesResourceMetadata(t *testing.T) {
+	idp := newIDP(t)
+	a, err := New(context.Background(), Config{
+		Issuers:        []string{idp.issuer},
+		Audience:       testAud,
+		RequiredScopes: []string{"Mail.Read"},
+		ResourceID:     "https://mailbox.example.com",
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	a.Middleware(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {})).
+		ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v1.0/me/messages", nil)) // no token
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", rec.Code)
+	}
+	got := rec.Header().Get("WWW-Authenticate")
+	want := `resource_metadata="https://mailbox.example.com/.well-known/oauth-protected-resource"`
+	if !strings.Contains(got, want) {
+		t.Errorf("WWW-Authenticate = %q, want to contain %q", got, want)
 	}
 }

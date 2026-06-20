@@ -160,10 +160,11 @@ With one or more issuers configured the server fails closed: it refuses to start
 if an issuer cannot be discovered, and rejects any request without a valid token.
 A rejection carries an **RFC 6750** `WWW-Authenticate: Bearer` challenge
 (`invalid_token` / `insufficient_scope`), and — with `-auth-resource` set — the
-server publishes **RFC 9728** protected-resource metadata so a client can discover
-the trusted issuers and scopes. (Both are served inline today; they will move to the
-dedicated `hstern/go-bearer-token` and `hstern/go-protected-resource-metadata`
-libraries once those ship.)
+server publishes **RFC 9728** protected-resource metadata at
+`/.well-known/oauth-protected-resource` so a client can discover the trusted issuers
+and scopes; the challenge then points at it via the §5.1 `resource_metadata`
+parameter. (The challenge is built with `hstern/go-bearer-token`, the metadata served
+and linked by `hstern/go-protected-resource-metadata`.)
 
 ## Layout
 
