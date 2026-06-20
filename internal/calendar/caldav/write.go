@@ -122,9 +122,14 @@ func eventToICal(e calendar.Event) *ical.Calendar {
 		ev.Props.Set(org)
 	}
 	for _, a := range e.Attendees {
-		if att := buildAddress(ical.PropAttendee, a); att != nil {
-			ev.Props.Add(att)
+		att := buildAddress(ical.PropAttendee, calendar.Address{Name: a.Name, Email: a.Email})
+		if att == nil {
+			continue
 		}
+		if ps := statusToPartStat[a.Status]; ps != "" {
+			att.Params.Set(ical.ParamParticipationStatus, ps)
+		}
+		ev.Props.Add(att)
 	}
 
 	cal.Children = append(cal.Children, ev.Component)

@@ -56,7 +56,7 @@ var seededEvent = calendar.Event{
 	Location:  "Old Room",
 	Start:     time.Date(2026, 6, 20, 9, 0, 0, 0, time.UTC),
 	End:       time.Date(2026, 6, 20, 10, 0, 0, 0, time.UTC),
-	Attendees: []calendar.Address{{Name: "Bob", Email: "bob@example.com"}},
+	Attendees: []calendar.Attendee{{Name: "Bob", Email: "bob@example.com"}},
 }
 
 // newWritableCalendarBackendSeeded returns a writable backend whose GetEvent

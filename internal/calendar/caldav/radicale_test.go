@@ -216,7 +216,7 @@ func TestRadicaleWrite(t *testing.T) {
 		End:       createStart.Add(time.Hour),
 		Location:  "Room 7",
 		Organizer: calendar.Address{Name: "Alice", Email: "alice@example.com"},
-		Attendees: []calendar.Address{{Email: "bob@example.com"}},
+		Attendees: []calendar.Attendee{{Email: "bob@example.com", Status: "accepted"}},
 	})
 	if err != nil {
 		t.Fatalf("CreateEvent: %v", err)
@@ -250,6 +250,11 @@ func TestRadicaleWrite(t *testing.T) {
 	}
 	if !got.Start.Equal(createStart) {
 		t.Errorf("GetEvent Start = %v, want %v", got.Start, createStart)
+	}
+	// The attendee PARTSTAT round-trips: written as PARTSTAT=ACCEPTED, read back as
+	// the neutral "accepted" status.
+	if len(got.Attendees) != 1 || got.Attendees[0].Email != "bob@example.com" || got.Attendees[0].Status != "accepted" {
+		t.Errorf("GetEvent Attendees = %+v, want one bob@example.com with status accepted", got.Attendees)
 	}
 
 	// UpdateEvent changes the subject; the UID and ID are preserved so a re-read

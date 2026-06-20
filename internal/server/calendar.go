@@ -187,18 +187,25 @@ func toCalendarRecipient(a calendar.Address) api.MicrosoftGraphRecipient {
 	}
 }
 
-func toGraphAttendees(as []calendar.Address) []api.MicrosoftGraphAttendee {
+func toGraphAttendees(as []calendar.Attendee) []api.MicrosoftGraphAttendee {
 	if len(as) == 0 {
 		return nil
 	}
 	out := make([]api.MicrosoftGraphAttendee, 0, len(as))
 	for _, a := range as {
-		out = append(out, api.MicrosoftGraphAttendee{
+		att := api.MicrosoftGraphAttendee{
 			EmailAddress: api.NewOptMicrosoftGraphEmailAddress(api.MicrosoftGraphEmailAddress{
 				Name:    api.NewOptNilString(a.Name),
 				Address: api.NewOptNilString(a.Email),
 			}),
-		})
+		}
+		// The neutral status uses the same tokens as Graph's responseStatus.response.
+		if a.Status != "" {
+			att.Status = api.NewOptMicrosoftGraphResponseStatus(api.MicrosoftGraphResponseStatus{
+				Response: api.NewOptMicrosoftGraphResponseType(api.MicrosoftGraphResponseType(a.Status)),
+			})
+		}
+		out = append(out, att)
 	}
 	return out
 }

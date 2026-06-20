@@ -78,9 +78,14 @@ func EventFromInvite(inv *scheduling.Invite) calendar.Event {
 		return calendar.Event{}
 	}
 
-	attendees := make([]calendar.Address, 0, len(inv.Attendees))
+	attendees := make([]calendar.Attendee, 0, len(inv.Attendees))
 	for _, a := range inv.Attendees {
-		attendees = append(attendees, toCalendarAddress(a.Address))
+		ca := toCalendarAddress(a.Address)
+		attendees = append(attendees, calendar.Attendee{
+			Name:   ca.Name,
+			Email:  ca.Email,
+			Status: partStatToNeutral(a.PartStat),
+		})
 	}
 
 	return calendar.Event{
@@ -126,7 +131,10 @@ func EventFromInvite(inv *scheduling.Invite) calendar.Event {
 func InviteFromEvent(ev calendar.Event) *scheduling.Invite {
 	attendees := make([]scheduling.Attendee, 0, len(ev.Attendees))
 	for _, a := range ev.Attendees {
-		attendees = append(attendees, scheduling.Attendee{Address: toSchedulingAddress(a)})
+		attendees = append(attendees, scheduling.Attendee{
+			Address:  scheduling.Address{Name: a.Name, Email: a.Email},
+			PartStat: neutralToPartStat(a.Status),
+		})
 	}
 
 	return &scheduling.Invite{
@@ -296,4 +304,37 @@ func toCalendarAddress(a scheduling.Address) calendar.Address {
 // is explicit.
 func toSchedulingAddress(a calendar.Address) scheduling.Address {
 	return scheduling.Address{Name: a.Name, Email: a.Email}
+}
+
+// partStatToNeutral maps an iCalendar PARTSTAT to the neutral
+// calendar.Attendee.Status (Graph responseStatus shape); neutralToPartStat is the
+// inverse. An unmapped value yields the zero value.
+func partStatToNeutral(p scheduling.PartStat) string {
+	switch p {
+	case scheduling.PartStatAccepted:
+		return "accepted"
+	case scheduling.PartStatDeclined:
+		return "declined"
+	case scheduling.PartStatTentative:
+		return "tentativelyAccepted"
+	case scheduling.PartStatNeedsAction:
+		return "notResponded"
+	default:
+		return ""
+	}
+}
+
+func neutralToPartStat(s string) scheduling.PartStat {
+	switch s {
+	case "accepted":
+		return scheduling.PartStatAccepted
+	case "declined":
+		return scheduling.PartStatDeclined
+	case "tentativelyAccepted":
+		return scheduling.PartStatTentative
+	case "notResponded":
+		return scheduling.PartStatNeedsAction
+	default:
+		return ""
+	}
 }

@@ -122,7 +122,7 @@ func graphToEvent(ge *api.MicrosoftGraphEvent) (calendar.Event, error) {
 	e := calendar.Event{
 		Subject:   ge.Subject.Or(""),
 		IsAllDay:  ge.IsAllDay.Or(false),
-		Attendees: graphToAddresses(ge.Attendees),
+		Attendees: graphToAttendees(ge.Attendees),
 	}
 	if v, ok := ge.Start.Get(); ok {
 		t, err := graphToTime(v)
@@ -195,7 +195,7 @@ func mergeEventPatch(current calendar.Event, ge *api.MicrosoftGraphEvent) (calen
 		}
 	}
 	if len(ge.Attendees) > 0 {
-		merged.Attendees = graphToAddresses(ge.Attendees)
+		merged.Attendees = graphToAttendees(ge.Attendees)
 	}
 	return merged, nil
 }
@@ -246,20 +246,27 @@ func graphRecipientToAddress(r api.MicrosoftGraphRecipient) calendar.Address {
 }
 
 // graphToAddresses maps Graph attendees onto neutral calendar.Address values.
-func graphToAddresses(as []api.MicrosoftGraphAttendee) []calendar.Address {
+func graphToAttendees(as []api.MicrosoftGraphAttendee) []calendar.Attendee {
 	if len(as) == 0 {
 		return nil
 	}
-	out := make([]calendar.Address, 0, len(as))
+	out := make([]calendar.Attendee, 0, len(as))
 	for _, a := range as {
 		ea, ok := a.EmailAddress.Get()
 		if !ok {
 			continue
 		}
-		out = append(out, calendar.Address{
+		att := calendar.Attendee{
 			Name:  ea.Name.Or(""),
 			Email: ea.Address.Or(""),
-		})
+		}
+		// Graph's responseStatus.response uses the same tokens as the neutral status.
+		if rs, ok := a.Status.Get(); ok {
+			if rt, ok := rs.Response.Get(); ok {
+				att.Status = string(rt)
+			}
+		}
+		out = append(out, att)
 	}
 	return out
 }

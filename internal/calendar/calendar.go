@@ -23,6 +23,17 @@ type Address struct {
 	Email string
 }
 
+// Attendee is an event participant: a calendar-user address plus their
+// participation status. Status is backend-neutral, mirroring Graph's
+// responseStatus.response (which the CalDAV adapter maps to/from the iCalendar
+// PARTSTAT): one of "" (unset), "accepted", "declined", "tentativelyAccepted",
+// or "notResponded".
+type Attendee struct {
+	Name   string
+	Email  string
+	Status string
+}
+
 // Body is an event description in a single representation. Calendars almost
 // always carry plain text (the iCalendar DESCRIPTION property), so ContentType
 // is "text" in the common case.
@@ -51,7 +62,7 @@ type Event struct {
 	IsAllDay   bool
 	Location   string
 	Organizer  Address
-	Attendees  []Address
+	Attendees  []Attendee
 	Body       Body
 	Status     string // mapped from the iCalendar STATUS (e.g. "confirmed")
 	CreatedAt  time.Time

@@ -133,10 +133,10 @@ func TestEventFromInvite(t *testing.T) {
 	if len(got.Attendees) != 2 {
 		t.Fatalf("Attendees len = %d, want 2", len(got.Attendees))
 	}
-	if got.Attendees[0] != (calendar.Address{Name: "Andy", Email: "andy@example.com"}) {
+	if got.Attendees[0] != (calendar.Attendee{Name: "Andy", Email: "andy@example.com", Status: "notResponded"}) {
 		t.Errorf("Attendees[0] = %+v", got.Attendees[0])
 	}
-	if got.Attendees[1] != (calendar.Address{Name: "Bea", Email: "bea@example.com"}) {
+	if got.Attendees[1] != (calendar.Attendee{Name: "Bea", Email: "bea@example.com", Status: "notResponded"}) {
 		t.Errorf("Attendees[1] = %+v", got.Attendees[1])
 	}
 }
@@ -339,7 +339,7 @@ func sampleEvent() calendar.Event {
 		Start:     time.Date(2026, 6, 15, 15, 0, 0, 0, time.UTC),
 		End:       time.Date(2026, 6, 15, 16, 0, 0, 0, time.UTC),
 		Organizer: calendar.Address{Name: "Olivia Organizer", Email: "org@example.com"},
-		Attendees: []calendar.Address{
+		Attendees: []calendar.Attendee{
 			{Name: "Andy Attendee", Email: "andy@example.com"},
 			{Name: "Bea Attendee", Email: "bea@example.com"},
 		},

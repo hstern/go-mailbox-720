@@ -89,10 +89,10 @@ func TestMapEventTimed(t *testing.T) {
 	if len(e.Attendees) != 2 {
 		t.Fatalf("got %d attendees, want 2", len(e.Attendees))
 	}
-	if got := e.Attendees[0]; got != (calendar.Address{Name: "Bob Jones", Email: "bob@example.com"}) {
+	if got := e.Attendees[0]; got != (calendar.Attendee{Name: "Bob Jones", Email: "bob@example.com"}) {
 		t.Errorf("Attendees[0] = %+v", got)
 	}
-	if got := e.Attendees[1]; got != (calendar.Address{Name: "", Email: "carol@example.com"}) {
+	if got := e.Attendees[1]; got != (calendar.Attendee{Name: "", Email: "carol@example.com"}) {
 		t.Errorf("Attendees[1] = %+v", got)
 	}
 }
@@ -173,7 +173,7 @@ func TestEventToICalRoundTrip(t *testing.T) {
 		Start:     time.Date(2026, 6, 19, 13, 0, 0, 0, time.UTC),
 		End:       time.Date(2026, 6, 19, 14, 30, 0, 0, time.UTC),
 		Organizer: calendar.Address{Name: "Alice Smith", Email: "alice@example.com"},
-		Attendees: []calendar.Address{
+		Attendees: []calendar.Attendee{
 			{Name: "Bob Jones", Email: "bob@example.com"},
 			{Email: "carol@example.com"},
 		},
