@@ -16,6 +16,7 @@ type writableContactsBackend struct {
 
 	createdBookID  string
 	createdContact contacts.Contact
+	updatedContact contacts.Contact
 	deletedID      string
 }
 
@@ -27,6 +28,7 @@ func (f *writableContactsBackend) CreateContact(_ context.Context, addressBookID
 }
 
 func (f *writableContactsBackend) UpdateContact(_ context.Context, c contacts.Contact) (contacts.Contact, error) {
+	f.updatedContact = c
 	return c, nil
 }
 
@@ -39,6 +41,34 @@ func newWritableContactsBackend() *writableContactsBackend {
 	return &writableContactsBackend{
 		fakeContactsBackend: fakeContactsBackend{
 			books: []contacts.AddressBook{{ID: "book-default", Name: "Contacts"}},
+		},
+	}
+}
+
+// seededContact is the current contact the writable backend's GetContact
+// returns, used by the PATCH (read-modify-write) tests. Its fields stand in for
+// an existing stored record so a partial patch can be checked for leaving them
+// intact.
+var seededContact = contacts.Contact{
+	ID:           "contact-1",
+	UID:          "uid-1",
+	DisplayName:  "Old Name",
+	GivenName:    "Old",
+	Surname:      "Name",
+	Organization: "Old Inc",
+	Title:        "Old Title",
+	Emails:       []contacts.EmailAddress{{Address: "old@example.com", Type: "work"}},
+	Phones:       []contacts.Phone{{Number: "+1-555-0000", Type: "work"}},
+}
+
+// newWritableContactsBackendSeeded returns a writable backend whose GetContact
+// resolves seededContact by its ID — the current record a PATCH reads, merges,
+// and writes back.
+func newWritableContactsBackendSeeded() *writableContactsBackend {
+	return &writableContactsBackend{
+		fakeContactsBackend: fakeContactsBackend{
+			books:    []contacts.AddressBook{{ID: "book-default", Name: "Contacts"}},
+			contacts: map[string][]contacts.Contact{"book-default": {seededContact}},
 		},
 	}
 }
@@ -155,5 +185,101 @@ func TestNilContactsProviderWriteNotImplemented(t *testing.T) {
 	}
 	if _, err := h.MeDeleteContacts(context.Background(), api.MeDeleteContactsParams{ContactID: "x"}); err == nil {
 		t.Error("MeDeleteContacts with nil provider: expected error, got nil")
+	}
+}
+
+// TestMeUpdateContactsPartialMergeLeavesAbsentFields: a PATCH that sets only
+// DisplayName overlays that one field, leaving the other names/organization/
+// title/emails/phones and the contact's identity (ID/UID) intact —
+// read-modify-write, not replace.
+func TestMeUpdateContactsPartialMergeLeavesAbsentFields(t *testing.T) {
+	backend := newWritableContactsBackendSeeded()
+	h := Handler{contacts: writableContactsProvider{backend: backend}}
+
+	req := &api.MicrosoftGraphContact{DisplayName: api.NewOptNilString("New Name")}
+
+	res, err := h.MeUpdateContacts(context.Background(), req, api.MeUpdateContactsParams{ContactID: "contact-1"})
+	if err != nil {
+		t.Fatalf("MeUpdateContacts: %v", err)
+	}
+	ok, isOK := res.(*api.MicrosoftGraphContactStatusCode)
+	if !isOK {
+		t.Fatalf("response type = %T, want *MicrosoftGraphContactStatusCode", res)
+	}
+	if ok.StatusCode != 200 {
+		t.Errorf("status = %d, want 200", ok.StatusCode)
+	}
+
+	got := backend.updatedContact
+	if got.DisplayName != "New Name" {
+		t.Errorf("merged display name = %q, want New Name", got.DisplayName)
+	}
+	if got.GivenName != "Old" || got.Surname != "Name" {
+		t.Errorf("merged name parts = (%q,%q), want (Old,Name) unchanged", got.GivenName, got.Surname)
+	}
+	if got.Organization != "Old Inc" {
+		t.Errorf("merged organization = %q, want Old Inc (unchanged)", got.Organization)
+	}
+	if got.Title != "Old Title" {
+		t.Errorf("merged title = %q, want Old Title (unchanged)", got.Title)
+	}
+	if n := len(got.Emails); n != 1 || got.Emails[0].Address != "old@example.com" {
+		t.Errorf("merged emails = %+v, want the original one (unchanged)", got.Emails)
+	}
+	if n := len(got.Phones); n != 1 || got.Phones[0].Number != "+1-555-0000" {
+		t.Errorf("merged phones = %+v, want the original one (unchanged)", got.Phones)
+	}
+	if got.ID != "contact-1" || got.UID != "uid-1" {
+		t.Errorf("merged identity = (%q,%q), want (contact-1,uid-1) preserved", got.ID, got.UID)
+	}
+	if !backend.closed {
+		t.Error("backend not closed")
+	}
+}
+
+// TestMeUpdateContactsReadOnlyBackendNotImplemented: a read-only backend (Backend
+// but not Writer) yields the not-implemented sentinel (Graph 501).
+func TestMeUpdateContactsReadOnlyBackendNotImplemented(t *testing.T) {
+	backend := newContactsFixture() // *fakeContactsBackend: Backend only, no Writer
+	h := Handler{contacts: fakeContactsProvider{backend: backend}}
+
+	if _, err := h.MeUpdateContacts(context.Background(), &api.MicrosoftGraphContact{}, api.MeUpdateContactsParams{ContactID: "contact-1"}); err == nil {
+		t.Error("MeUpdateContacts on read-only backend: expected error, got nil")
+	}
+}
+
+// TestMeUpdateContactsNilProviderNotImplemented: a nil provider yields 501.
+func TestMeUpdateContactsNilProviderNotImplemented(t *testing.T) {
+	h := Handler{}
+	if _, err := h.MeUpdateContacts(context.Background(), &api.MicrosoftGraphContact{}, api.MeUpdateContactsParams{ContactID: "x"}); err == nil {
+		t.Error("MeUpdateContacts with nil provider: expected error, got nil")
+	}
+}
+
+// TestMeUpdateContactsPartialPhonePatchPreservesOtherKinds: patching only the
+// mobile number must not drop the contact's existing work/home phones (the three
+// Graph phone fields collapse into one neutral slice, so they merge per-kind).
+func TestMeUpdateContactsPartialPhonePatchPreservesOtherKinds(t *testing.T) {
+	backend := newWritableContactsBackendSeeded() // seeded with a "work" phone
+	h := Handler{contacts: writableContactsProvider{backend: backend}}
+
+	req := &api.MicrosoftGraphContact{MobilePhone: api.NewOptNilString("+1-555-9999")}
+	if _, err := h.MeUpdateContacts(context.Background(), req, api.MeUpdateContactsParams{ContactID: seededContact.ID}); err != nil {
+		t.Fatalf("MeUpdateContacts: %v", err)
+	}
+	var work, cell string
+	for _, p := range backend.updatedContact.Phones {
+		switch p.Type {
+		case "work":
+			work = p.Number
+		case "cell":
+			cell = p.Number
+		}
+	}
+	if work != "+1-555-0000" {
+		t.Errorf("work phone = %q, want +1-555-0000 (must survive a mobile-only patch)", work)
+	}
+	if cell != "+1-555-9999" {
+		t.Errorf("cell phone = %q, want +1-555-9999", cell)
 	}
 }

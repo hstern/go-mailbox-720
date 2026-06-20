@@ -18,9 +18,6 @@ import (
 // calendar, and returns the stored event (201 Created). The backend is obtained
 // via calendarBackend (nil-provider -> 501) and type-asserted to calendar.Writer;
 // a read-only backend yields 501.
-//
-// Deferred: MeUpdateEvents (PATCH) needs a read-modify-write merge of the partial
-// body onto the stored event and is left for a follow-up.
 func (h Handler) MeCreateEvents(ctx context.Context, req *api.MicrosoftGraphEvent) (api.MeCreateEventsRes, error) {
 	b, err := h.calendarBackend(ctx)
 	if err != nil {
@@ -54,6 +51,45 @@ func (h Handler) MeCreateEvents(ctx context.Context, req *api.MicrosoftGraphEven
 	return &api.MicrosoftGraphEventStatusCode{
 		StatusCode: http.StatusCreated,
 		Response:   toGraphEvent(created),
+	}, nil
+}
+
+// MeUpdateEvents implements PATCH /me/events/{event-id}. PATCH is a partial
+// update: the current event is read via GetEvent and only the fields present in
+// the inbound Graph body overlay it (absent fields are left unchanged), then the
+// merged event — preserving its ID/UID — is written via Writer.UpdateEvent and
+// returned (200 OK). The backend is obtained via calendarBackend (nil-provider
+// -> 501) and type-asserted to calendar.Writer; a read-only backend yields 501.
+// A non-UTC time zone on a patched Start/End is rejected with 400, as in create.
+func (h Handler) MeUpdateEvents(ctx context.Context, req *api.MicrosoftGraphEvent, params api.MeUpdateEventsParams) (api.MeUpdateEventsRes, error) {
+	b, err := h.calendarBackend(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = b.Close() }()
+
+	w, ok := b.(calendar.Writer)
+	if !ok {
+		return nil, ht.ErrNotImplemented
+	}
+
+	current, err := b.GetEvent(ctx, params.EventID)
+	if err != nil {
+		return nil, fmt.Errorf("get event: %w", err)
+	}
+
+	merged, err := mergeEventPatch(current, req)
+	if err != nil {
+		return badRequest(err.Error()), nil
+	}
+
+	updated, err := w.UpdateEvent(ctx, merged)
+	if err != nil {
+		return nil, fmt.Errorf("update event: %w", err)
+	}
+	return &api.MicrosoftGraphEventStatusCode{
+		StatusCode: http.StatusOK,
+		Response:   toGraphEvent(updated),
 	}, nil
 }
 
@@ -114,6 +150,53 @@ func graphToEvent(ge *api.MicrosoftGraphEvent) (calendar.Event, error) {
 		}
 	}
 	return e, nil
+}
+
+// mergeEventPatch overlays the fields present in the inbound Graph PATCH body
+// onto the current event, leaving absent fields unchanged — the read-modify-write
+// half of PATCH semantics. Presence is detected per field: scalar Opt/OptNil
+// fields via .Get() (a set field overlays, even when its value is empty), and the
+// Attendees collection via a non-empty slice. The event's identity (ID, UID, and
+// the rest of the current record) is preserved so UpdateEvent rewrites in place.
+// A patched Start/End with a non-UTC time zone is rejected just like create.
+func mergeEventPatch(current calendar.Event, ge *api.MicrosoftGraphEvent) (calendar.Event, error) {
+	merged := current
+	if v, ok := ge.Subject.Get(); ok {
+		merged.Subject = v
+	}
+	if v, ok := ge.IsAllDay.Get(); ok {
+		merged.IsAllDay = v
+	}
+	if v, ok := ge.Start.Get(); ok {
+		t, err := graphToTime(v)
+		if err != nil {
+			return calendar.Event{}, fmt.Errorf("start: %w", err)
+		}
+		merged.Start = t
+	}
+	if v, ok := ge.End.Get(); ok {
+		t, err := graphToTime(v)
+		if err != nil {
+			return calendar.Event{}, fmt.Errorf("end: %w", err)
+		}
+		merged.End = t
+	}
+	if v, ok := ge.Location.Get(); ok {
+		merged.Location = v.DisplayName.Or("")
+	}
+	if v, ok := ge.Organizer.Get(); ok {
+		merged.Organizer = graphRecipientToAddress(v)
+	}
+	if v, ok := ge.Body.Get(); ok {
+		merged.Body = calendar.Body{
+			Content:     v.Content.Or(""),
+			ContentType: neutralBodyType(v.ContentType),
+		}
+	}
+	if len(ge.Attendees) > 0 {
+		merged.Attendees = graphToAddresses(ge.Attendees)
+	}
+	return merged, nil
 }
 
 // graphToTime parses a Graph dateTimeTimeZone back into an instant — the inverse
