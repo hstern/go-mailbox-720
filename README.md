@@ -53,10 +53,12 @@ Built but not yet fully wired, or deliberately first-cut:
   composition) plus both directions wired — `POST /me/events/{id}/accept|decline|
   tentativelyAccept` email an iMIP reply to the organizer (needs `-smtp-addr` +
   `-mailbox-email`), and an opt-in inbound trigger loop (`-enable-scheduling`) turns
-  REQUEST mail into tentative calendar events — and that trigger auto-disables when
-  the CalDAV server schedules natively (the RFC 6638 `calendar-auto-schedule`
-  capability switch). Still open: gating accept/decline on the same switch (it needs
-  a per-attendee PARTSTAT path to update `responseStatus` via CalDAV instead of email).
+  REQUEST mail into tentative calendar events. Both honor the RFC 6638
+  `calendar-auto-schedule` capability switch: when the CalDAV server schedules
+  natively the trigger stands down, and accept/decline record the responder's
+  PARTSTAT via CalDAV (the server sends the reply) instead of emailing. Still open:
+  recording `responseStatus` locally on the storage-only (email) path, and an
+  end-to-end test against a real RFC 6638 server (the Docker matrix has none yet).
 - **Delta**: all three delta endpoints (`/me/messages`, `/me/events`,
   `/me/contacts`) report created/updated items **and** `@removed` tombstones for
   deletions. Mail uses IMAP **CONDSTORE/QRESYNC** (RFC 7162) — `CHANGEDSINCE` for

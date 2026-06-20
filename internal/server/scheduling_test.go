@@ -43,7 +43,7 @@ func seededInvite() *fakeCalendarBackend {
 			Start:     time.Date(2026, 6, 20, 9, 0, 0, 0, time.UTC),
 			End:       time.Date(2026, 6, 20, 10, 0, 0, 0, time.UTC),
 			Organizer: calendar.Address{Name: "Alice", Email: "alice@example.com"},
-			Attendees: []calendar.Address{{Email: "me@example.com"}},
+			Attendees: []calendar.Attendee{{Email: "me@example.com"}},
 		}}},
 	}
 }
@@ -120,5 +120,80 @@ func TestMeEventsEventTentativelyAcceptNilProviderNotImplemented(t *testing.T) {
 	if _, err := h.MeEventsEventTentativelyAccept(context.Background(),
 		&api.MeEventsEventTentativelyAcceptReq{}, api.MeEventsEventTentativelyAcceptParams{EventID: "evt-1"}); err == nil {
 		t.Error("MeEventsEventTentativelyAccept with nil scheduling provider: expected error (501), got nil")
+	}
+}
+
+// nativeCalendarBackend is a writable backend whose server schedules natively
+// (RFC 6638). It records UpdateEvent via the embedded writable backend.
+type nativeCalendarBackend struct {
+	writableCalendarBackend
+}
+
+func (*nativeCalendarBackend) SupportsServerScheduling(context.Context) (bool, error) {
+	return true, nil
+}
+
+type nativeCalendarProvider struct{ backend *nativeCalendarBackend }
+
+func (p nativeCalendarProvider) Calendar(context.Context) (calendar.Backend, error) {
+	return p.backend, nil
+}
+
+func seededNativeInvite() *nativeCalendarBackend {
+	return &nativeCalendarBackend{writableCalendarBackend: writableCalendarBackend{
+		fakeCalendarBackend: fakeCalendarBackend{events: map[string][]calendar.Event{"cal-primary": {{
+			ID:        "evt-1",
+			UID:       "uid-1@example.com",
+			Subject:   "Standup",
+			Organizer: calendar.Address{Name: "Alice", Email: "alice@example.com"},
+			Attendees: []calendar.Attendee{{Email: "me@example.com", Status: "notResponded"}},
+		}}}},
+	}}
+}
+
+// When the CalDAV server schedules natively, accept records the responder's
+// PARTSTAT via UpdateEvent (the server sends the reply) and does NOT email.
+func TestMeEventsEventAcceptNativeUpdatesPartStat(t *testing.T) {
+	sender := &fakeSender{}
+	backend := seededNativeInvite()
+	h := Handler{
+		calendar:   nativeCalendarProvider{backend: backend},
+		scheduling: fakeSchedulingProvider{sender: sender, addr: "me@example.com"},
+	}
+
+	res, err := h.MeEventsEventAccept(context.Background(), &api.MeEventsEventAcceptReq{}, api.MeEventsEventAcceptParams{EventID: "evt-1"})
+	if err != nil {
+		t.Fatalf("MeEventsEventAccept: %v", err)
+	}
+	if _, ok := res.(*api.MeEventsEventAcceptNoContent); !ok {
+		t.Fatalf("response = %T, want 204", res)
+	}
+	if sender.from != "" {
+		t.Error("emailed an iMIP reply even though the server schedules natively")
+	}
+	var status string
+	for _, a := range backend.updatedEvent.Attendees {
+		if a.Email == "me@example.com" {
+			status = a.Status
+		}
+	}
+	if status != "accepted" {
+		t.Errorf("responder PARTSTAT in UpdateEvent = %q, want accepted (attendees: %+v)", status, backend.updatedEvent.Attendees)
+	}
+}
+
+// When the responder is not an attendee, a native-scheduling response is a 400.
+func TestMeEventsEventAcceptNativeNotAnAttendee(t *testing.T) {
+	backend := seededNativeInvite()
+	h := Handler{
+		calendar:   nativeCalendarProvider{backend: backend},
+		scheduling: fakeSchedulingProvider{sender: &fakeSender{}, addr: "stranger@example.com"},
+	}
+	res, err := h.MeEventsEventAccept(context.Background(), &api.MeEventsEventAcceptReq{}, api.MeEventsEventAcceptParams{EventID: "evt-1"})
+	if err != nil {
+		t.Fatalf("MeEventsEventAccept: %v", err)
+	}
+	if errRes, ok := res.(*api.ErrorStatusCode); !ok || errRes.StatusCode != 400 {
+		t.Errorf("response = %T, want a 400 (mailbox not an attendee)", res)
 	}
 }
