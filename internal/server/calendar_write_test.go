@@ -493,3 +493,110 @@ func TestMeCreateEventsSelfOnlyDoesNotEmail(t *testing.T) {
 		t.Error("no UpdateEvent expected when there are no real recipients")
 	}
 }
+
+// Deleting an event with attendees on the dumb-backend tier emails them a
+// METHOD:CANCEL, while the delete itself still returns 204.
+func TestMeDeleteEventsCancelsOnDumbBackend(t *testing.T) {
+	backend := newWritableCalendarBackendSeeded() // GetEvent("evt-1") -> seededEvent (attendee Bob)
+	sender := &fakeSender{}
+	h := Handler{
+		calendar:   writableCalendarProvider{backend: backend},
+		scheduling: fakeSchedulingProvider{sender: sender, addr: "me@example.com"},
+	}
+
+	res, err := h.MeDeleteEvents(context.Background(), api.MeDeleteEventsParams{EventID: "evt-1"})
+	if err != nil {
+		t.Fatalf("MeDeleteEvents: %v", err)
+	}
+	if _, ok := res.(*api.MeDeleteEventsNoContent); !ok {
+		t.Fatalf("response = %T, want *MeDeleteEventsNoContent (204)", res)
+	}
+	if backend.deletedID != "evt-1" {
+		t.Errorf("deleted id = %q, want evt-1", backend.deletedID)
+	}
+	if sender.from != "me@example.com" {
+		t.Errorf("CANCEL from = %q, want me@example.com", sender.from)
+	}
+	if len(sender.to) != 1 || sender.to[0] != "bob@example.com" {
+		t.Errorf("CANCEL to = %v, want [bob@example.com]", sender.to)
+	}
+	inv, err := scheduling.Parse(sender.raw)
+	if err != nil {
+		t.Fatalf("parse CANCEL: %v", err)
+	}
+	if inv.Method != scheduling.MethodCancel {
+		t.Errorf("sent method = %q, want CANCEL", inv.Method)
+	}
+}
+
+// When the backend schedules natively, deleting must NOT also email a CANCEL — the
+// calendar server withdraws the meeting itself.
+func TestMeDeleteEventsNativeSchedulerDoesNotCancel(t *testing.T) {
+	backend := &nativeCalendarBackend{writableCalendarBackend: *newWritableCalendarBackendSeeded()}
+	sender := &fakeSender{}
+	h := Handler{
+		calendar:   nativeCalendarProvider{backend: backend},
+		scheduling: fakeSchedulingProvider{sender: sender, addr: "me@example.com"},
+	}
+
+	res, err := h.MeDeleteEvents(context.Background(), api.MeDeleteEventsParams{EventID: "evt-1"})
+	if err != nil {
+		t.Fatalf("MeDeleteEvents: %v", err)
+	}
+	if _, ok := res.(*api.MeDeleteEventsNoContent); !ok {
+		t.Fatalf("response = %T, want 204", res)
+	}
+	if backend.deletedID != "evt-1" {
+		t.Errorf("deleted id = %q, want evt-1", backend.deletedID)
+	}
+	if sender.from != "" {
+		t.Error("emailed a CANCEL even though the server schedules natively")
+	}
+}
+
+// A delete whose GetEvent fails still deletes (204) and sends no CANCEL — the
+// notification is best-effort, the withdrawal is not.
+func TestMeDeleteEventsGetEventFailureStillDeletes(t *testing.T) {
+	backend := newWritableCalendarBackend() // no seeded events: GetEvent("evt-1") errors
+	sender := &fakeSender{}
+	h := Handler{
+		calendar:   writableCalendarProvider{backend: backend},
+		scheduling: fakeSchedulingProvider{sender: sender, addr: "me@example.com"},
+	}
+
+	res, err := h.MeDeleteEvents(context.Background(), api.MeDeleteEventsParams{EventID: "evt-1"})
+	if err != nil {
+		t.Fatalf("MeDeleteEvents: %v", err)
+	}
+	if _, ok := res.(*api.MeDeleteEventsNoContent); !ok {
+		t.Fatalf("response = %T, want 204", res)
+	}
+	if backend.deletedID != "evt-1" {
+		t.Errorf("deleted id = %q, want evt-1 (delete must proceed despite the read failure)", backend.deletedID)
+	}
+	if sender.from != "" {
+		t.Error("sent a CANCEL even though the event could not be read")
+	}
+}
+
+// A CANCEL that fails to send does not fail the delete (still 204): the withdrawal
+// has already happened, so the send error is logged, not propagated.
+func TestMeDeleteEventsCancelSendFailureStillReturns204(t *testing.T) {
+	backend := newWritableCalendarBackendSeeded()
+	sender := &fakeSender{sendErr: errors.New("smtp unavailable")}
+	h := Handler{
+		calendar:   writableCalendarProvider{backend: backend},
+		scheduling: fakeSchedulingProvider{sender: sender, addr: "me@example.com"},
+	}
+
+	res, err := h.MeDeleteEvents(context.Background(), api.MeDeleteEventsParams{EventID: "evt-1"})
+	if err != nil {
+		t.Fatalf("MeDeleteEvents: %v", err)
+	}
+	if _, ok := res.(*api.MeDeleteEventsNoContent); !ok {
+		t.Fatalf("response = %T, want 204 despite the CANCEL send failure", res)
+	}
+	if backend.deletedID != "evt-1" {
+		t.Errorf("deleted id = %q, want evt-1", backend.deletedID)
+	}
+}
