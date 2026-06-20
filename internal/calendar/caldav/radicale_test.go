@@ -524,3 +524,65 @@ func freePort(t *testing.T) string {
 	}
 	return port
 }
+
+// TestRadicaleFindEventByUID exercises the calendar.Finder lookup against a real
+// server: an event created via the adapter must be locatable by its UID (backing
+// the inbound scheduling trigger's de-duplication), and an unknown UID must report
+// not-found.
+func TestRadicaleFindEventByUID(t *testing.T) {
+	if _, err := exec.LookPath("docker"); err != nil {
+		t.Skip("docker not available")
+	}
+	base := startRadicale(t)
+	seedCalendar(t, base)
+
+	cl, err := Dial(base, radicaleUser, radicalePass, nil)
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	defer func() { _ = cl.Close() }()
+	ctx := context.Background()
+
+	cals, err := cl.ListCalendars(ctx)
+	if err != nil {
+		t.Fatalf("ListCalendars: %v", err)
+	}
+	var work *calendar.Calendar
+	for i := range cals {
+		if cals[i].Name == calendarName {
+			work = &cals[i]
+			break
+		}
+	}
+	if work == nil {
+		t.Fatalf("calendar %q not listed: %+v", calendarName, cals)
+	}
+
+	start := time.Date(2026, 8, 3, 9, 0, 0, 0, time.UTC)
+	created, err := cl.CreateEvent(ctx, work.ID, calendar.Event{
+		Subject: "Locate me",
+		Start:   start,
+		End:     start.Add(time.Hour),
+	})
+	if err != nil {
+		t.Fatalf("CreateEvent: %v", err)
+	}
+
+	got, found, err := cl.FindEventByUID(ctx, work.ID, created.UID)
+	if err != nil {
+		t.Fatalf("FindEventByUID: %v", err)
+	}
+	if !found {
+		t.Fatalf("FindEventByUID(%q) found=false, want true", created.UID)
+	}
+	if got.ID != created.ID {
+		t.Errorf("found event ID = %q, want %q", got.ID, created.ID)
+	}
+	if got.Subject != "Locate me" {
+		t.Errorf("found event Subject = %q, want %q", got.Subject, "Locate me")
+	}
+
+	if _, found, err := cl.FindEventByUID(ctx, work.ID, "no-such-uid@example.com"); err != nil || found {
+		t.Errorf("FindEventByUID(unknown) = found %v, err %v; want false, nil", found, err)
+	}
+}

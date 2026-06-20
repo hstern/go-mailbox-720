@@ -41,6 +41,7 @@ type Client struct {
 }
 
 var _ calendar.Backend = (*Client)(nil)
+var _ calendar.Finder = (*Client)(nil)
 
 // Dial builds a CalDAV client for endpoint (the server's CalDAV base URL),
 // authenticating every request with HTTP Basic credentials. It does not perform
@@ -135,6 +136,44 @@ func (cl *Client) ListEvents(ctx context.Context, calID string, r calendar.Range
 	return events, nil
 }
 
+// FindEventByUID locates the event in a calendar whose iCalendar UID matches uid,
+// via a calendar-query REPORT filtered on the VEVENT UID property, and reports
+// whether one was found. It backs the inbound scheduling trigger's UID correlation
+// (calendar.Finder). The text match is exact; the first matching object's master
+// VEVENT is returned.
+func (cl *Client) FindEventByUID(ctx context.Context, calID, uid string) (calendar.Event, bool, error) {
+	calPath, err := decodeCalendarID(calID)
+	if err != nil {
+		return calendar.Event{}, false, err
+	}
+	query := &gocaldav.CalendarQuery{
+		CompRequest: gocaldav.CalendarCompRequest{
+			Name:     ical.CompCalendar,
+			AllProps: true,
+			Comps:    []gocaldav.CalendarCompRequest{{Name: ical.CompEvent, AllProps: true}},
+		},
+		CompFilter: gocaldav.CompFilter{
+			Name: ical.CompCalendar,
+			Comps: []gocaldav.CompFilter{{
+				Name:  ical.CompEvent,
+				Props: []gocaldav.PropFilter{{Name: ical.PropUID, TextMatch: &gocaldav.TextMatch{Text: uid}}},
+			}},
+		},
+	}
+	objs, err := cl.c.QueryCalendar(ctx, calPath, query)
+	if err != nil {
+		return calendar.Event{}, false, fmt.Errorf("caldav: query calendar %q by uid: %w", calPath, err)
+	}
+	for _, obj := range objs {
+		// A server with no UID-property filtering may return every object; confirm
+		// the UID rather than trusting the server narrowed it.
+		if e, ok := eventFromObject(calID, obj.Path, obj.Data); ok && e.UID == uid {
+			return e, true, nil
+		}
+	}
+	return calendar.Event{}, false, nil
+}
+
 // GetEvent fetches a single event resource by opaque ID and maps its master
 // VEVENT.
 func (cl *Client) GetEvent(ctx context.Context, id string) (calendar.Event, error) {
@@ -170,12 +209,19 @@ func eventFromObject(calID, objectPath string, cal *ical.Calendar) (calendar.Eve
 	if len(events) == 0 {
 		return calendar.Event{}, false
 	}
-	master := 0
+	master := -1
 	for i := range events {
 		if events[i].Props.Get(propRecurrenceID) == nil {
 			master = i
 			break
 		}
+	}
+	if master < 0 {
+		// Only recurrence overrides and no master component: a malformed object we
+		// cannot represent as one event (and whose SEQUENCE would mislead the
+		// Finder's revision comparison). Skip it rather than treat an override as
+		// the master.
+		return calendar.Event{}, false
 	}
 	e := mapEvent(&events[master])
 	e.ID = eventID(objectPath)
