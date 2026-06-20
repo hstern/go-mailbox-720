@@ -72,7 +72,11 @@ type Event struct {
 	Attendees  []Attendee
 	Body       Body
 	Status     string // mapped from the iCalendar STATUS (e.g. "confirmed")
-	CreatedAt  time.Time
+	// Sequence is the iCalendar SEQUENCE (RFC 5545 §3.8.7.4): the event's revision
+	// number, bumped by the organizer on each significant change so iTIP recipients
+	// can tell a re-sent REQUEST/CANCEL supersedes an earlier one. 0 for a new event.
+	Sequence  int
+	CreatedAt time.Time
 }
 
 // Range bounds an event listing by start/end instant. A zero Start or End means

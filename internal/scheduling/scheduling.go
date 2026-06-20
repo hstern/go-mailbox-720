@@ -488,5 +488,10 @@ func propInt(props ical.Props, name string) int {
 
 // setInt sets a property to the decimal string form of an integer.
 func setInt(props ical.Props, name string, v int) {
-	props.SetText(name, fmt.Sprintf("%d", v))
+	// A bare integer property: SetText would tag it VALUE=TEXT, which contradicts
+	// SEQUENCE's INTEGER type (RFC 5545 §3.8.7.4) and makes Prop.Int — and other
+	// clients' parsers — reject it.
+	prop := ical.NewProp(name)
+	prop.Value = fmt.Sprintf("%d", v)
+	props.Set(prop)
 }
