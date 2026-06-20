@@ -24,6 +24,11 @@ require (
 )
 
 require (
+	github.com/hstern/go-access-tokens v0.2.0
+	github.com/hstern/go-token-introspection v0.1.0
+)
+
+require (
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/dlclark/regexp2 v1.12.0 // indirect
 	github.com/fatih/color v1.19.0 // indirect
