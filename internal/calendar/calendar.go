@@ -171,3 +171,16 @@ type SchedulingDetector interface {
 	// calendar auto-scheduling.
 	SupportsServerScheduling(ctx context.Context) (bool, error)
 }
+
+// Finder is the optional capability to locate an event by its iCalendar UID rather
+// than the opaque store ID. The inbound scheduling trigger uses it to correlate a
+// re-sent REQUEST with the tentative event an earlier REQUEST created, so a new
+// revision updates that event in place instead of creating a duplicate. An adapter
+// that can index by UID implements Finder in addition to Backend; callers fall back
+// to creating when it is absent.
+type Finder interface {
+	// FindEventByUID returns the event in the named calendar whose iCalendar UID
+	// matches uid, and whether one was found. A nil error with found=false means no
+	// such event; an error means the lookup itself failed.
+	FindEventByUID(ctx context.Context, calendarID, uid string) (Event, bool, error)
+}

@@ -93,6 +93,7 @@ func EventFromInvite(inv *scheduling.Invite) calendar.Event {
 		Subject:   inv.Summary,
 		Start:     inv.Start,
 		End:       inv.End,
+		Sequence:  inv.Sequence,
 		Organizer: toCalendarAddress(inv.Organizer),
 		Attendees: attendees,
 		Status:    StatusTentative,
@@ -161,11 +162,11 @@ func InviteFromEvent(ev calendar.Event) *scheduling.Invite {
 // methods belong to different flows (a REPLY is organizer-side response tracking;
 // a CANCEL is a withdrawal, handled once UID-correlated updates land).
 //
-// DEFERRED: UID-correlated update of an existing tentative event. A re-sent
-// REQUEST (same UID, higher SEQUENCE) should locate and update the event the
-// first REQUEST created rather than creating a duplicate; that requires a UID
-// lookup on the backend and is part of the trigger follow-up. Today this always
-// creates.
+// UID correlation: if w also implements [calendar.Finder], a re-sent REQUEST is
+// matched to the event an earlier REQUEST created (by UID) and updates it in place
+// when it carries a higher SEQUENCE, rather than creating a duplicate; an equal or
+// lower SEQUENCE is treated as a duplicate/stale delivery and left untouched. A
+// backend without Finder always creates (the first-cut behavior).
 func ProcessRequest(ctx context.Context, w calendar.Writer, calendarID string, raw []byte) (calendar.Event, error) {
 	inv, err := scheduling.Parse(raw)
 	if err != nil {
@@ -176,6 +177,30 @@ func ProcessRequest(ctx context.Context, w calendar.Writer, calendarID string, r
 	}
 
 	event := EventFromInvite(inv)
+
+	// UID correlation: when the backend can locate the event a prior REQUEST created,
+	// a re-sent REQUEST updates it in place rather than creating a duplicate. Only a
+	// strictly higher SEQUENCE is a new revision; an equal or lower one is a
+	// duplicate delivery or a stale resend, so the stored event (and the attendee's
+	// own PARTSTAT on it) is kept untouched.
+	if f, ok := w.(calendar.Finder); ok {
+		existing, found, err := f.FindEventByUID(ctx, calendarID, inv.UID)
+		if err != nil {
+			return calendar.Event{}, fmt.Errorf("itip: find event by uid: %w", err)
+		}
+		if found {
+			if inv.Sequence <= existing.Sequence {
+				return existing, nil
+			}
+			event.ID = existing.ID
+			updated, err := w.UpdateEvent(ctx, event)
+			if err != nil {
+				return calendar.Event{}, fmt.Errorf("itip: update event: %w", err)
+			}
+			return updated, nil
+		}
+	}
+
 	created, err := w.CreateEvent(ctx, calendarID, event)
 	if err != nil {
 		return calendar.Event{}, fmt.Errorf("itip: create event: %w", err)

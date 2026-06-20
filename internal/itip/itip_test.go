@@ -605,3 +605,109 @@ func TestCancelNil(t *testing.T) {
 		t.Fatal("Cancel(nil): want error, got nil")
 	}
 }
+
+// fakeFinderWriter is a calendar.Writer + calendar.Finder for the UID-correlation
+// tests: FindEventByUID returns a preset event, and it records whether the inbound
+// REQUEST resulted in a create, an update, or neither.
+type fakeFinderWriter struct {
+	existing  calendar.Event
+	found     bool
+	created   bool
+	updated   bool
+	updatedEv calendar.Event
+}
+
+func (f *fakeFinderWriter) FindEventByUID(context.Context, string, string) (calendar.Event, bool, error) {
+	return f.existing, f.found, nil
+}
+func (f *fakeFinderWriter) CreateEvent(_ context.Context, calendarID string, e calendar.Event) (calendar.Event, error) {
+	f.created = true
+	e.ID = "created-id"
+	return e, nil
+}
+func (f *fakeFinderWriter) UpdateEvent(_ context.Context, e calendar.Event) (calendar.Event, error) {
+	f.updated = true
+	f.updatedEv = e
+	return e, nil
+}
+func (f *fakeFinderWriter) DeleteEvent(context.Context, string) error { return nil }
+
+// requestWithSequence builds an inbound REQUEST iMIP message at a given SEQUENCE
+// (UID abc-123@example.com), for the UID-correlation tests.
+func requestWithSequence(t *testing.T, seq int) []byte {
+	t.Helper()
+	inv := scheduling.Invite{
+		UID:       "abc-123@example.com",
+		Summary:   "Project sync",
+		Start:     time.Date(2026, 6, 15, 15, 0, 0, 0, time.UTC),
+		End:       time.Date(2026, 6, 15, 16, 0, 0, 0, time.UTC),
+		Sequence:  seq,
+		Organizer: scheduling.Address{Email: "olivia@example.com"},
+		Attendees: []scheduling.Attendee{{Address: scheduling.Address{Email: "andy@example.com"}}},
+	}
+	ics, err := scheduling.Request(inv)
+	if err != nil {
+		t.Fatalf("build request ics: %v", err)
+	}
+	raw, err := scheduling.Compose(inv.Organizer, []scheduling.Address{inv.Attendees[0].Address},
+		"Invitation", scheduling.MethodRequest, ics, fixedDate)
+	if err != nil {
+		t.Fatalf("compose request message: %v", err)
+	}
+	return raw
+}
+
+// No existing event for the UID: ProcessRequest creates (the first-cut behavior).
+func TestProcessRequestUnknownUIDCreates(t *testing.T) {
+	w := &fakeFinderWriter{found: false}
+	if _, err := ProcessRequest(context.Background(), w, "cal-1", requestWithSequence(t, 0)); err != nil {
+		t.Fatalf("ProcessRequest: %v", err)
+	}
+	if !w.created || w.updated {
+		t.Errorf("created=%v updated=%v, want create only", w.created, w.updated)
+	}
+}
+
+// A re-sent REQUEST at a higher SEQUENCE updates the existing event in place rather
+// than creating a duplicate.
+func TestProcessRequestHigherSequenceUpdatesInPlace(t *testing.T) {
+	w := &fakeFinderWriter{found: true, existing: calendar.Event{ID: "evt-stored", UID: "abc-123@example.com", Sequence: 1}}
+	if _, err := ProcessRequest(context.Background(), w, "cal-1", requestWithSequence(t, 2)); err != nil {
+		t.Fatalf("ProcessRequest: %v", err)
+	}
+	if w.created || !w.updated {
+		t.Errorf("created=%v updated=%v, want update only", w.created, w.updated)
+	}
+	if w.updatedEv.ID != "evt-stored" {
+		t.Errorf("updated event ID = %q, want evt-stored (updated in place)", w.updatedEv.ID)
+	}
+	if w.updatedEv.Sequence != 2 {
+		t.Errorf("updated SEQUENCE = %d, want 2", w.updatedEv.Sequence)
+	}
+}
+
+// A re-delivered (equal) or stale (lower) SEQUENCE neither creates nor updates —
+// it leaves the stored event and the attendee's own PARTSTAT untouched.
+func TestProcessRequestEqualOrLowerSequenceSkips(t *testing.T) {
+	for _, tc := range []struct {
+		name             string
+		stored, incoming int
+	}{
+		{"equal/duplicate", 2, 2},
+		{"lower/stale", 3, 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := &fakeFinderWriter{found: true, existing: calendar.Event{ID: "evt-stored", UID: "abc-123@example.com", Sequence: tc.stored}}
+			got, err := ProcessRequest(context.Background(), w, "cal-1", requestWithSequence(t, tc.incoming))
+			if err != nil {
+				t.Fatalf("ProcessRequest: %v", err)
+			}
+			if w.created || w.updated {
+				t.Errorf("created=%v updated=%v, want neither", w.created, w.updated)
+			}
+			if got.ID != "evt-stored" {
+				t.Errorf("returned event ID = %q, want the stored event unchanged", got.ID)
+			}
+		})
+	}
+}
