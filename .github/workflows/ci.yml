@@ -138,3 +138,23 @@ jobs:
       - name: CalDAV adapter integration (Radicale)
         run: go test -tags dockertest -timeout 240s -run "TestRadicale" ./internal/calendar/caldav/
 
+  stalwart-e2e:
+    # Runs the RFC 6638 native-scheduling gating e2e against a real Stalwart server
+    # (build tag dockertest). Stalwart implements CalDAV auto-scheduling natively, so
+    # this exercises accept -> PARTSTAT-via-CalDAV (no client-side email) against an
+    # actual scheduler. The e2e drives the accept handler via server.New, which
+    # imports the generated Graph package. Docker is available on GitHub-hosted runners.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Generate (fetch upstream spec + ogen)
+        run: go generate ./internal/graph
+
+      - name: Native-scheduling gating e2e (Stalwart)
+        run: go test -tags dockertest -timeout 300s -run "TestStalwart" ./internal/calendar/caldav/
+

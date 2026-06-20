@@ -8,8 +8,6 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"net/http/httputil"
-	"net/url"
 	"os/exec"
 	"testing"
 	"time"
@@ -18,29 +16,6 @@ import (
 	"github.com/hstern/go-mailbox-720/internal/server"
 	"github.com/hstern/go-mailbox-720/internal/smtp"
 )
-
-// autoScheduleProxy fronts the Radicale base URL and injects the RFC 6638
-// calendar-auto-schedule compliance class into OPTIONS DAV response headers, so
-// the adapter detects the (otherwise storage-only) server as a native scheduler
-// while Radicale still serves every real CalDAV operation. This lets the gating
-// path be exercised end to end without a heavyweight RFC 6638 server in the matrix.
-func autoScheduleProxy(t *testing.T, base string) string {
-	t.Helper()
-	target, err := url.Parse(base)
-	if err != nil {
-		t.Fatalf("parse base: %v", err)
-	}
-	proxy := httputil.NewSingleHostReverseProxy(target)
-	proxy.ModifyResponse = func(resp *http.Response) error {
-		if resp.Request.Method == http.MethodOptions {
-			resp.Header.Add("DAV", "calendar-auto-schedule")
-		}
-		return nil
-	}
-	srv := httptest.NewServer(proxy)
-	t.Cleanup(srv.Close)
-	return srv.URL
-}
 
 // recordingSender notes whether an iMIP reply was emailed.
 type recordingSender struct{ sent bool }
@@ -63,67 +38,55 @@ type clientCalendarProvider struct{ cl *Client }
 
 func (p clientCalendarProvider) Calendar(context.Context) (calendar.Backend, error) { return p.cl, nil }
 
-// TestRadicaleNativeSchedulingGating exercises the RFC 6638 capability switch end
-// to end: with the proxy making Radicale look like a native scheduler, POSTing
-// accept through the real Graph server must record the responder's PARTSTAT via
-// CalDAV (UpdateEvent → Radicale) and NOT email an iMIP reply.
-//
-// INTERIM: only the "native" signal is faked (one injected OPTIONS header) —
-// everything else is real (handler, adapter, CalDAV PUT/GET). Replacing this with
-// a real RFC 6638 server (Stalwart, which advertises calendar-auto-schedule and
-// actually emits the reply) is tracked separately. The request body is empty ({}),
-// so an omitted SendResponse must default to true (a regression guard for the
-// subsetter that strips Graph's spec-level default:false).
-func TestRadicaleNativeSchedulingGating(t *testing.T) {
+// TestStalwartNativeSchedulingGating exercises the RFC 6638 capability switch end
+// to end against a REAL native scheduler (Stalwart). POSTing accept through the
+// real Graph server must record the responder's PARTSTAT via CalDAV (UpdateEvent
+// → Stalwart, which then performs the iTIP reply itself) and must NOT email an
+// iMIP reply from us — the whole point of the switch.
+func TestStalwartNativeSchedulingGating(t *testing.T) {
 	if _, err := exec.LookPath("docker"); err != nil {
 		t.Skip("docker not available")
 	}
-	base := startRadicale(t)
-	seedCalendar(t, base)
+	base, login, pass := startStalwart(t)
 
-	// The adapter talks to Radicale through the proxy, so OPTIONS reports
-	// calendar-auto-schedule and the adapter detects native scheduling.
-	cl, err := Dial(autoScheduleProxy(t, base), radicaleUser, radicalePass, nil)
+	cl, err := Dial(base, login, pass, nil)
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
 	defer func() { _ = cl.Close() }()
 	ctx := context.Background()
 
+	// The adapter must detect Stalwart as a native scheduler (it advertises
+	// calendar-auto-schedule in its OPTIONS DAV header).
 	if native, err := cl.SupportsServerScheduling(ctx); err != nil || !native {
-		t.Fatalf("SupportsServerScheduling = %v, %v; want true (proxy injects calendar-auto-schedule)", native, err)
+		t.Fatalf("SupportsServerScheduling = %v, %v; want true (Stalwart is RFC 6638)", native, err)
 	}
 
 	cals, err := cl.ListCalendars(ctx)
 	if err != nil {
 		t.Fatalf("ListCalendars: %v", err)
 	}
-	var calID string
-	for _, c := range cals {
-		if c.Name == calendarName {
-			calID = c.ID
-		}
+	if len(cals) == 0 {
+		t.Fatalf("no calendars discovered for %s", login)
 	}
-	if calID == "" {
-		t.Fatalf("calendar %q not found in %+v", calendarName, cals)
-	}
+	calID := cals[0].ID
 
-	const mailbox = "me@example.com"
 	start := time.Date(2026, 9, 1, 10, 0, 0, 0, time.UTC)
 	created, err := cl.CreateEvent(ctx, calID, calendar.Event{
 		Subject:   "Planning",
 		Start:     start,
 		End:       start.Add(time.Hour),
 		Organizer: calendar.Address{Name: "Alice", Email: "alice@example.com"},
-		Attendees: []calendar.Attendee{{Email: mailbox, Status: "notResponded"}},
+		Attendees: []calendar.Attendee{{Email: login, Status: "notResponded"}},
 	})
 	if err != nil {
 		t.Fatalf("CreateEvent: %v", err)
 	}
 
-	// Drive the real accept handler over HTTP through the generated Graph server.
+	// Drive the real accept handler over HTTP. The empty body relies on
+	// SendResponse defaulting to true (the subsetter strips Graph's default:false).
 	sender := &recordingSender{}
-	graphSrv, err := server.New(nil, clientCalendarProvider{cl: cl}, nil, e2eSchedulingProvider{sender: sender, addr: mailbox})
+	graphSrv, err := server.New(nil, clientCalendarProvider{cl: cl}, nil, e2eSchedulingProvider{sender: sender, addr: login})
 	if err != nil {
 		t.Fatalf("server.New: %v", err)
 	}
@@ -140,7 +103,8 @@ func TestRadicaleNativeSchedulingGating(t *testing.T) {
 		t.Fatalf("accept status = %d, want 204; body=%s", resp.StatusCode, body)
 	}
 
-	// Native path: no email, and the responder's PARTSTAT is now ACCEPTED in Radicale.
+	// Native path: no email from us, and the responder's PARTSTAT is now ACCEPTED
+	// in Stalwart (which performs the iTIP reply itself).
 	if sender.sent {
 		t.Error("emailed an iMIP reply even though the server schedules natively")
 	}
@@ -150,7 +114,7 @@ func TestRadicaleNativeSchedulingGating(t *testing.T) {
 	}
 	var status string
 	for _, a := range got.Attendees {
-		if a.Email == mailbox {
+		if a.Email == login {
 			status = a.Status
 		}
 	}

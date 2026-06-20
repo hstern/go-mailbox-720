@@ -179,10 +179,13 @@ func sanitizeParam(s string) string {
 }
 
 // newUID mints a fresh iCalendar UID for a created event: 16 random bytes hex
-// encoded, scoped with this adapter's domain to make it globally unique per
-// RFC 5545 §3.8.4.7.
+// encoded, scoped with this adapter's name to make it globally unique per
+// RFC 5545 §3.8.4.7. The UID doubles as the object resource name, so the scope is
+// joined with '-' rather than '@': an '@' in the resource path breaks object GETs
+// against servers whose calendar home is itself email-addressed (e.g. Stalwart's
+// /dav/cal/user@domain/), even though '@' is a valid path character.
 func newUID() string {
 	var b [16]byte
 	_, _ = rand.Read(b[:])
-	return hex.EncodeToString(b[:]) + "@go-mailbox-720"
+	return hex.EncodeToString(b[:]) + "-go-mailbox-720"
 }
