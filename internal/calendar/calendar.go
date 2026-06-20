@@ -77,6 +77,51 @@ type Event struct {
 	// can tell a re-sent REQUEST/CANCEL supersedes an earlier one. 0 for a new event.
 	Sequence  int
 	CreatedAt time.Time
+
+	// Recurrence describes the repeat rule of a recurring series, carried on the
+	// series master VEVENT (the iCalendar RRULE plus its EXDATE exceptions). Nil on
+	// a non-recurring event and on an individual occurrence/override; the master
+	// owns the pattern. It maps to Graph's event.recurrence (patternedRecurrence).
+	Recurrence *RecurrencePattern
+
+	// RecurrenceID marks an event that addresses a single instance of a recurring
+	// series rather than the whole series: it is the original start instant of the
+	// occurrence the event stands for (the iCalendar RECURRENCE-ID). Zero on a
+	// non-recurring event and on the series master. An occurrence surfaced by
+	// expansion and an override (exception) VEVENT both carry it; IsOverride
+	// distinguishes them.
+	RecurrenceID time.Time
+
+	// IsOverride reports whether this instance is an exception VEVENT explicitly
+	// stored by the organizer (an override of the pattern, e.g. a moved or
+	// retitled occurrence) rather than a plain occurrence synthesized from the
+	// master's RRULE. It is meaningful only when RecurrenceID is non-zero. Maps to
+	// Graph's event.type ("exception" vs "occurrence").
+	IsOverride bool
+
+	// SeriesMasterID is the opaque ID of the series master event for an instance
+	// (occurrence or override). Empty on the master itself and on non-recurring
+	// events. It backs Graph's event.seriesMasterId so a client can navigate from
+	// an instance back to the series.
+	SeriesMasterID string
+}
+
+// RecurrencePattern is the backend-neutral recurrence rule of a series: the
+// iCalendar RRULE together with its EXDATE exception instants. It is modelled
+// around the iCalendar RRULE rather than Graph's split pattern/range so the
+// CalDAV adapter can round-trip it losslessly; the Graph layer derives the
+// patternedRecurrence shape (recurrencePattern + recurrenceRange) from it.
+type RecurrencePattern struct {
+	// RRULE is the iCalendar recurrence rule value (RFC 5545 §3.3.10), e.g.
+	// "FREQ=WEEKLY;BYDAY=MO,WE;COUNT=10" — the RRULE property value with the
+	// "RRULE:" name stripped. It is the canonical form; the adapter writes it back
+	// verbatim and the Graph layer parses it for patternedRecurrence.
+	RRULE string
+
+	// ExceptionDates are the EXDATE instants (RFC 5545 §3.8.5.1): occurrences the
+	// rule would generate but that have been removed from the series. Carried in
+	// UTC.
+	ExceptionDates []time.Time
 }
 
 // Range bounds an event listing by start/end instant. A zero Start or End means
@@ -183,4 +228,51 @@ type Finder interface {
 	// matches uid, and whether one was found. A nil error with found=false means no
 	// such event; an error means the lookup itself failed.
 	FindEventByUID(ctx context.Context, calendarID, uid string) (Event, bool, error)
+}
+
+// InstanceReader is the optional capability to surface the individual occurrences
+// of a recurring series as addressable events: expand the master's RRULE over a
+// window and merge in the stored override (RECURRENCE-ID) VEVENTs. It backs
+// Microsoft Graph's GET /me/events/{id}/instances and the occurrence expansion of
+// GET /me/calendarView. It is kept separate from Backend (like Writer and Finder)
+// so an adapter without recurrence expansion, and the server's read-path fakes,
+// need not implement it; consumers type-assert for it:
+//
+//	if ir, ok := backend.(calendar.InstanceReader); ok {
+//		insts, err := ir.ListInstances(ctx, eventID, r)
+//	}
+//
+// An InstanceReader is bound to the same authenticated principal as its Backend.
+type InstanceReader interface {
+	// ListInstances expands the recurring series identified by the opaque event ID
+	// (the series master) into its occurrences within the time range r, which must
+	// be bounded on both sides — an unbounded RRULE (no COUNT/UNTIL) has infinitely
+	// many occurrences, so the caller supplies the window. Each returned Event
+	// carries a RecurrenceID (the occurrence's original start) and SeriesMasterID
+	// (the master's opaque ID). Occurrences with a stored override take the
+	// override's fields (and IsOverride=true); EXDATE-cancelled occurrences are
+	// omitted. A non-recurring event yields the single event itself when it falls
+	// in the window.
+	ListInstances(ctx context.Context, eventID string, r Range) ([]Event, error)
+}
+
+// InstanceWriter is the optional capability to record a per-occurrence override of
+// a recurring series: store an exception (RECURRENCE-ID) event that replaces a
+// single occurrence's fields without disturbing the master rule or the other
+// occurrences. It is kept separate from Writer (like InstanceReader from Backend)
+// so an adapter without per-instance writes need not implement it; consumers
+// type-assert for it:
+//
+//	if iw, ok := backend.(calendar.InstanceWriter); ok {
+//		stored, err := iw.WriteInstanceOverride(ctx, masterID, override)
+//	}
+//
+// An InstanceWriter is bound to the same authenticated principal as its Backend.
+type InstanceWriter interface {
+	// WriteInstanceOverride adds or replaces the override for one occurrence of the
+	// series identified by masterID (its opaque series-master ID). override carries
+	// the occurrence's RecurrenceID (which occurrence) plus the replacement fields;
+	// RecurrenceID must be non-zero. It returns the stored override stamped with its
+	// instance ID, CalendarID, and SeriesMasterID.
+	WriteInstanceOverride(ctx context.Context, masterID string, override Event) (Event, error)
 }
