@@ -153,8 +153,8 @@ func (p *principal) hasScopes(required []string) bool {
 // Middleware wraps next, rejecting any request without a valid bearer token.
 func (a *Authenticator) Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		raw, ok := bearerToken(r)
-		if !ok {
+		raw, err := accesstoken.BearerToken(r) // RFC 6750 §2.1 bearer extraction
+		if err != nil {
 			grapherr.Write(w, http.StatusUnauthorized)
 			return
 		}
@@ -383,17 +383,6 @@ func toSet(items []string) map[string]struct{} {
 // looksLikeJWT reports whether raw has the three dot-separated segments of a JWS.
 func looksLikeJWT(raw string) bool {
 	return strings.Count(raw, ".") == 2
-}
-
-// bearerToken extracts the token from an "Authorization: Bearer <token>" header.
-func bearerToken(r *http.Request) (string, bool) {
-	const prefix = "Bearer "
-	h := r.Header.Get("Authorization")
-	if len(h) <= len(prefix) || !strings.EqualFold(h[:len(prefix)], prefix) {
-		return "", false
-	}
-	tok := strings.TrimSpace(h[len(prefix):])
-	return tok, tok != ""
 }
 
 // unverifiedIssuer reads the "iss" claim from a JWT WITHOUT verifying it, purely
