@@ -10,3 +10,6 @@ openapi-subset.yaml
 # is a safety net for a stray `go run ./cmd/gen-graph-api` from the repo root.
 /internal/graph/api/
 /api/
+
+# mailboxd binary from `go build ./cmd/mailboxd`
+/mailboxd

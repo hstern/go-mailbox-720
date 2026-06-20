@@ -32,6 +32,7 @@ import (
 	"github.com/hstern/go-mailbox-720/internal/mail"
 	"github.com/hstern/go-mailbox-720/internal/mail/imap"
 	"github.com/hstern/go-mailbox-720/internal/server"
+	"github.com/hstern/go-mailbox-720/internal/subscriptions"
 )
 
 func main() {
@@ -160,6 +161,26 @@ func run(addr string, authCfg auth.Config, provider server.MailProvider, calProv
 	// inherit its context (and thus the authenticated mailbox identity).
 	mux := http.NewServeMux()
 	mux.Handle("POST "+basePath+"/$batch", batch.Handler(h, basePath))
+
+	// /subscriptions is a Graph endpoint not in the generated API; mount the
+	// change-notification handler over an in-process store. The SSRF-guarded
+	// client is used for the notificationUrl validation handshake. Delivery of
+	// notifications (IMAP IDLE -> POST) is future work; this is create/list/delete.
+	//
+	// SINGLE-TENANT: one shared store, no per-identity keying — fine for the
+	// static single-mailbox model, but before multi-mailbox use the store must be
+	// keyed on the authenticated subject (with a per-principal subscription cap),
+	// else any authenticated caller can list/delete every caller's subscriptions.
+	subStore := subscriptions.NewMemoryStore()
+	subHandler := subscriptions.NewHandler(
+		subStore, subscriptions.GuardedClient(),
+		[]string{"/me/messages", "/me/events", "/me/contacts"},
+		72*time.Hour, time.Now,
+	)
+	mux.Handle(basePath+"/subscriptions", subHandler)
+	mux.Handle(basePath+"/subscriptions/", subHandler)
+	log.Println("subscriptions: enabled (in-memory store; delivery not yet wired)")
+
 	mux.Handle("/", h)
 
 	var handler http.Handler = mux

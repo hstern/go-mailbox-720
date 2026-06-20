@@ -1,0 +1,264 @@
+package subscriptions
+
+import (
+	"encoding/json"
+	"errors"
+	"net/http"
+	"strings"
+	"time"
+)
+
+// maxSubscriptionBody bounds a POST {base} request body. A subscription is a
+// small JSON object (a handful of short string fields), so a few KiB is generous
+// while still refusing an oversized body as an amplification guard.
+const maxSubscriptionBody = 16 << 10 // 16 KiB
+
+// Handler serves the Microsoft Graph change-notification subscription endpoint
+// (https://learn.microsoft.com/graph/api/resources/subscription). It is a
+// self-contained stdlib http.Handler the caller mounts under a base path (e.g.
+// "/v1.0/subscriptions"); the /subscriptions surface is not part of the
+// generated Graph API, so this handler stands alone the way [internal/batch]
+// does.
+//
+// It routes:
+//
+//   - POST   {base}        create a subscription;
+//   - GET    {base}        list subscriptions as {"value":[...]};
+//   - DELETE {base}/{id}   delete a subscription;
+//
+// and renders Graph-shaped error objects ({"error":{"code","message"}}) for
+// every rejection.
+type Handler struct {
+	store            Store
+	client           *http.Client
+	allowedResources []string
+	maxTTL           time.Duration
+	now              func() time.Time
+}
+
+// NewHandler builds the subscriptions [Handler].
+//
+// store persists subscriptions. client performs the notificationUrl validation
+// handshake ([VerifyNotificationURL]); inject it so tests can pass an httptest
+// client (which dials 127.0.0.1) while production passes [GuardedClient], whose
+// dialer is SSRF-hardened. allowedResources is the case-insensitive allow-list a
+// subscription's resource must match. maxTTL is the largest lifetime a
+// subscription may request (expirationDateTime no later than now+maxTTL). now is
+// the clock, injected so expiry validation is deterministic in tests; a nil now
+// defaults to time.Now.
+//
+// The returned http.Handler is safe for concurrent use (the [Store] is).
+func NewHandler(store Store, client *http.Client, allowedResources []string, maxTTL time.Duration, now func() time.Time) http.Handler {
+	if now == nil {
+		now = time.Now
+	}
+	return &Handler{
+		store:            store,
+		client:           client,
+		allowedResources: allowedResources,
+		maxTTL:           maxTTL,
+		now:              now,
+	}
+}
+
+// subscriptionWire is the JSON shape of a Graph subscription on the wire. The
+// @odata.* envelope fields are omitted for now; expirationDateTime is RFC3339.
+type subscriptionWire struct {
+	ID                 string `json:"id,omitempty"`
+	ChangeType         string `json:"changeType"`
+	NotificationURL    string `json:"notificationUrl"`
+	Resource           string `json:"resource"`
+	ExpirationDateTime string `json:"expirationDateTime"`
+	ClientState        string `json:"clientState,omitempty"`
+}
+
+// toWire renders a stored Subscription as its wire shape. clientState IS echoed
+// back: Graph returns it on create so the subscriber can confirm what was stored.
+func toWire(sub Subscription) subscriptionWire {
+	return subscriptionWire{
+		ID:                 sub.ID,
+		ChangeType:         string(sub.ChangeType),
+		NotificationURL:    sub.NotificationURL,
+		Resource:           sub.Resource,
+		ExpirationDateTime: sub.ExpirationDateTime.UTC().Format(time.RFC3339),
+		ClientState:        sub.ClientState,
+	}
+}
+
+// listEnvelope wraps a subscription list as Graph's {"value":[...]} collection.
+type listEnvelope struct {
+	Value []subscriptionWire `json:"value"`
+}
+
+// ServeHTTP routes by method and path. The handler is mount-agnostic: it locates
+// its own "subscriptions" path segment (wherever the caller mounts it, e.g.
+// "/v1.0/subscriptions") and treats any single segment after it as the
+// subscription id. POST and GET target the collection (no id); DELETE targets a
+// single id below it.
+func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	id := subscriptionID(r.URL.Path)
+
+	switch r.Method {
+	case http.MethodPost:
+		if id != "" {
+			writeError(w, http.StatusNotFound, "notFound", "The requested resource does not exist.")
+			return
+		}
+		h.create(w, r)
+	case http.MethodGet:
+		if id != "" {
+			writeError(w, http.StatusNotFound, "notFound", "The requested resource does not exist.")
+			return
+		}
+		h.list(w)
+	case http.MethodDelete:
+		if id == "" {
+			writeError(w, http.StatusNotFound, "notFound", "A subscription id is required.")
+			return
+		}
+		h.delete(w, id)
+	default:
+		writeError(w, http.StatusMethodNotAllowed, "methodNotAllowed", "The HTTP method is not allowed.")
+	}
+}
+
+// subscriptionID extracts the subscription id from a request path, independent
+// of where the handler is mounted. It finds the last "subscriptions" path
+// segment and returns the single segment after it (empty for the collection
+// endpoint, the id for an item endpoint). A path with more than one segment after
+// "subscriptions" yields an empty id, which the item routes reject as not-found.
+func subscriptionID(path string) string {
+	segments := strings.Split(strings.Trim(path, "/"), "/")
+	for i := len(segments) - 1; i >= 0; i-- {
+		if segments[i] == "subscriptions" {
+			rest := segments[i+1:]
+			if len(rest) == 1 {
+				return rest[0]
+			}
+			return ""
+		}
+	}
+	// No "subscriptions" segment found (unconventional mount): fall back to the
+	// final non-empty segment so a bare "/{id}" mount still resolves an id.
+	if n := len(segments); n > 0 && segments[n-1] != "" {
+		return segments[n-1]
+	}
+	return ""
+}
+
+// create handles POST {base}: decode, validate, run the notificationUrl
+// handshake, persist, and respond 201 with the stored subscription.
+func (h *Handler) create(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, maxSubscriptionBody)
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+
+	var wire subscriptionWire
+	if err := dec.Decode(&wire); err != nil {
+		writeError(w, http.StatusBadRequest, "invalidRequest", "The subscription request body is not valid JSON.")
+		return
+	}
+
+	sub := Subscription{
+		Resource:        wire.Resource,
+		ChangeType:      ChangeType(wire.ChangeType),
+		NotificationURL: wire.NotificationURL,
+		ClientState:     wire.ClientState,
+	}
+	if wire.ExpirationDateTime != "" {
+		exp, err := time.Parse(time.RFC3339, wire.ExpirationDateTime)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalidRequest",
+				"expirationDateTime must be an RFC3339 date-time.")
+			return
+		}
+		sub.ExpirationDateTime = exp
+	}
+
+	now := h.now()
+	if err := Validate(sub, now, h.maxTTL, h.allowedResources); err != nil {
+		writeError(w, http.StatusBadRequest, validationCode(err), err.Error())
+		return
+	}
+
+	// Prove the client owns the notificationUrl before storing anything: it must
+	// echo the validationToken we POST it.
+	if err := VerifyNotificationURL(r.Context(), h.client, sub.NotificationURL); err != nil {
+		writeError(w, http.StatusBadRequest, "invalidRequest",
+			"The notificationUrl did not pass the validation handshake.")
+		return
+	}
+
+	stored, err := h.store.Create(sub)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "generalException",
+			"The subscription could not be stored.")
+		return
+	}
+
+	writeJSON(w, http.StatusCreated, toWire(stored))
+}
+
+// list handles GET {base}: render every stored subscription as {"value":[...]}.
+func (h *Handler) list(w http.ResponseWriter) {
+	subs := h.store.List()
+	out := listEnvelope{Value: make([]subscriptionWire, 0, len(subs))}
+	for _, sub := range subs {
+		out.Value = append(out.Value, toWire(sub))
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+// delete handles DELETE {base}/{id}: 204 on success, 404 when absent.
+func (h *Handler) delete(w http.ResponseWriter, id string) {
+	if err := h.store.Delete(id); err != nil {
+		if errors.Is(err, ErrNotFound) {
+			writeError(w, http.StatusNotFound, "notFound", "The requested subscription does not exist.")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "generalException",
+			"The subscription could not be deleted.")
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// validationCode maps a [Validate] sentinel error to the Graph error "code" a
+// 400 should carry. Every sentinel is a malformed-request variant, so the codes
+// stay in the invalidRequest/badRequest family while naming the specific fault.
+func validationCode(err error) string {
+	switch {
+	case errors.Is(err, ErrNotificationURLRequired),
+		errors.Is(err, ErrNotificationURLNotHTTPS):
+		return "invalidRequest"
+	case errors.Is(err, ErrInvalidChangeType):
+		return "invalidRequest"
+	case errors.Is(err, ErrUnsupportedResource):
+		return "invalidRequest"
+	case errors.Is(err, ErrExpirationInPast),
+		errors.Is(err, ErrExpirationTooFar):
+		return "invalidRequest"
+	default:
+		return "badRequest"
+	}
+}
+
+// writeJSON renders v as a JSON response with the given status.
+func writeJSON(w http.ResponseWriter, status int, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(v)
+}
+
+// writeError renders the Graph error-object shape ({"error":{"code","message"}}),
+// matching the wire format produced by [internal/grapherr] and [internal/batch].
+func writeError(w http.ResponseWriter, status int, code, message string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(map[string]map[string]string{
+		"error": {
+			"code":    code,
+			"message": message,
+		},
+	})
+}
