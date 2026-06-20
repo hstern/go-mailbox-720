@@ -37,6 +37,7 @@ import (
 	"github.com/hstern/go-mailbox-720/internal/notify"
 	"github.com/hstern/go-mailbox-720/internal/schedrun"
 	"github.com/hstern/go-mailbox-720/internal/server"
+	"github.com/hstern/go-mailbox-720/internal/smtp"
 	"github.com/hstern/go-mailbox-720/internal/subscriptions"
 )
 
@@ -55,6 +56,11 @@ func main() {
 	carddavURL := flag.String("contacts-carddav-url", "", "CardDAV base URL for the contacts backend (empty: contacts operations return 501; password from MAILBOXD_CARDDAV_PASSWORD). Use an https:// URL for TLS")
 	carddavUser := flag.String("contacts-carddav-username", "", "CardDAV username for the contacts backend")
 	enableScheduling := flag.Bool("enable-scheduling", false, "run the iTIP scheduling trigger: turn inbound mail invitations into tentative calendar events (needs IMAP + CalDAV backends; opt-in, since it writes to the calendar and the RFC 6638 capability switch is not yet implemented)")
+	smtpAddr := flag.String("smtp-addr", "", "SMTP submission server host:port for emailing meeting accept/decline replies (empty: those operations return 501; password from MAILBOXD_SMTP_PASSWORD)")
+	smtpUser := flag.String("smtp-username", "", "SMTP username")
+	smtpTLS := flag.Bool("smtp-tls", false, "use implicit TLS (SMTPS, port 465) for SMTP")
+	smtpStartTLS := flag.Bool("smtp-starttls", true, "use STARTTLS (submission, port 587) for SMTP; ignored when -smtp-tls is set")
+	mailboxEmail := flag.String("mailbox-email", "", "the mailbox owner's email, used as the responding attendee when accepting/declining meetings")
 	flag.Parse()
 
 	cfg := auth.Config{
@@ -96,7 +102,18 @@ func main() {
 			password: os.Getenv("MAILBOXD_CARDDAV_PASSWORD"),
 		}
 	}
-	if err := run(*addr, cfg, provider, calProvider, contactsProvider, *enableScheduling); err != nil {
+	var schedProvider server.SchedulingProvider
+	if *smtpAddr != "" {
+		schedProvider = staticSchedulingProvider{
+			addr:     *smtpAddr,
+			username: *smtpUser,
+			password: os.Getenv("MAILBOXD_SMTP_PASSWORD"),
+			tls:      *smtpTLS,
+			startTLS: *smtpStartTLS,
+			mailbox:  *mailboxEmail,
+		}
+	}
+	if err := run(*addr, cfg, provider, calProvider, contactsProvider, schedProvider, *enableScheduling); err != nil {
 		log.Fatalln("mailboxd:", err)
 	}
 }
@@ -135,8 +152,22 @@ func (p staticCardDAVProvider) Contacts(_ context.Context) (contacts.Backend, er
 	return carddav.Dial(p.url, p.username, p.password, nil)
 }
 
-func run(addr string, authCfg auth.Config, provider server.MailProvider, calProvider server.CalendarProvider, contactsProvider server.ContactsProvider, enableScheduling bool) error {
-	h, err := server.New(provider, calProvider, contactsProvider)
+// staticSchedulingProvider answers meeting accept/decline by emailing the
+// organizer from one configured SMTP account and mailbox address. A per-identity
+// provider (mapping the token's identity to credentials) is future work.
+type staticSchedulingProvider struct {
+	addr, username, password, mailbox string
+	tls, startTLS                     bool
+}
+
+func (p staticSchedulingProvider) Sender(_ context.Context) (smtp.Sender, error) {
+	return smtp.Dial(p.addr, p.username, p.password, &smtp.Options{TLS: p.tls, StartTLS: p.startTLS})
+}
+
+func (p staticSchedulingProvider) MailboxAddress() string { return p.mailbox }
+
+func run(addr string, authCfg auth.Config, provider server.MailProvider, calProvider server.CalendarProvider, contactsProvider server.ContactsProvider, schedProvider server.SchedulingProvider, enableScheduling bool) error {
+	h, err := server.New(provider, calProvider, contactsProvider, schedProvider)
 	if err != nil {
 		return err
 	}

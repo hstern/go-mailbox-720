@@ -28,16 +28,19 @@ const basePath = "/v1.0"
 // Operations that need a backend return 501 when no provider is configured.
 type Handler struct {
 	api.UnimplementedHandler
-	mail     MailProvider
-	calendar CalendarProvider
-	contacts ContactsProvider
+	mail       MailProvider
+	calendar   CalendarProvider
+	contacts   ContactsProvider
+	scheduling SchedulingProvider
 }
 
 // New builds the mailbox server's HTTP handler (an *api.Server, which is an
-// http.Handler). mailProvider, calendarProvider, and contactsProvider may each
-// be nil, in which case the corresponding operations report "not implemented".
-func New(mailProvider MailProvider, calendarProvider CalendarProvider, contactsProvider ContactsProvider) (*api.Server, error) {
-	return api.NewServer(Handler{mail: mailProvider, calendar: calendarProvider, contacts: contactsProvider},
+// http.Handler). Each provider may be nil, in which case the corresponding
+// operations report "not implemented": mailProvider for mail, calendarProvider
+// for calendar, contactsProvider for contacts, and schedulingProvider for the
+// meeting accept/decline replies.
+func New(mailProvider MailProvider, calendarProvider CalendarProvider, contactsProvider ContactsProvider, schedulingProvider SchedulingProvider) (*api.Server, error) {
+	return api.NewServer(Handler{mail: mailProvider, calendar: calendarProvider, contacts: contactsProvider, scheduling: schedulingProvider},
 		api.WithPathPrefix(basePath),
 		api.WithErrorHandler(graphErrorHandler),
 		api.WithNotFound(graphNotFoundHandler),
