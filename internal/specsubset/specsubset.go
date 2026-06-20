@@ -102,6 +102,12 @@ func Subset(full []byte, cfg Config) (*Result, error) {
 		}
 	}
 
+	// Surface the delta continuation tokens. Microsoft's spec models the delta()
+	// function without $deltatoken/$skiptoken — they live in the opaque
+	// @odata.deltaLink/@odata.nextLink URLs the client echoes back — so ogen would
+	// not give the handler a way to read them. Add them as inline query params.
+	injectDeltaTokenParams(kept)
+
 	// Prune the kept path items before computing the closure.
 	for _, pi := range kept {
 		stripXMS(pi)
@@ -197,6 +203,37 @@ func Subset(full []byte, cfg Config) (*Result, error) {
 
 // stripXMS flattens nullable-anyOf, removes x-ms-* keys, drops navigation
 // properties, and removes discriminator blocks, mutating node in place.
+// injectDeltaTokenParams adds the $deltatoken and $skiptoken query parameters to
+// the GET operation of any kept path whose key ends in "delta()". They are added
+// as inline string params (no $ref), so they pull in no extra components and ride
+// along in the kept path item. ogen surfaces them on the params struct (as
+// Deltatoken/Skiptoken) so the handler can read the opaque continuation token a
+// client echoes back from a prior @odata.deltaLink/@odata.nextLink.
+func injectDeltaTokenParams(kept map[string]any) {
+	for path, pi := range kept {
+		if !strings.HasSuffix(path, "delta()") {
+			continue
+		}
+		item, ok := pi.(map[string]any)
+		if !ok {
+			continue
+		}
+		op, ok := item["get"].(map[string]any)
+		if !ok {
+			continue
+		}
+		params, _ := op["parameters"].([]any)
+		for _, name := range []string{"$deltatoken", "$skiptoken"} {
+			params = append(params, map[string]any{
+				"name":   name,
+				"in":     "query",
+				"schema": map[string]any{"type": "string"},
+			})
+		}
+		op["parameters"] = params
+	}
+}
+
 func stripXMS(node any) {
 	switch n := node.(type) {
 	case map[string]any:

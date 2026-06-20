@@ -341,3 +341,32 @@ func TestSubsetDropsTargetMidClosure(t *testing.T) {
 		}
 	}
 }
+
+// TestInjectDeltaTokenParams checks that the delta continuation-token params are
+// added to a delta() operation and that non-delta paths are left untouched.
+func TestInjectDeltaTokenParams(t *testing.T) {
+	kept := map[string]any{
+		"/me/messages/delta()": map[string]any{
+			"get": map[string]any{
+				"parameters": []any{map[string]any{"name": "$top", "in": "query"}},
+			},
+		},
+		"/me/messages": map[string]any{
+			"get": map[string]any{"parameters": []any{}},
+		},
+	}
+	injectDeltaTokenParams(kept)
+
+	got := map[string]bool{}
+	for _, p := range kept["/me/messages/delta()"].(map[string]any)["get"].(map[string]any)["parameters"].([]any) {
+		got[p.(map[string]any)["name"].(string)] = true
+	}
+	for _, want := range []string{"$top", "$deltatoken", "$skiptoken"} {
+		if !got[want] {
+			t.Errorf("delta op missing param %q; got %v", want, got)
+		}
+	}
+	if plain := kept["/me/messages"].(map[string]any)["get"].(map[string]any)["parameters"].([]any); len(plain) != 0 {
+		t.Errorf("non-delta path params modified: %v", plain)
+	}
+}

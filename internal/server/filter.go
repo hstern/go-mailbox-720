@@ -49,3 +49,18 @@ func badRequest(message string) *api.ErrorStatusCode {
 		},
 	}
 }
+
+// resyncRequired builds the Graph 410 (Gone) a delta sync returns when the
+// client's continuation token is no longer valid: the client drops the token and
+// restarts with an initial sync. Delta libraries key their recovery off this.
+func resyncRequired() *api.ErrorStatusCode {
+	return &api.ErrorStatusCode{
+		StatusCode: http.StatusGone,
+		Response: api.MicrosoftGraphODataErrorsODataError{
+			Error: api.MicrosoftGraphODataErrorsMainError{
+				Code:    "resyncRequired",
+				Message: "The delta token is invalid or expired; restart with an initial sync.",
+			},
+		},
+	}
+}

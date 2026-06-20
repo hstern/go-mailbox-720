@@ -481,6 +481,109 @@ func TestListMessagesFilterPaging(t *testing.T) {
 	}
 }
 
+// appendRaw appends raw to the given mailbox over the existing Client session,
+// so a Delta call after it observes a genuinely new arrival.
+func (cl *Client) appendRaw(t *testing.T, mailbox, raw string) {
+	t.Helper()
+	ac := cl.c.Append(mailbox, int64(len(raw)), &goimap.AppendOptions{})
+	if _, err := ac.Write([]byte(raw)); err != nil {
+		t.Fatalf("append write: %v", err)
+	}
+	if err := ac.Close(); err != nil {
+		t.Fatalf("append close: %v", err)
+	}
+	if _, err := ac.Wait(); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+}
+
+func TestDelta(t *testing.T) {
+	cl := dialTest(t)
+	ctx := context.Background()
+	fid := folderID("INBOX")
+
+	// Initial sync: empty token returns the seeded message and a fresh,
+	// non-empty token capturing the sync state.
+	first, tok, err := cl.Delta(ctx, fid, "")
+	if err != nil {
+		t.Fatalf("Delta (initial): %v", err)
+	}
+	if len(first) != 1 {
+		t.Fatalf("initial Delta: got %d messages, want 1", len(first))
+	}
+	if first[0].Subject != "Hello there" {
+		t.Errorf("initial Delta subject = %q, want %q", first[0].Subject, "Hello there")
+	}
+	if tok == "" {
+		t.Fatal("initial Delta returned an empty token")
+	}
+
+	// A new message arrives.
+	newRaw := "From: Carol <carol@example.com>\r\n" +
+		"To: Bob <bob@example.com>\r\n" +
+		"Subject: Second message\r\n" +
+		"Date: Thu, 12 Jun 2025 12:00:00 +0000\r\n" +
+		"Content-Type: text/plain; charset=utf-8\r\n" +
+		"\r\n" +
+		"A new arrival.\r\n"
+	cl.appendRaw(t, "INBOX", newRaw)
+
+	// Delta by the prior token returns ONLY the new message and an advanced token.
+	second, tok2, err := cl.Delta(ctx, fid, tok)
+	if err != nil {
+		t.Fatalf("Delta (incremental): %v", err)
+	}
+	if len(second) != 1 {
+		t.Fatalf("incremental Delta: got %d messages, want 1 (only the new one)", len(second))
+	}
+	if second[0].Subject != "Second message" {
+		t.Errorf("incremental Delta subject = %q, want %q", second[0].Subject, "Second message")
+	}
+	if tok2 == "" || tok2 == tok {
+		t.Errorf("incremental Delta token = %q, want a non-empty advanced token (was %q)", tok2, tok)
+	}
+
+	// A further Delta with the latest token reports nothing, with a stable token.
+	third, tok3, err := cl.Delta(ctx, fid, tok2)
+	if err != nil {
+		t.Fatalf("Delta (no change): %v", err)
+	}
+	if len(third) != 0 {
+		t.Errorf("no-change Delta: got %d messages, want 0", len(third))
+	}
+	if tok3 != tok2 {
+		t.Errorf("no-change Delta token = %q, want it unchanged (%q)", tok3, tok2)
+	}
+}
+
+func TestDeltaMalformedToken(t *testing.T) {
+	cl := dialTest(t)
+	if _, _, err := cl.Delta(context.Background(), folderID("INBOX"), "!!!not base64!!!"); err == nil {
+		t.Error("Delta with a malformed token = nil error, want error")
+	}
+}
+
+func TestDeltaUIDValidityReset(t *testing.T) {
+	cl := dialTest(t)
+	ctx := context.Background()
+	fid := folderID("INBOX")
+
+	// A token claiming a UIDVALIDITY that does not match the folder means the
+	// folder was recreated: Delta must full-resync, returning all current
+	// messages rather than treating the high-water mark as valid.
+	stale := encodeDeltaToken(999999, 5)
+	msgs, tok, err := cl.Delta(ctx, fid, stale)
+	if err != nil {
+		t.Fatalf("Delta (uidvalidity reset): %v", err)
+	}
+	if len(msgs) != 1 {
+		t.Fatalf("uidvalidity-reset Delta: got %d messages, want 1 (full resync)", len(msgs))
+	}
+	if tok == "" || tok == stale {
+		t.Errorf("uidvalidity-reset Delta token = %q, want a fresh token", tok)
+	}
+}
+
 func equalStrings(a, b []string) bool {
 	if len(a) != len(b) {
 		return false

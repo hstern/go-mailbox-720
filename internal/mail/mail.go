@@ -11,10 +11,17 @@ package mail
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/hstern/go-mailbox-720/internal/odata"
 )
+
+// ErrInvalidDeltaToken marks a delta continuation token that cannot be decoded
+// (malformed, or from an incompatible encoding). A DeltaReader wraps it so the
+// HTTP layer can map an invalid client-supplied token to a resync response
+// rather than a server error.
+var ErrInvalidDeltaToken = errors.New("mail: invalid delta token")
 
 // Address is a parsed mailbox address (display name + addr-spec).
 type Address struct {
@@ -106,4 +113,29 @@ type Writer interface {
 	// DeleteMessage removes the message with the given opaque id, the backing for
 	// Graph's DELETE.
 	DeleteMessage(ctx context.Context, id string) error
+}
+
+// DeltaReader is the optional incremental-sync capability: report the messages
+// that have changed in a folder since a prior point, identified by an opaque
+// token. It is kept separate from Backend (like Writer) so that an adapter
+// without delta support, and the server's read-path fakes, need not implement
+// it, and so adding it does not disturb Backend's existing implementers. An
+// adapter that supports delta implements DeltaReader in addition to Backend;
+// consumers type-assert for it:
+//
+//	if d, ok := backend.(mail.DeltaReader); ok {
+//		msgs, next, err := d.Delta(ctx, folderID, token)
+//	}
+//
+// This is the backing for Microsoft Graph's GET /me/messages/delta. A
+// DeltaReader is bound to the same authenticated mailbox identity as its
+// Backend.
+type DeltaReader interface {
+	// Delta returns the messages in folderID that are new since the opaque
+	// token. An empty token means initial sync: return the current messages
+	// and a fresh token capturing the sync state. The returned next token is
+	// fed back on the following call. This first cut is ADDITIVE — it reports
+	// newly-arrived messages (by UID); reporting deletions/flag changes needs
+	// IMAP CONDSTORE/QRESYNC and is future work (note this in the doc).
+	Delta(ctx context.Context, folderID string, token string) (msgs []Message, next string, err error)
 }

@@ -137,6 +137,64 @@ func TestDovecotIntegration(t *testing.T) {
 	}
 }
 
+func TestDovecotDelta(t *testing.T) {
+	if _, err := exec.LookPath("docker"); err != nil {
+		t.Skip("docker not available")
+	}
+	addr := startDovecot(t)
+	appendToINBOX(t, addr, testRawMessage)
+
+	cl, err := Dial(addr, dovecotUser, dovecotPass, &Options{TLS: false})
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	defer func() { _ = cl.Close() }()
+	ctx := context.Background()
+	fid := folderID("INBOX")
+
+	// Initial delta: the seeded message plus a fresh token.
+	first, tok, err := cl.Delta(ctx, fid, "")
+	if err != nil {
+		t.Fatalf("Delta (initial): %v", err)
+	}
+	if len(first) != 1 || first[0].Subject != "Hello there" {
+		t.Fatalf("initial Delta: got %d messages (subj %q), want 1 'Hello there'",
+			len(first), subjectOrEmpty(first))
+	}
+	if tok == "" {
+		t.Fatal("initial Delta returned an empty token")
+	}
+
+	// A new message arrives, then delta-by-token returns just it.
+	newRaw := "From: Carol <carol@example.com>\r\n" +
+		"To: Bob <bob@example.com>\r\n" +
+		"Subject: Second message\r\n" +
+		"Date: Thu, 12 Jun 2025 12:00:00 +0000\r\n" +
+		"Content-Type: text/plain; charset=utf-8\r\n" +
+		"\r\n" +
+		"A new arrival.\r\n"
+	appendToINBOX(t, addr, newRaw)
+
+	second, tok2, err := cl.Delta(ctx, fid, tok)
+	if err != nil {
+		t.Fatalf("Delta (incremental): %v", err)
+	}
+	if len(second) != 1 || second[0].Subject != "Second message" {
+		t.Fatalf("incremental Delta: got %d messages (subj %q), want 1 'Second message'",
+			len(second), subjectOrEmpty(second))
+	}
+	if tok2 == "" || tok2 == tok {
+		t.Errorf("incremental Delta token = %q, want an advanced token (was %q)", tok2, tok)
+	}
+}
+
+func subjectOrEmpty(msgs []mail.Message) string {
+	if len(msgs) == 0 {
+		return ""
+	}
+	return msgs[0].Subject
+}
+
 func hasFolder(folders []mail.MailFolder, name string) bool {
 	for _, f := range folders {
 		if f.DisplayName == name {
