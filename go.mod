@@ -49,4 +49,6 @@ require (
 	gopkg.in/yaml.v2 v2.4.0 // indirect
 )
 
+// Fork adds QRESYNC VANISHED client support (the mail delta uses it for deletion
+// tombstones); drop this once upstream PR emersion/go-imap#757 merges and ships.
 replace github.com/emersion/go-imap/v2 => github.com/hstern/go-imap/v2 v2.0.0-beta.8.0.20260620025710-a2d23bc67297
