@@ -77,28 +77,8 @@ func (h Handler) MeCreateEvents(ctx context.Context, req *api.MicrosoftGraphEven
 // recorded as SCHEDULE-STATUS=5.1 on the attendees (the protocol's delivery-status
 // channel, read back via CalDAV) — never silently swallowed.
 func (h Handler) inviteAttendees(ctx context.Context, b calendar.Backend, w calendar.Writer, event calendar.Event) calendar.Event {
-	if h.scheduling == nil {
-		return event
-	}
-	organizer := h.scheduling.MailboxAddress()
-	if organizer == "" {
-		return event
-	}
-	isRecipient := func(a calendar.Attendee) bool {
-		return a.Email != "" && !strings.EqualFold(a.Email, organizer)
-	}
-	hasRecipient := false
-	for _, a := range event.Attendees {
-		if isRecipient(a) {
-			hasRecipient = true
-			break
-		}
-	}
-	if !hasRecipient {
-		return event
-	}
-	// Capability switch: an RFC 6638 server schedules on our behalf.
-	if native, _ := serverSchedulesEvents(ctx, b); native {
+	organizer, send := h.shouldSelfSchedule(ctx, b, event)
+	if !send {
 		return event
 	}
 
@@ -111,7 +91,7 @@ func (h Handler) inviteAttendees(ctx context.Context, b calendar.Backend, w cale
 		event.Organizer = calendar.Address{Email: organizer}
 	}
 	for i := range event.Attendees {
-		if isRecipient(event.Attendees[i]) {
+		if isSchedulingRecipient(event.Attendees[i], organizer) {
 			event.Attendees[i].ScheduleStatus = string(status)
 		}
 	}
@@ -129,19 +109,8 @@ func (h Handler) inviteAttendees(ctx context.Context, b calendar.Backend, w cale
 // Graph/Exchange the create succeeds regardless of invitation delivery.
 func (h Handler) sendRequest(ctx context.Context, organizer string, event calendar.Event) scheduling.ScheduleStatus {
 	inv := itip.InviteFromEvent(event)
-	// Force the organizer to the configured mailbox, but keep the display name the
-	// client supplied when they already named themselves as organizer (CN is lost
-	// only when we have to synthesize the organizer, where no name is available).
-	if !strings.EqualFold(inv.Organizer.Email, organizer) {
-		inv.Organizer = scheduling.Address{Email: organizer}
-	}
-	recipients := make([]scheduling.Attendee, 0, len(inv.Attendees))
-	for _, a := range inv.Attendees {
-		if a.Email != "" && !strings.EqualFold(a.Email, organizer) {
-			recipients = append(recipients, a)
-		}
-	}
-	inv.Attendees = recipients
+	inv.Organizer = organizerFor(inv.Organizer, organizer)
+	inv.Attendees = schedulingRecipients(inv.Attendees, organizer)
 
 	sender, err := h.scheduling.Sender(ctx)
 	if err != nil {
@@ -155,6 +124,95 @@ func (h Handler) sendRequest(ctx context.Context, organizer string, event calend
 		return scheduling.SchedStatusNoDelivery
 	}
 	return scheduling.SchedStatusSent
+}
+
+// cancelInvitations is the organizer-side withdrawal: when an event with attendees
+// is deleted on the dumb-backend tier, it emails them a METHOD:CANCEL iMIP message
+// so their calendars drop the meeting. Like inviteAttendees it no-ops unless we are
+// the scheduler (same capability switch); unlike it there is nothing to persist —
+// the event is already gone — so a send failure is only logged, never swallowed
+// into a misleading success or surfaced as an HTTP error (the delete stands).
+func (h Handler) cancelInvitations(ctx context.Context, b calendar.Backend, event calendar.Event) {
+	organizer, send := h.shouldSelfSchedule(ctx, b, event)
+	if !send {
+		return
+	}
+
+	// itip.Cancel emits METHOD:CANCEL regardless of inv.Method (scheduling.Cancel
+	// sets it), so InviteFromEvent's REQUEST method is harmless and left as-is.
+	inv := itip.InviteFromEvent(event)
+	inv.Organizer = organizerFor(inv.Organizer, organizer)
+	inv.Attendees = schedulingRecipients(inv.Attendees, organizer)
+
+	sender, err := h.scheduling.Sender(ctx)
+	if err != nil {
+		log.Printf("calendar: iMIP CANCEL for event %s: smtp sender: %v", event.ID, err)
+		return
+	}
+	defer func() { _ = sender.Close() }()
+
+	if err := itip.Cancel(ctx, sender, inv.Organizer, inv, time.Now()); err != nil {
+		log.Printf("calendar: iMIP CANCEL send failed for event %s: %v", event.ID, err)
+	}
+}
+
+// shouldSelfSchedule decides whether the server must send iMIP scheduling messages
+// for event itself. It is true only with a scheduling provider, a known mailbox
+// address, at least one attendee other than the organizer, and a backend that does
+// NOT schedule natively (RFC 6638) — a native server does it itself, so we must not
+// double-drive. organizer is the resolved mailbox address ("" when unavailable).
+func (h Handler) shouldSelfSchedule(ctx context.Context, b calendar.Backend, event calendar.Event) (organizer string, send bool) {
+	if h.scheduling == nil {
+		return "", false
+	}
+	organizer = h.scheduling.MailboxAddress()
+	if organizer == "" {
+		return "", false
+	}
+	hasRecipient := false
+	for _, a := range event.Attendees {
+		if isSchedulingRecipient(a, organizer) {
+			hasRecipient = true
+			break
+		}
+	}
+	if !hasRecipient {
+		return organizer, false
+	}
+	if native, _ := serverSchedulesEvents(ctx, b); native {
+		return organizer, false
+	}
+	return organizer, true
+}
+
+// isSchedulingRecipient reports whether an attendee should receive a scheduling
+// message: a real address that is not the organizer's own.
+func isSchedulingRecipient(a calendar.Attendee, organizer string) bool {
+	return a.Email != "" && !strings.EqualFold(a.Email, organizer)
+}
+
+// schedulingRecipients keeps the attendees a scheduling message should go to (real
+// addresses other than the organizer), dropping the organizer so we never mail them
+// their own invitation or cancellation.
+func schedulingRecipients(attendees []scheduling.Attendee, organizer string) []scheduling.Attendee {
+	out := make([]scheduling.Attendee, 0, len(attendees))
+	for _, a := range attendees {
+		if a.Email != "" && !strings.EqualFold(a.Email, organizer) {
+			out = append(out, a)
+		}
+	}
+	return out
+}
+
+// organizerFor forces the scheduling organizer to the configured mailbox, keeping
+// the display name the client supplied when they already named themselves as
+// organizer (the CN is lost only when we synthesize the organizer, where no name
+// is available).
+func organizerFor(eventOrganizer scheduling.Address, mailbox string) scheduling.Address {
+	if strings.EqualFold(eventOrganizer.Email, mailbox) {
+		return eventOrganizer
+	}
+	return scheduling.Address{Email: mailbox}
 }
 
 // MeUpdateEvents implements PATCH /me/events/{event-id}. PATCH is a partial
@@ -211,8 +269,17 @@ func (h Handler) MeDeleteEvents(ctx context.Context, params api.MeDeleteEventsPa
 		return nil, ht.ErrNotImplemented
 	}
 
+	// Read the event before deleting so its attendees can be sent a CANCEL. A read
+	// failure is tolerated: the delete still proceeds, just without notification.
+	event, getErr := b.GetEvent(ctx, params.EventID)
+
 	if err := w.DeleteEvent(ctx, params.EventID); err != nil {
 		return nil, fmt.Errorf("delete event: %w", err)
+	}
+	// Organizer side of the iTIP engine: withdraw the meeting from the attendees'
+	// calendars. Best-effort — the delete has already succeeded.
+	if getErr == nil {
+		h.cancelInvitations(ctx, b, event)
 	}
 	return &api.MeDeleteEventsNoContent{}, nil
 }

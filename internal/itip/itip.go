@@ -291,6 +291,49 @@ func Invite(ctx context.Context, sender smtp.Sender, organizer scheduling.Addres
 	return nil
 }
 
+// Cancel is the organizer-side withdrawal: it builds a METHOD:CANCEL iMIP message
+// for the given invite (via [scheduling.Cancel] + [scheduling.Compose]) and submits
+// it to every attendee through the [smtp.Sender], from the organizer's address.
+//
+// It is the counterpart of [Invite] for a deleted event: where Invite mails the
+// REQUEST, Cancel withdraws it (STATUS:CANCELLED, a bumped SEQUENCE). date is passed
+// in for deterministic output. It returns an error if inv is nil, the CANCEL cannot
+// be built (no UID/organizer), it cannot be composed, or the send fails.
+func Cancel(ctx context.Context, sender smtp.Sender, organizer scheduling.Address, inv *scheduling.Invite, date time.Time) error {
+	if inv == nil {
+		return fmt.Errorf("itip: cancel: nil invite")
+	}
+
+	ics, err := scheduling.Cancel(*inv)
+	if err != nil {
+		return fmt.Errorf("itip: build cancel: %w", err)
+	}
+
+	to := make([]scheduling.Address, 0, len(inv.Attendees))
+	rcpt := make([]string, 0, len(inv.Attendees))
+	for _, a := range inv.Attendees {
+		if a.Email == "" {
+			continue
+		}
+		to = append(to, a.Address)
+		rcpt = append(rcpt, a.Email)
+	}
+	if len(rcpt) == 0 {
+		return fmt.Errorf("itip: cancel: no attendee addresses to send to")
+	}
+
+	subject := "Cancelled: " + inv.Summary
+	msg, err := scheduling.Compose(organizer, to, subject, scheduling.MethodCancel, ics, date)
+	if err != nil {
+		return fmt.Errorf("itip: compose cancel: %w", err)
+	}
+
+	if err := sender.Send(ctx, organizer.Email, rcpt, msg); err != nil {
+		return fmt.Errorf("itip: send cancel: %w", err)
+	}
+	return nil
+}
+
 // toCalendarAddress maps a scheduling.Address onto the calendar port's Address.
 // The two types are structurally identical (display name + email) but live in
 // separate packages, so the bridge is explicit.

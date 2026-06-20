@@ -557,3 +557,50 @@ func rawMessage(ics string) []byte {
 		ics +
 		"\r\n--" + boundary + "--\r\n")
 }
+
+func TestCancel(t *testing.T) {
+	inv := &scheduling.Invite{
+		UID:       "old-1@example.com",
+		Summary:   "Kickoff",
+		Start:     time.Date(2026, 7, 1, 14, 0, 0, 0, time.UTC),
+		Sequence:  0,
+		Organizer: scheduling.Address{Name: "Olivia", Email: "olivia@example.com"},
+		Attendees: []scheduling.Attendee{
+			{Address: scheduling.Address{Email: "andy@example.com"}},
+			{Address: scheduling.Address{Email: "bea@example.com"}},
+		},
+	}
+	organizer := scheduling.Address{Name: "Olivia", Email: "olivia@example.com"}
+
+	s := &fakeSender{}
+	if err := Cancel(context.Background(), s, organizer, inv, fixedDate); err != nil {
+		t.Fatalf("Cancel: %v", err)
+	}
+	if s.sendCalls != 1 {
+		t.Fatalf("Send calls = %d, want 1", s.sendCalls)
+	}
+	if s.gotFrom != "olivia@example.com" {
+		t.Errorf("from = %q, want olivia@example.com", s.gotFrom)
+	}
+	if len(s.gotTo) != 2 || s.gotTo[0] != "andy@example.com" || s.gotTo[1] != "bea@example.com" {
+		t.Errorf("to = %v, want [andy bea]", s.gotTo)
+	}
+
+	cancel, err := scheduling.Parse(s.gotRaw)
+	if err != nil {
+		t.Fatalf("parse sent cancel: %v", err)
+	}
+	if cancel.Method != scheduling.MethodCancel {
+		t.Errorf("sent method = %q, want CANCEL", cancel.Method)
+	}
+	if cancel.UID != "old-1@example.com" {
+		t.Errorf("sent UID = %q, want old-1@example.com", cancel.UID)
+	}
+}
+
+func TestCancelNil(t *testing.T) {
+	s := &fakeSender{}
+	if err := Cancel(context.Background(), s, scheduling.Address{Email: "olivia@example.com"}, nil, fixedDate); err == nil {
+		t.Fatal("Cancel(nil): want error, got nil")
+	}
+}
