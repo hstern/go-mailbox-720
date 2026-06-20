@@ -360,6 +360,27 @@ func TestRadicaleDelta(t *testing.T) {
 	if findSubject(changed, eventSummary) != nil {
 		t.Errorf("incremental Delta unexpectedly re-reported unchanged event %q: %+v", eventSummary, changed)
 	}
+
+	// Delete the new event; the next delta reports its opaque id as removed (a
+	// tombstone), and that id matches the one the changed sync gave it.
+	gone := findSubject(changed, deltaSubject)
+	if err := w.DeleteEvent(ctx, gone.ID); err != nil {
+		t.Fatalf("DeleteEvent: %v", err)
+	}
+	_, removed, _, err := d.Delta(ctx, work.ID, next)
+	if err != nil {
+		t.Fatalf("post-delete Delta: %v", err)
+	}
+	var sawTombstone bool
+	for _, id := range removed {
+		if id == gone.ID {
+			sawTombstone = true
+			break
+		}
+	}
+	if !sawTombstone {
+		t.Errorf("post-delete Delta did not report removed id %q: %+v", gone.ID, removed)
+	}
 }
 
 // findSubject returns the first event with the given subject, or nil.
