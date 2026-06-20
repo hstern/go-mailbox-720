@@ -87,15 +87,21 @@ func newIDP(t *testing.T) *idp {
 	return i
 }
 
+// sign mints a plain (typ=JWT) bearer token; signAT mints an RFC 9068 access token
+// (typ=at+jwt), which the middleware holds to the full profile.
 func (i *idp) sign(t *testing.T, claims map[string]any) string {
-	return signWith(t, i.key, testKID, claims)
+	return signWith(t, i.key, testKID, "JWT", claims)
 }
 
-func signWith(t *testing.T, key *rsa.PrivateKey, kid string, claims map[string]any) string {
+func (i *idp) signAT(t *testing.T, claims map[string]any) string {
+	return signWith(t, i.key, testKID, "at+jwt", claims)
+}
+
+func signWith(t *testing.T, key *rsa.PrivateKey, kid, typ string, claims map[string]any) string {
 	t.Helper()
 	signer, err := jose.NewSigner(
 		jose.SigningKey{Algorithm: jose.RS256, Key: jose.JSONWebKey{Key: key, KeyID: kid}},
-		(&jose.SignerOptions{}).WithType("JWT"),
+		(&jose.SignerOptions{}).WithType(jose.ContentType(typ)),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -115,20 +121,20 @@ func signWith(t *testing.T, key *rsa.PrivateKey, kid string, claims map[string]a
 	return tok
 }
 
+// baseClaims is a plain (non-RFC-9068) JWT access token of the shape Microsoft
+// Entra and many IdPs emit: typ=JWT, scopes in scp, no jti/client_id. The
+// middleware accepts it on signature + audience; the RFC 9068 profile is enforced
+// only for typ=at+jwt tokens (see the at+jwt cases).
 func baseClaims(iss string) map[string]any {
 	now := time.Now()
 	return map[string]any{
 		"iss": iss,
 		"aud": testAud,
 		"sub": "user@example.com",
-		// RFC 9068 §2.2 requires the access-token claim set, including jti and
-		// client_id; scope (not scp) carries the granted scopes.
-		"scope":     "Mail.Read",
-		"jti":       "jti-1",
-		"client_id": "test-client",
-		"iat":       now.Unix(),
-		"nbf":       now.Add(-time.Minute).Unix(),
-		"exp":       now.Add(time.Hour).Unix(),
+		"scp": "Mail.Read",
+		"iat": now.Unix(),
+		"nbf": now.Add(-time.Minute).Unix(),
+		"exp": now.Add(time.Hour).Unix(),
 	}
 }
 
@@ -155,13 +161,28 @@ func TestMiddleware(t *testing.T) {
 		wantStatus  int
 		wantMailbox string // non-empty only on the accepted (200) case
 	}{
-		{"valid", func() string { return idp.sign(t, baseClaims(idp.issuer)) }, http.StatusOK, "user@example.com"},
+		// A plain typ=JWT token (Microsoft-style: scp scopes, no jti/client_id) is
+		// accepted on signature + audience.
+		{"valid plain jwt", func() string { return idp.sign(t, baseClaims(idp.issuer)) }, http.StatusOK, "user@example.com"},
 		{"scope via roles", func() string {
 			c := baseClaims(idp.issuer)
-			delete(c, "scope")
+			delete(c, "scp")
 			c["roles"] = []any{"Mail.Read", "other"}
 			return idp.sign(t, c)
 		}, http.StatusOK, "user@example.com"},
+		// An RFC 9068 access token (typ=at+jwt) IS held to the profile: complete →
+		// accepted; missing the required jti/client_id → rejected.
+		{"at+jwt conformant", func() string {
+			c := baseClaims(idp.issuer)
+			delete(c, "scp")
+			c["scope"] = "Mail.Read"
+			c["jti"] = "jti-1"
+			c["client_id"] = "test-client"
+			return idp.signAT(t, c)
+		}, http.StatusOK, "user@example.com"},
+		{"at+jwt missing required claims", func() string {
+			return idp.signAT(t, baseClaims(idp.issuer)) // no jti/client_id
+		}, http.StatusUnauthorized, ""},
 		{"missing header", func() string { return "" }, http.StatusUnauthorized, ""},
 		{"malformed token", func() string { return "not.a.jwt" }, http.StatusUnauthorized, ""},
 		{"untrusted issuer", func() string {
@@ -169,7 +190,7 @@ func TestMiddleware(t *testing.T) {
 			c["iss"] = "https://evil.example"
 			return idp.sign(t, c)
 		}, http.StatusUnauthorized, ""},
-		{"bad signature", func() string { return signWith(t, otherKey, testKID, baseClaims(idp.issuer)) }, http.StatusUnauthorized, ""},
+		{"bad signature", func() string { return signWith(t, otherKey, testKID, "JWT", baseClaims(idp.issuer)) }, http.StatusUnauthorized, ""},
 		{"wrong audience", func() string {
 			c := baseClaims(idp.issuer)
 			c["aud"] = "someone-else"
@@ -182,7 +203,7 @@ func TestMiddleware(t *testing.T) {
 		}, http.StatusUnauthorized, ""},
 		{"missing scope", func() string {
 			c := baseClaims(idp.issuer)
-			c["scope"] = "openid"
+			c["scp"] = "openid"
 			return idp.sign(t, c)
 		}, http.StatusForbidden, ""},
 	}

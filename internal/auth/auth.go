@@ -6,12 +6,14 @@
 // Each configured issuer is discovered via .well-known/openid-configuration at
 // New time. Two token shapes are supported:
 //
-//   - JWT access tokens: the JWS is verified against the issuer's JWKS (signature,
-//     algorithm pinning, issuer, audience, expiry) by go-oidc, then the verified
-//     payload is validated against the RFC 9068 "JWT Profile for OAuth 2.0 Access
-//     Tokens" claim set by go-access-tokens. RFC 9068 §2.2 requires iss, sub, aud,
-//     exp, iat, jti, and client_id — so a JWT lacking jti or client_id is rejected
-//     on this path. (Opaque tokens are unaffected.)
+//   - JWT bearer tokens: the JWS is verified against the issuer's JWKS — signature,
+//     the issuer's discovery-pinned algorithms, issuer, audience, expiry — by
+//     go-oidc. That is the access-control gate. A token that declares itself an RFC
+//     9068 "JWT Profile for OAuth 2.0 Access Tokens" (typ=at+jwt) is additionally
+//     held to that profile by go-access-tokens (the §2.2 required claims incl. jti
+//     and client_id, and the §4 checks); a plain typ=JWT token — as Microsoft Entra
+//     and many IdPs issue — is accepted on signature + audience like any bearer JWT.
+//     The token's typ thus selects how strictly it is decoded.
 //   - Opaque access tokens (e.g. Kanidm's default) are validated via RFC 7662 token
 //     introspection (go-token-introspection) against the issuer's introspection
 //     endpoint, using the resource server's own client credentials.
@@ -180,36 +182,50 @@ func (a *Authenticator) validate(ctx context.Context, raw string) (*principal, e
 }
 
 // validateJWT verifies the token's JWS — signature, the issuer's discovery-pinned
-// algorithms, issuer, audience, and expiry, via go-oidc — then validates the RFC
-// 9068 access-token claim profile (go-access-tokens) over the now-verified payload.
-// Keeping go-oidc for the crypto preserves algorithm pinning; go-access-tokens adds
-// the §2.2 required-claim and §4 checks an ID-token verifier does not make.
+// algorithms, issuer, audience, and expiry, via go-oidc (the access-control gate
+// for every JWT, and what preserves algorithm pinning) — then decodes the verified
+// token for typed claim access. A token that declares itself an RFC 9068 access
+// token (typ=at+jwt) is additionally held to that profile; a plain JWT is not, so
+// non-RFC-9068 issuers (Microsoft Entra, …) work without being rejected for a
+// missing jti/client_id.
 func (a *Authenticator) validateJWT(ctx context.Context, verifier *oidc.IDTokenVerifier, iss, raw string) (*principal, error) {
 	if _, err := verifier.Verify(ctx, raw); err != nil {
 		return nil, err
 	}
-	// The signature is verified; decode the (now trusted) payload for the RFC 9068
-	// validator rather than re-running the crypto.
-	payload, err := jwtPayload(raw)
+	// The signature is verified; decode the same (now trusted) compact token for
+	// typed claim access rather than re-running the crypto.
+	tok, err := accesstoken.Parse(raw)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("auth: parse token: %w", err)
 	}
-	claims, err := accesstoken.ParseClaims(payload)
-	if err != nil {
-		return nil, fmt.Errorf("auth: parse access token: %w", err)
-	}
-	opts := []accesstoken.Option{accesstoken.WithIssuer(iss)}
-	if a.audience != "" {
-		opts = append(opts, accesstoken.WithAudience(a.audience))
-	}
-	if err := claims.Validate(opts...); err != nil {
-		return nil, fmt.Errorf("auth: validate access token: %w", err)
+	if accesstoken.ValidType(tok.Header.Type) {
+		// The token claims to be an RFC 9068 access token: hold it to the profile.
+		opts := []accesstoken.Option{accesstoken.WithIssuer(iss)}
+		if a.audience != "" {
+			opts = append(opts, accesstoken.WithAudience(a.audience))
+		}
+		if err := tok.Validate(opts...); err != nil {
+			return nil, fmt.Errorf("auth: validate access token: %w", err)
+		}
 	}
 	return &principal{
 		issuer:  iss,
-		subject: subjectFromClaims(claims, a.subjectClaim),
-		scopes:  toSet(append(claims.ScopeValues(), claims.Roles...)),
+		subject: subjectFromClaims(&tok.Claims, a.subjectClaim),
+		scopes:  toSet(scopesFromClaims(&tok.Claims)),
 	}, nil
+}
+
+// scopesFromClaims gathers granted scopes across the conventions IdPs actually use:
+// the RFC 9068/8693 "scope" claim, the app-role "roles" claim, and "scp" (Microsoft
+// Entra and others). The set is the union; an absent claim contributes nothing.
+func scopesFromClaims(c *accesstoken.Claims) []string {
+	out := append([]string{}, c.ScopeValues()...)
+	out = append(out, c.Roles...)
+	var scp string
+	if ok, _ := c.GetExtra("scp", &scp); ok {
+		out = append(out, strings.Fields(scp)...)
+	}
+	return out
 }
 
 // introspectToken validates an opaque token against the configured introspection
@@ -311,22 +327,6 @@ func toSet(items []string) map[string]struct{} {
 // looksLikeJWT reports whether raw has the three dot-separated segments of a JWS.
 func looksLikeJWT(raw string) bool {
 	return strings.Count(raw, ".") == 2
-}
-
-// jwtPayload returns the decoded JSON payload (the second segment) of a compact
-// JWS. It is only called after the signature has been verified, so the bytes are
-// trusted; it lets the RFC 9068 validator run on the verified payload without
-// re-doing signature crypto.
-func jwtPayload(raw string) ([]byte, error) {
-	parts := strings.Split(raw, ".")
-	if len(parts) != 3 {
-		return nil, fmt.Errorf("auth: malformed jwt")
-	}
-	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
-	if err != nil {
-		return nil, fmt.Errorf("auth: decode jwt payload: %w", err)
-	}
-	return payload, nil
 }
 
 // bearerToken extracts the token from an "Authorization: Bearer <token>" header.
