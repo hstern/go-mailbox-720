@@ -120,9 +120,8 @@ jobs:
     # Runs the CalDAV adapter against a real Radicale server in Docker (build tag
     # dockertest), validating the adapter's network methods (principal discovery,
     # calendar-query REPORT, GET) end-to-end against a real server rather than the
-    # unit tests' in-memory iCalendar fixtures. No `go generate` is needed: the
-    # calendar adapter does not import the generated Graph package. Docker is
-    # available on GitHub-hosted runners.
+    # unit tests' in-memory iCalendar fixtures. Docker is available on GitHub-hosted
+    # runners.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -130,6 +129,11 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+
+      # The RFC 6638 native-scheduling e2e drives the accept handler via server.New,
+      # which imports the generated Graph package.
+      - name: Generate (fetch upstream spec + ogen)
+        run: go generate ./internal/graph
 
       - name: CalDAV adapter integration (Radicale)
         run: go test -tags dockertest -timeout 240s -run "TestRadicale" ./internal/calendar/caldav/
