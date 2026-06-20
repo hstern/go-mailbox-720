@@ -24,11 +24,12 @@ import (
 var ErrInvalidDeltaToken = errors.New("mail: invalid delta token")
 
 // ErrDeltaUnsupported marks a backend that cannot serve incremental delta sync —
-// for IMAP, a server that does not advertise CONDSTORE, which delta requires to
-// track changes by MODSEQ. A DeltaReader returns it instead of silently degrading
-// to additive-only sync; the HTTP layer maps it to 501 so the operator learns the
-// backing server is unsuitable for delta.
-var ErrDeltaUnsupported = errors.New("mail: backend does not support delta sync (IMAP CONDSTORE required)")
+// for IMAP, a server that does not advertise QRESYNC, which delta requires to
+// track changes by MODSEQ (CONDSTORE, which QRESYNC implies) and to learn which
+// UIDs were expunged (VANISHED). A DeltaReader returns it instead of silently
+// degrading; the HTTP layer maps it to 501 so the operator learns the backing
+// server is unsuitable for delta.
+var ErrDeltaUnsupported = errors.New("mail: backend does not support delta sync (IMAP QRESYNC required)")
 
 // Address is a parsed mailbox address (display name + addr-spec).
 type Address struct {
@@ -138,13 +139,16 @@ type Writer interface {
 // DeltaReader is bound to the same authenticated mailbox identity as its
 // Backend.
 type DeltaReader interface {
-	// Delta returns the messages in folderID that are new since the opaque
-	// token. An empty token means initial sync: return the current messages
-	// and a fresh token capturing the sync state. The returned next token is
-	// fed back on the following call. This first cut is ADDITIVE — it reports
-	// newly-arrived messages (by UID); reporting deletions/flag changes needs
-	// IMAP CONDSTORE/QRESYNC and is future work (note this in the doc).
-	Delta(ctx context.Context, folderID string, token string) (msgs []Message, next string, err error)
+	// Delta returns the messages in folderID changed since the opaque token. An
+	// empty token means initial sync: return the current messages and a fresh
+	// token capturing the sync state. The returned next token is fed back on the
+	// following call.
+	//
+	// changed holds created and modified messages (a flag/read-state change
+	// re-reports the message); removed holds the opaque IDs of expunged messages,
+	// for Graph @removed tombstones. Implementations that cannot track changes
+	// (the IMAP adapter needs QRESYNC) return ErrDeltaUnsupported.
+	Delta(ctx context.Context, folderID string, token string) (changed []Message, removed []string, next string, err error)
 }
 
 // RawReader is the optional raw-message capability: fetch the full, unparsed

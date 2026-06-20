@@ -55,7 +55,7 @@ func Run(
 ) error {
 	// Baseline: capture the current high-water mark so pre-existing mail isn't
 	// (re)processed; only messages arriving after this are turned into events.
-	_, token, err := syncer.Delta(ctx, "", "")
+	_, _, token, err := syncer.Delta(ctx, "", "")
 	if err != nil {
 		return fmt.Errorf("schedrun: baseline sync: %w", err)
 	}
@@ -63,7 +63,7 @@ func Run(
 	// onChange runs on the watcher's single drain goroutine, so token is only ever
 	// touched from one goroutine — no synchronization needed.
 	onChange := func() {
-		msgs, next, err := syncer.Delta(ctx, "", token)
+		msgs, _, next, err := syncer.Delta(ctx, "", token)
 		if err != nil {
 			// Keep the old token and retry on the next signal rather than skipping
 			// unseen messages.

@@ -49,7 +49,7 @@ func Run(
 	// Baseline: capture the current high-water mark without notifying for the
 	// messages already present when the loop starts. A change between this sync
 	// and the watch starting is caught by the watch's first signal.
-	_, token, err := syncer.Delta(ctx, "", "")
+	_, _, token, err := syncer.Delta(ctx, "", "")
 	if err != nil {
 		return fmt.Errorf("notify: baseline sync: %w", err)
 	}
@@ -57,7 +57,7 @@ func Run(
 	// onChange runs on the watcher's single drain goroutine, so the token is only
 	// ever read/written from one goroutine — no synchronization needed.
 	onChange := func() {
-		msgs, next, err := syncer.Delta(ctx, "", token)
+		msgs, _, next, err := syncer.Delta(ctx, "", token)
 		if err != nil {
 			// A transient sync error: keep the old token and retry on the next
 			// signal rather than advancing past unseen messages.

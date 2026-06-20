@@ -194,7 +194,7 @@ func TestDovecotDelta(t *testing.T) {
 	fid := folderID("INBOX")
 
 	// Initial delta: the seeded message plus a fresh token.
-	first, tok, err := cl.Delta(ctx, fid, "")
+	first, _, tok, err := cl.Delta(ctx, fid, "")
 	if err != nil {
 		t.Fatalf("Delta (initial): %v", err)
 	}
@@ -216,7 +216,7 @@ func TestDovecotDelta(t *testing.T) {
 		"A new arrival.\r\n"
 	appendToINBOX(t, addr, newRaw)
 
-	second, tok2, err := cl.Delta(ctx, fid, tok)
+	second, _, tok2, err := cl.Delta(ctx, fid, tok)
 	if err != nil {
 		t.Fatalf("Delta (incremental): %v", err)
 	}
@@ -234,7 +234,7 @@ func TestDovecotDelta(t *testing.T) {
 	if err := cl.SetRead(ctx, first[0].ID, true); err != nil {
 		t.Fatalf("SetRead: %v", err)
 	}
-	changed, tok3, err := cl.Delta(ctx, fid, tok2)
+	changed, _, tok3, err := cl.Delta(ctx, fid, tok2)
 	if err != nil {
 		t.Fatalf("Delta (flag change): %v", err)
 	}
@@ -247,7 +247,7 @@ func TestDovecotDelta(t *testing.T) {
 	}
 
 	// With the latest token nothing has changed: an empty result and a stable token.
-	none, tok4, err := cl.Delta(ctx, fid, tok3)
+	none, _, tok4, err := cl.Delta(ctx, fid, tok3)
 	if err != nil {
 		t.Fatalf("Delta (no change): %v", err)
 	}
@@ -256,6 +256,27 @@ func TestDovecotDelta(t *testing.T) {
 	}
 	if tok4 != tok3 {
 		t.Errorf("no-change Delta token = %q, want it unchanged (%q)", tok4, tok3)
+	}
+
+	// Deletion -> tombstone: expunging a message makes the next delta report its
+	// opaque id as removed, via QRESYNC VANISHED (the win our go-imap fork adds).
+	gone := second[0].ID
+	if err := cl.DeleteMessage(ctx, gone); err != nil {
+		t.Fatalf("DeleteMessage: %v", err)
+	}
+	_, removed, _, err := cl.Delta(ctx, fid, tok4)
+	if err != nil {
+		t.Fatalf("Delta (post-delete): %v", err)
+	}
+	var sawTombstone bool
+	for _, id := range removed {
+		if id == gone {
+			sawTombstone = true
+			break
+		}
+	}
+	if !sawTombstone {
+		t.Errorf("post-delete Delta did not report removed id %q: %+v", gone, removed)
 	}
 }
 

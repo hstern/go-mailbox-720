@@ -27,12 +27,12 @@ type fakeSyncer struct {
 	msgs  []mail.Message
 }
 
-func (s *fakeSyncer) Delta(_ context.Context, _, _ string) ([]mail.Message, string, error) {
+func (s *fakeSyncer) Delta(_ context.Context, _, _ string) ([]mail.Message, []string, string, error) {
 	s.calls++
 	if s.calls == 1 {
-		return nil, "base", nil // baseline
+		return nil, nil, "base", nil // baseline
 	}
-	return s.msgs, fmt.Sprintf("t%d", s.calls), nil
+	return s.msgs, nil, fmt.Sprintf("t%d", s.calls), nil
 }
 
 type fakeRaw struct{ byID map[string][]byte }

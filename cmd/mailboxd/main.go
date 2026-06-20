@@ -218,12 +218,12 @@ func run(addr string, authCfg auth.Config, provider server.MailProvider, calProv
 	mux.Handle(basePath+"/subscriptions/", subHandler)
 	log.Println("subscriptions: endpoint enabled (in-memory store)")
 
-	// The events/contacts delta operations are served by custom handlers (mounted
-	// ahead of the api.Server) rather than the generated ones, because a delta
-	// page's value array mixes full objects with @removed tombstones for deleted
-	// items — a shape the generated typed collection cannot carry. The mail delta
-	// stays on the generated handler (it is additive: IMAP reports no deletions
-	// without CONDSTORE).
+	// The three delta operations are served by custom handlers (mounted ahead of
+	// the api.Server) rather than the generated ones, because a delta page's value
+	// array mixes full objects with @removed tombstones for deleted items — a shape
+	// the generated typed collection cannot carry. Deletions come from the CalDAV/
+	// CardDAV sync-collection and, for mail, IMAP QRESYNC VANISHED.
+	mux.Handle("GET "+basePath+"/me/messages/delta()", server.MessagesDeltaHandler(provider))
 	mux.Handle("GET "+basePath+"/me/events/delta()", server.EventsDeltaHandler(calProvider))
 	mux.Handle("GET "+basePath+"/me/contacts/delta()", server.ContactsDeltaHandler(contactsProvider))
 

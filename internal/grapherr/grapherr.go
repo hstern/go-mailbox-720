@@ -33,6 +33,7 @@ var table = map[int]meta{
 	http.StatusUnauthorized:         {"unauthenticated", "Authentication is required."},
 	http.StatusForbidden:            {"forbidden", "Access is denied."},
 	http.StatusNotFound:             {"notFound", "The requested resource does not exist."},
+	http.StatusGone:                 {"resyncRequired", "The delta token is invalid or expired; restart with an initial sync."},
 	http.StatusMethodNotAllowed:     {"methodNotAllowed", "The HTTP method is not allowed."},
 	http.StatusUnsupportedMediaType: {"unsupportedMediaType", "The content type is not supported."},
 	http.StatusNotImplemented:       {"notImplemented", "This operation is not implemented."},

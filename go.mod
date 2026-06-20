@@ -48,3 +48,5 @@ require (
 	golang.org/x/text v0.38.0 // indirect
 	gopkg.in/yaml.v2 v2.4.0 // indirect
 )
+
+replace github.com/emersion/go-imap/v2 => github.com/hstern/go-imap/v2 v2.0.0-beta.8.0.20260620025710-a2d23bc67297

@@ -45,6 +45,11 @@ type Client struct {
 	// handler is harmless outside a Watch.
 	mu           sync.Mutex
 	onUnilateral func()
+	// vanished accumulates the UIDs the server reports expunged via QRESYNC
+	// VANISHED responses (RFC 7162). Delta clears it before its FETCH and reads
+	// it after to emit deletion tombstones. Guarded by mu, since the handler is
+	// invoked from go-imap's read goroutine.
+	vanished goimap.UIDSet
 }
 
 var _ mail.Backend = (*Client)(nil)
@@ -69,6 +74,15 @@ func Dial(addr, username, password string, o *Options) (*Client, error) {
 			},
 			// Expunge fires when a message is removed.
 			Expunge: func(uint32) { cl.fireUnilateral() },
+			// Vanished (QRESYNC) reports expunged UIDs: collect them for Delta to
+			// turn into tombstones, and fire the watch trigger as Expunge would
+			// (QRESYNC makes the server send VANISHED in place of EXPUNGE).
+			Vanished: func(uids goimap.UIDSet, _ bool) {
+				cl.mu.Lock()
+				cl.vanished = append(cl.vanished, uids...)
+				cl.mu.Unlock()
+				cl.fireUnilateral()
+			},
 		},
 	}
 	var (
@@ -88,6 +102,16 @@ func Dial(addr, username, password string, o *Options) (*Client, error) {
 		return nil, fmt.Errorf("imap: login: %w", err)
 	}
 	cl.c = c
+	// Enable QRESYNC when the server offers it, so it reports expunges as
+	// uid-based VANISHED responses that Delta turns into deletion tombstones.
+	// Best-effort: a server without QRESYNC still serves every other path (only
+	// Delta requires it, and says so).
+	if c.Caps().Has(goimap.CapQResync) {
+		if _, err := c.Enable(goimap.CapQResync).Wait(); err != nil {
+			_ = c.Close()
+			return nil, fmt.Errorf("imap: enable qresync: %w", err)
+		}
+	}
 	return cl, nil
 }
 

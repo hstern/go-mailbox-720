@@ -36,14 +36,14 @@ type fakeSyncer struct {
 	msgs     []mail.Message
 }
 
-func (s *fakeSyncer) Delta(_ context.Context, _, _ string) ([]mail.Message, string, error) {
+func (s *fakeSyncer) Delta(_ context.Context, _, _ string) ([]mail.Message, []string, string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.calls++
 	if s.calls == 1 {
-		return s.baseline, "tok1", nil
+		return s.baseline, nil, "tok1", nil
 	}
-	return s.msgs, fmt.Sprintf("tok%d", s.calls), nil
+	return s.msgs, nil, fmt.Sprintf("tok%d", s.calls), nil
 }
 
 func newSub(t *testing.T, store subscriptions.Store, url string) {
@@ -127,6 +127,6 @@ func TestRunBaselineError(t *testing.T) {
 
 type errSyncer struct{}
 
-func (errSyncer) Delta(_ context.Context, _, _ string) ([]mail.Message, string, error) {
-	return nil, "", fmt.Errorf("boom")
+func (errSyncer) Delta(_ context.Context, _, _ string) ([]mail.Message, []string, string, error) {
+	return nil, nil, "", fmt.Errorf("boom")
 }

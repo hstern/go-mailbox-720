@@ -3,6 +3,7 @@ package server
 import (
 	"errors"
 	"net/http"
+	"net/url"
 
 	"github.com/go-faster/jx"
 	ht "github.com/ogen-go/ogen/http"
@@ -10,7 +11,66 @@ import (
 	"github.com/hstern/go-mailbox-720/internal/calendar"
 	"github.com/hstern/go-mailbox-720/internal/contacts"
 	"github.com/hstern/go-mailbox-720/internal/grapherr"
+	"github.com/hstern/go-mailbox-720/internal/mail"
 )
+
+// MessagesDeltaHandler serves GET /me/messages/delta with @removed tombstones for
+// expunged messages. Like the events/contacts delta handlers it is a custom
+// http.Handler (not a generated operation) because the value array mixes full
+// messages with tombstones; it reuses the generated per-message encoder for the
+// changed messages. The IMAP adapter reports deletions via QRESYNC VANISHED.
+func MessagesDeltaHandler(p MailProvider) http.Handler {
+	return http.HandlerFunc((Handler{mail: p}).serveMessagesDelta)
+}
+
+func (h Handler) serveMessagesDelta(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	b, err := h.backend(ctx)
+	if err != nil {
+		grapherr.Write(w, statusFor(err))
+		return
+	}
+	defer func() { _ = b.Close() }()
+
+	d, ok := b.(mail.DeltaReader)
+	if !ok {
+		grapherr.Write(w, http.StatusNotImplemented)
+		return
+	}
+
+	token := r.URL.Query().Get("$deltatoken")
+	if token == "" {
+		token = r.URL.Query().Get("$skiptoken")
+	}
+	changed, removed, next, err := d.Delta(ctx, "", token)
+	if err != nil {
+		switch {
+		case errors.Is(err, mail.ErrInvalidDeltaToken):
+			// Tell the client to drop the token and resync rather than fail forever.
+			grapherr.Write(w, http.StatusGone)
+		case errors.Is(err, mail.ErrDeltaUnsupported):
+			// The IMAP server lacks QRESYNC, so delta cannot be served.
+			grapherr.Write(w, http.StatusNotImplemented)
+		default:
+			grapherr.Write(w, http.StatusInternalServerError)
+		}
+		return
+	}
+
+	writeDelta(w, deltaLink("/me/messages/delta()", next), removed, func(e *jx.Encoder) {
+		for _, m := range changed {
+			gm := toGraphMessage(m)
+			gm.Encode(e)
+		}
+	})
+}
+
+// deltaLink builds the @odata.deltaLink a client GETs for the next sync round:
+// the given delta operation path under the API base prefix, carrying the opaque
+// continuation token.
+func deltaLink(opPath, token string) string {
+	return basePath + opPath + "?$deltatoken=" + url.QueryEscape(token)
+}
 
 // EventsDeltaHandler and ContactsDeltaHandler serve GET /me/events/delta and
 // /me/contacts/delta with @removed tombstones for deleted items. They are plain

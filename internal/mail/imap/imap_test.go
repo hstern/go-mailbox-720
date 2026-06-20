@@ -548,12 +548,12 @@ func (cl *Client) appendRaw(t *testing.T, mailbox, raw string) {
 // dovecot_test.go, since the in-process imapmemserver does not implement
 // CONDSTORE. These mock-server tests cover the require + local-validation paths.
 
-func TestDeltaRequiresCondstore(t *testing.T) {
-	// imapmemserver does not advertise CONDSTORE, so Delta must refuse rather than
+func TestDeltaRequiresQResync(t *testing.T) {
+	// imapmemserver does not advertise QRESYNC, so Delta must refuse rather than
 	// silently degrade to additive-only sync.
 	cl := dialTest(t)
-	if _, _, err := cl.Delta(context.Background(), folderID("INBOX"), ""); !errors.Is(err, mail.ErrDeltaUnsupported) {
-		t.Errorf("Delta against a non-CONDSTORE server = %v, want mail.ErrDeltaUnsupported", err)
+	if _, _, _, err := cl.Delta(context.Background(), folderID("INBOX"), ""); !errors.Is(err, mail.ErrDeltaUnsupported) {
+		t.Errorf("Delta against a non-QRESYNC server = %v, want mail.ErrDeltaUnsupported", err)
 	}
 }
 
@@ -561,7 +561,7 @@ func TestDeltaMalformedToken(t *testing.T) {
 	// A malformed token is rejected locally (before any capability/SELECT round
 	// trip) as an invalid delta token.
 	cl := dialTest(t)
-	_, _, err := cl.Delta(context.Background(), folderID("INBOX"), "!!!not base64!!!")
+	_, _, _, err := cl.Delta(context.Background(), folderID("INBOX"), "!!!not base64!!!")
 	if !errors.Is(err, mail.ErrInvalidDeltaToken) {
 		t.Errorf("Delta with a malformed token = %v, want mail.ErrInvalidDeltaToken", err)
 	}
