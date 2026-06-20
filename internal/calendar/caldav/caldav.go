@@ -12,6 +12,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -30,9 +31,13 @@ type Options struct {
 }
 
 // Client is a CalDAV-backed calendar.Backend over a single authenticated
-// principal.
+// principal. http and endpoint are retained alongside the go-webdav client so the
+// adapter can issue the one request go-webdav does not expose: an OPTIONS probe
+// for the RFC 6638 calendar-auto-schedule capability (see SupportsServerScheduling).
 type Client struct {
-	c *gocaldav.Client
+	c        *gocaldav.Client
+	http     webdav.HTTPClient
+	endpoint *url.URL
 }
 
 var _ calendar.Backend = (*Client)(nil)
@@ -54,7 +59,11 @@ func Dial(endpoint, username, password string, o *Options) (*Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("caldav: new client for %s: %w", endpoint, err)
 	}
-	return &Client{c: c}, nil
+	u, err := url.Parse(endpoint)
+	if err != nil {
+		return nil, fmt.Errorf("caldav: parse endpoint %s: %w", endpoint, err)
+	}
+	return &Client{c: c, http: httpClient, endpoint: u}, nil
 }
 
 // Close releases the backend. The CalDAV client holds no persistent connection

@@ -55,7 +55,7 @@ func main() {
 	caldavUser := flag.String("cal-caldav-username", "", "CalDAV username for the calendar backend")
 	carddavURL := flag.String("contacts-carddav-url", "", "CardDAV base URL for the contacts backend (empty: contacts operations return 501; password from MAILBOXD_CARDDAV_PASSWORD). Use an https:// URL for TLS")
 	carddavUser := flag.String("contacts-carddav-username", "", "CardDAV username for the contacts backend")
-	enableScheduling := flag.Bool("enable-scheduling", false, "run the iTIP scheduling trigger: turn inbound mail invitations into tentative calendar events (needs IMAP + CalDAV backends; opt-in, since it writes to the calendar and the RFC 6638 capability switch is not yet implemented)")
+	enableScheduling := flag.Bool("enable-scheduling", false, "run the iTIP scheduling trigger: turn inbound mail invitations into tentative calendar events (needs IMAP + CalDAV backends; opt-in, since it writes to the calendar). Auto-disables when the CalDAV server schedules natively (RFC 6638)")
 	smtpAddr := flag.String("smtp-addr", "", "SMTP submission server host:port for emailing meeting accept/decline replies (empty: those operations return 501; password from MAILBOXD_SMTP_PASSWORD)")
 	smtpUser := flag.String("smtp-username", "", "SMTP username")
 	smtpTLS := flag.Bool("smtp-tls", false, "use implicit TLS (SMTPS, port 465) for SMTP")
@@ -345,6 +345,19 @@ func startScheduler(ctx context.Context, provider server.MailProvider, calProvid
 	if err != nil {
 		log.Println("scheduling: disabled (calendar connection failed):", err)
 		return
+	}
+	// RFC 6638 capability switch: if the CalDAV server schedules natively it
+	// already handles inbound iTIP, so the client-side email bridge must not run —
+	// it would duplicate the events the server creates. A probe failure falls
+	// through to running the bridge (the safe default for a dumb server).
+	if d, ok := calBackend.(calendar.SchedulingDetector); ok {
+		if native, err := d.SupportsServerScheduling(ctx); err != nil {
+			log.Println("scheduling: RFC 6638 probe failed, assuming client-side scheduling:", err)
+		} else if native {
+			_ = calBackend.Close()
+			log.Println("scheduling: disabled (CalDAV server schedules natively via RFC 6638)")
+			return
+		}
 	}
 	writer, ok := calBackend.(calendar.Writer)
 	if !ok {

@@ -157,6 +157,16 @@ func TestRadicaleIntegration(t *testing.T) {
 	if !got.Start.Equal(seedEventStart) {
 		t.Errorf("GetEvent Start = %v, want %v", got.Start, seedEventStart)
 	}
+
+	// Radicale is a storage-only CalDAV server (no RFC 6638 auto-scheduling), so
+	// the capability probe must report false — the client-side bridge applies.
+	native, err := cl.SupportsServerScheduling(ctx)
+	if err != nil {
+		t.Fatalf("SupportsServerScheduling: %v", err)
+	}
+	if native {
+		t.Error("SupportsServerScheduling = true for Radicale, want false (no RFC 6638)")
+	}
 }
 
 // TestRadicaleWrite exercises the Writer capability end to end against Radicale:

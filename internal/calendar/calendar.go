@@ -132,3 +132,20 @@ type DeltaReader interface {
 	// @removed tombstones). On an initial sync removed is empty.
 	Delta(ctx context.Context, calendarID string, token string) (changed []Event, removed []string, next string, err error)
 }
+
+// SchedulingDetector is the optional capability to report whether the backing
+// server performs iTIP scheduling itself (CalDAV RFC 6638 calendar
+// auto-scheduling). It is kept separate from Backend (like Writer); an adapter
+// that can detect it implements SchedulingDetector in addition to Backend, and
+// the scheduling trigger type-asserts for it:
+//
+//	if d, ok := backend.(calendar.SchedulingDetector); ok { ... }
+//
+// When the server schedules natively, the client-side email scheduling bridge
+// (inbound REQUEST mail → tentative event) should not run, since the server
+// already handles inbound iTIP — running both would duplicate events.
+type SchedulingDetector interface {
+	// SupportsServerScheduling reports whether the server implements RFC 6638
+	// calendar auto-scheduling.
+	SupportsServerScheduling(ctx context.Context) (bool, error)
+}
