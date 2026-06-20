@@ -4,10 +4,12 @@ An open-source Go server that implements the **mailbox slice of the Microsoft
 Graph API** — so a self-hosted mail/calendar/contacts backend can answer Graph
 clients.
 
-> **Status: early / work in progress.** The codegen pipeline, server skeleton,
-> and OIDC authentication are in place; the Graph operations themselves are not
-> implemented yet (every route currently returns a Graph `notImplemented`
-> error). It does not yet talk to a real mail backend.
+> **Status: working, still maturing.** Reads and writes for mail, calendar, and
+> contacts are implemented over real IMAP / CalDAV / CardDAV backends, behind
+> OIDC, with `$filter`, `$batch`, delta sync, and change-notification
+> subscriptions. The iTIP/iMIP scheduling engine and several protocol corners are
+> built but not yet fully wired (see [Status detail](#status-detail)). Without a
+> backend configured, an operation returns a Graph `notImplemented` (501).
 
 "Microsoft Graph" and "Microsoft" are trademarks of Microsoft Corporation, used
 here descriptively (nominative fair use) to say what this software is compatible
@@ -21,8 +23,43 @@ with. This project is not affiliated with or endorsed by Microsoft.
 - **Scope: the Exchange/mailbox slice** — `messages`, `mailFolders`, `events`,
   `calendars`, `contacts`, under `/me` and `/users/{id}`. Everything else in
   Graph (Teams, SharePoint, OneDrive, directory, …) is out of scope.
+- **Bring your own backends.** Mail maps onto **IMAP**, calendar onto **CalDAV**,
+  contacts onto **CardDAV** — your existing self-hosted servers (e.g. Dovecot +
+  Radicale). Backend-neutral ports mean a JMAP adapter can drop in later.
 - **OIDC resource server.** Bring your own external IdP (Keycloak, Authentik,
-  Dex, Entra, Kanidm); the server validates bearer JWTs and does not issue them.
+  Dex, Entra, Kanidm); the server validates bearer tokens and does not issue them.
+
+## Implemented
+
+| Area | Operations |
+| --- | --- |
+| Mail (IMAP) | `GET /me/messages` (with `$filter` → IMAP SEARCH), `GET /me/mailFolders`, `GET /me/messages/{id}`, `PATCH` (isRead) + `DELETE`, `GET /me/messages/delta` (incremental sync) |
+| Calendar (CalDAV) | `GET /me/events`, `GET /me/calendars`, `POST` / `PATCH` / `DELETE /me/events` |
+| Contacts (CardDAV) | `GET /me/contacts`, `POST` / `PATCH` / `DELETE /me/contacts` |
+| Protocol | `POST /$batch` (JSON batching), `POST` / `GET` / `DELETE /v1.0/subscriptions` (change notifications, with IMAP-IDLE-driven delivery) |
+| Auth | JWT (JWKS) + opaque-token (RFC 7662 introspection) validation, RFC 9493 subject identity |
+
+Event times accept UTC, RFC3339 offsets, and Windows zone names (e.g. `Pacific
+Standard Time`), resolved to the correct instant. Secrets (IMAP/CalDAV/CardDAV
+passwords, the introspection client secret) are read from the environment, never
+flags, so they stay out of the process table.
+
+## Status detail
+
+Built but not yet fully wired, or deliberately first-cut:
+
+- **iTIP/iMIP scheduling** (`internal/scheduling`, `internal/itip`, `internal/smtp`):
+  the full engine — parse, reply, request/cancel, iMIP email composition, and the
+  orchestration core (inbound REQUEST → tentative event; accept/decline → emailed
+  reply) — plus an SMTP send port. The inbound-mail trigger loop and the RFC 6638
+  capability switch are not yet wired.
+- **Delta**: mail delta is additive (new messages); deletions/flag changes await
+  CONDSTORE/QRESYNC. Calendar/contacts delta operations are generated but return
+  501 pending CalDAV/CardDAV sync-token (RFC 6578) wiring.
+- **Subscriptions**: single-tenant in-memory store (per-identity keying is a
+  prerequisite before multi-mailbox use); notification delivery is created-only.
+- **Update PATCH** of events/contacts merges provided fields; partial collection
+  semantics are best-effort.
 
 ## Repository hygiene: no Microsoft IP in git
 
@@ -44,21 +81,24 @@ go build ./...
 go test ./...
 ```
 
-Some integration tests need Docker and are behind a build tag so the default
-`go test ./...` stays fast. The IMAP adapter has a Dovecot-backed integration
-test:
+Some integration tests need Docker and are behind a `dockertest` build tag so the
+default `go test ./...` stays fast. They run the adapters against real servers:
 
 ```sh
-go test -tags dockertest ./internal/mail/imap/
+go test -tags dockertest ./internal/mail/imap/        # IMAP + delta + IDLE vs Dovecot
+go test -tags dockertest ./internal/calendar/caldav/  # CalDAV read/write vs Radicale
 ```
 
-Run the server (auth disabled — all requests allowed; for local experimentation
-only):
+Run the server against your backends (auth disabled here — local experimentation
+only). With a backend configured the routes return real data:
 
 ```sh
-go run ./cmd/mailboxd -addr :8080
-# every route answers under /v1.0, e.g.:
-curl -i http://localhost:8080/v1.0/me/messages   # 501 notImplemented (for now)
+MAILBOXD_IMAP_PASSWORD=… MAILBOXD_CALDAV_PASSWORD=… MAILBOXD_CARDDAV_PASSWORD=… \
+go run ./cmd/mailboxd -addr :8080 \
+  -mail-imap-addr imap.example.com:993 -mail-imap-username alice \
+  -cal-caldav-url https://dav.example.com/ -cal-caldav-username alice \
+  -contacts-carddav-url https://dav.example.com/ -contacts-carddav-username alice
+curl -i http://localhost:8080/v1.0/me/messages   # 200 with the inbox
 ```
 
 Run with OIDC enforced (the production posture):
@@ -79,6 +119,9 @@ go run ./cmd/mailboxd \
 | `-auth-scope` | Comma-separated required scopes (matched against `scp`/`scope`/`roles`). |
 | `-auth-subject-claim` | Token claim mapped to the mailbox identity (default `sub`). |
 | `-auth-introspect-client-id` | OAuth2 client id enabling RFC 7662 introspection of **opaque** tokens (secret via `MAILBOXD_INTROSPECT_CLIENT_SECRET`). |
+| `-mail-imap-addr` / `-mail-imap-username` / `-mail-imap-tls` | IMAP mail backend (password via `MAILBOXD_IMAP_PASSWORD`). |
+| `-cal-caldav-url` / `-cal-caldav-username` | CalDAV calendar backend (password via `MAILBOXD_CALDAV_PASSWORD`). |
+| `-contacts-carddav-url` / `-contacts-carddav-username` | CardDAV contacts backend (password via `MAILBOXD_CARDDAV_PASSWORD`). |
 
 JWT access tokens are validated locally against the issuer's JWKS. Opaque access
 tokens (e.g. Kanidm's default) are validated via RFC 7662 introspection when
@@ -95,17 +138,20 @@ if an issuer cannot be discovered, and rejects any request without a valid token
 
 | Path | Purpose |
 | --- | --- |
-| `cmd/gen-graph-api` | Build-time codegen: fetch spec → subset → `ogen`. |
-| `internal/specsubset` | Prunes the full Graph spec to the mailbox slice. |
+| `cmd/gen-graph-api`, `internal/specsubset` | Build-time codegen: fetch spec → subset → `ogen`. |
 | `internal/graph` | Hosts the `go generate` directive; `internal/graph/api` is the generated (git-excluded) package. |
-| `internal/server` | HTTP server implementing the generated handler. |
-| `internal/auth` | OIDC resource-server middleware. |
-| `internal/grapherr` | Graph error-object response shape. |
-| `internal/mail` | Mailbox backing-store port (backend-neutral, Graph/JMAP-shaped). |
-| `internal/mail/imap` | IMAP adapter implementing the mail port (go-imap v2 + go-message). |
+| `internal/server` | HTTP server implementing the generated handler (mail/calendar/contacts/delta/batch handlers + Graph↔neutral mapping). |
+| `internal/auth`, `internal/grapherr` | OIDC resource-server middleware; Graph error-object shape. |
+| `internal/odata`, `internal/batch` | `$filter` parsing/translation; `$batch` JSON batching. |
+| `internal/mail` + `internal/mail/imap` | Mail port + IMAP adapter (read/write/delta/IDLE). |
+| `internal/calendar` + `…/caldav` | Calendar port + CalDAV adapter (read/write). |
+| `internal/contacts` + `…/carddav` | Contacts port + CardDAV adapter (read/write). |
+| `internal/subscriptions`, `internal/notify` | Change-notification model/store/validation/delivery; IDLE→delta→deliver loop. |
+| `internal/scheduling`, `internal/itip`, `internal/smtp` | iTIP/iMIP engine, scheduling orchestration, SMTP send port. |
+| `internal/tz` | Graph (Windows/IANA) time-zone resolution. |
 | `cmd/mailboxd` | The server binary. |
 | `test/conformance` | Black-box conformance test driving mailboxd with the official `msgraph-sdk-go` client (separate module). |
-| `test/e2e-oidc` | OIDC end-to-end test: a real Kanidm IdP (Docker) issues a token that mailboxd accepts via introspection (separate module; needs Docker). |
+| `test/e2e-oidc` | End-to-end: real Kanidm + Dovecot + Radicale (Docker) — an authenticated client reads mail and calendar through mailboxd (separate module). |
 
 ## License
 
