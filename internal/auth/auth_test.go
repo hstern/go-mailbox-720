@@ -374,3 +374,51 @@ func TestScopeClaimsDefaultDoesNotReadScp(t *testing.T) {
 		t.Error("next ran despite the scope being only in scp under default ScopeClaims")
 	}
 }
+
+// The auth failures emit an RFC 6750 §3 WWW-Authenticate: Bearer challenge — a bare
+// one for missing credentials, error=invalid_token for a bad token, and
+// error=insufficient_scope (with the required scope) for a scope failure.
+func TestWWWAuthenticateChallenge(t *testing.T) {
+	idp := newIDP(t)
+	a, err := New(context.Background(), Config{
+		Issuers:        []string{idp.issuer},
+		Audience:       testAud,
+		RequiredScopes: []string{"Mail.Read"},
+		ScopeClaims:    []string{"scope", "scp", "roles"},
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	otherKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tc := range []struct {
+		name   string
+		auth   string // Authorization header value ("" => none)
+		want   int
+		header string // expected WWW-Authenticate value
+	}{
+		{"no credentials", "", http.StatusUnauthorized, `Bearer realm="mailbox-api"`},
+		{"bad token", "Bearer " + signWith(t, otherKey, testKID, "JWT", baseClaims(idp.issuer)), http.StatusUnauthorized, `Bearer realm="mailbox-api", error="invalid_token"`},
+		{"insufficient scope", "Bearer " + idp.sign(t, func() map[string]any { c := baseClaims(idp.issuer); c["scp"] = "openid"; return c }()), http.StatusForbidden, `Bearer realm="mailbox-api", error="insufficient_scope", scope="Mail.Read"`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "/v1.0/me/messages", nil)
+			if tc.auth != "" {
+				req.Header.Set("Authorization", tc.auth)
+			}
+			rec := httptest.NewRecorder()
+			a.Middleware(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {})).ServeHTTP(rec, req)
+
+			if rec.Code != tc.want {
+				t.Errorf("status = %d, want %d", rec.Code, tc.want)
+			}
+			if got := rec.Header().Get("WWW-Authenticate"); got != tc.header {
+				t.Errorf("WWW-Authenticate = %q, want %q", got, tc.header)
+			}
+		})
+	}
+}
