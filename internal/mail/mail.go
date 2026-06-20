@@ -23,6 +23,13 @@ import (
 // rather than a server error.
 var ErrInvalidDeltaToken = errors.New("mail: invalid delta token")
 
+// ErrDeltaUnsupported marks a backend that cannot serve incremental delta sync —
+// for IMAP, a server that does not advertise CONDSTORE, which delta requires to
+// track changes by MODSEQ. A DeltaReader returns it instead of silently degrading
+// to additive-only sync; the HTTP layer maps it to 501 so the operator learns the
+// backing server is unsuitable for delta.
+var ErrDeltaUnsupported = errors.New("mail: backend does not support delta sync (IMAP CONDSTORE required)")
+
 // Address is a parsed mailbox address (display name + addr-spec).
 type Address struct {
 	Name  string

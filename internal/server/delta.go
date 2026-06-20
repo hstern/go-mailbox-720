@@ -46,6 +46,11 @@ func (h Handler) MeMessagesDelta(ctx context.Context, params api.MeMessagesDelta
 		if errors.Is(err, mail.ErrInvalidDeltaToken) {
 			return resyncRequired(), nil
 		}
+		// The backing IMAP server lacks CONDSTORE, so delta cannot be served:
+		// surface 501 so the operator learns the server is unsuitable.
+		if errors.Is(err, mail.ErrDeltaUnsupported) {
+			return nil, ht.ErrNotImplemented
+		}
 		return nil, fmt.Errorf("messages delta: %w", err)
 	}
 

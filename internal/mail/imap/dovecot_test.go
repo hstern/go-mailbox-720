@@ -227,6 +227,36 @@ func TestDovecotDelta(t *testing.T) {
 	if tok2 == "" || tok2 == tok {
 		t.Errorf("incremental Delta token = %q, want an advanced token (was %q)", tok2, tok)
 	}
+
+	// CONDSTORE's win over additive sync: a FLAG change (not just a new arrival)
+	// advances a message's MODSEQ, so delta-by-token re-reports it with the new
+	// state. Mark the seeded message read; the next delta must surface it as read.
+	if err := cl.SetRead(ctx, first[0].ID, true); err != nil {
+		t.Fatalf("SetRead: %v", err)
+	}
+	changed, tok3, err := cl.Delta(ctx, fid, tok2)
+	if err != nil {
+		t.Fatalf("Delta (flag change): %v", err)
+	}
+	if len(changed) != 1 || changed[0].Subject != "Hello there" || !changed[0].IsRead {
+		t.Fatalf("flag-change Delta: got %d messages (subj %q, read=%v), want the now-read 'Hello there'",
+			len(changed), subjectOrEmpty(changed), len(changed) == 1 && changed[0].IsRead)
+	}
+	if tok3 == "" || tok3 == tok2 {
+		t.Errorf("flag-change Delta token = %q, want an advanced token (was %q)", tok3, tok2)
+	}
+
+	// With the latest token nothing has changed: an empty result and a stable token.
+	none, tok4, err := cl.Delta(ctx, fid, tok3)
+	if err != nil {
+		t.Fatalf("Delta (no change): %v", err)
+	}
+	if len(none) != 0 {
+		t.Errorf("no-change Delta: got %d messages, want 0", len(none))
+	}
+	if tok4 != tok3 {
+		t.Errorf("no-change Delta token = %q, want it unchanged (%q)", tok4, tok3)
+	}
 }
 
 // TestDovecotIdle exercises the IDLE watcher against a real Dovecot server,
