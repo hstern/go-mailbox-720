@@ -128,12 +128,23 @@ func (h Handler) cancelInvitations(ctx context.Context, b calendar.Backend, even
 	if !send {
 		return
 	}
+	h.sendCancelTo(ctx, organizer, event, eventRecipients(event, organizer))
+}
 
+// sendCancelTo emails a METHOD:CANCEL for event to the given recipients (already
+// filtered to exclude the organizer), withdrawing the meeting from their calendars.
+// It is the send core shared by a full delete (all attendees) and a PATCH that drops
+// some attendees (just those). A send failure is only logged — there is nothing to
+// persist, and the calendar change has already happened.
+func (h Handler) sendCancelTo(ctx context.Context, organizer string, event calendar.Event, recipients []scheduling.Attendee) {
+	if len(recipients) == 0 {
+		return
+	}
 	// itip.Cancel emits METHOD:CANCEL regardless of inv.Method (scheduling.Cancel
 	// sets it), so InviteFromEvent's REQUEST method is harmless and left as-is.
 	inv := itip.InviteFromEvent(event)
 	inv.Organizer = organizerFor(inv.Organizer, organizer)
-	inv.Attendees = schedulingRecipients(inv.Attendees, organizer)
+	inv.Attendees = recipients
 
 	sender, err := h.scheduling.Sender(ctx)
 	if err != nil {
@@ -144,6 +155,55 @@ func (h Handler) cancelInvitations(ctx context.Context, b calendar.Backend, even
 
 	if err := itip.Cancel(ctx, sender, inv.Organizer, inv, time.Now()); err != nil {
 		log.Printf("calendar: iMIP CANCEL send failed for event %s: %v", event.ID, err)
+	}
+}
+
+// eventRecipients is the event's scheduling recipients: its attendees other than
+// the organizer, as scheduling.Attendee values.
+func eventRecipients(event calendar.Event, organizer string) []scheduling.Attendee {
+	return schedulingRecipients(itip.InviteFromEvent(event).Attendees, organizer)
+}
+
+// removedRecipients returns the recipients on current that are absent from merged —
+// the attendees a PATCH dropped, who are owed a CANCEL. Matching is by email,
+// case-insensitively.
+func removedRecipients(current, merged calendar.Event, organizer string) []scheduling.Attendee {
+	keep := make(map[string]bool)
+	for _, a := range eventRecipients(merged, organizer) {
+		keep[strings.ToLower(a.Email)] = true
+	}
+	var out []scheduling.Attendee
+	for _, a := range eventRecipients(current, organizer) {
+		if !keep[strings.ToLower(a.Email)] {
+			out = append(out, a)
+		}
+	}
+	return out
+}
+
+// rosterAdded reports whether merged has a recipient that current lacks (a PATCH
+// added an attendee), matched by email.
+func rosterAdded(current, merged calendar.Event, organizer string) bool {
+	had := make(map[string]bool)
+	for _, a := range eventRecipients(current, organizer) {
+		had[strings.ToLower(a.Email)] = true
+	}
+	for _, a := range eventRecipients(merged, organizer) {
+		if !had[strings.ToLower(a.Email)] {
+			return true
+		}
+	}
+	return false
+}
+
+// resetRecipientStatus marks every recipient attendee not-yet-responded — the
+// neutral PARTSTAT=NEEDS-ACTION an organizer's significant change re-solicits, so
+// the stored event shows responses are pending again.
+func resetRecipientStatus(event *calendar.Event, organizer string) {
+	for i := range event.Attendees {
+		if isSchedulingRecipient(event.Attendees[i], organizer) {
+			event.Attendees[i].Status = "notResponded"
+		}
 	}
 }
 
@@ -221,31 +281,64 @@ func recordSchedulingOutcome(event *calendar.Event, organizer string, status sch
 	}
 }
 
-// reinviteOnUpdate re-sends a METHOD:REQUEST to a meeting's attendees when a PATCH
-// makes a significant change to it, bumping SEQUENCE so the re-issued invitation
-// supersedes the prior one and recording the per-attendee SCHEDULE-STATUS. Like the
-// create path it is gated by the capability switch (no-op for a native scheduler)
-// and only fires for a real meeting; it returns the event to persist — unchanged
-// when nothing is re-sent.
+// reinviteOnUpdate carries a PATCH's scheduling consequences to a meeting's
+// attendees on the dumb-backend tier and returns the event to persist:
+//
+//   - attendees the patch dropped are sent a METHOD:CANCEL (withdrawing the meeting
+//     from their calendars);
+//   - a start/end/location change OR an added attendee re-sends a METHOD:REQUEST to
+//     the remaining attendees, bumping SEQUENCE so it supersedes the prior one;
+//   - a start/end/location change additionally resets the recipients' PARTSTAT,
+//     since a significant change (RFC 5546) requires them to respond afresh — an
+//     added-attendee-only change leaves existing responses intact.
+//
+// It is gated by the capability switch (no-op for a native scheduler) but, unlike
+// the create path, not on the presence of recipients: a removal must be cancelled
+// even when none remain. The event is returned unchanged when nothing an attendee
+// needs to hear about changed.
 func (h Handler) reinviteOnUpdate(ctx context.Context, b calendar.Backend, current, merged calendar.Event) calendar.Event {
-	if !significantChange(current, merged) {
+	if h.scheduling == nil {
 		return merged
 	}
-	organizer, send := h.shouldSelfSchedule(ctx, b, merged)
-	if !send {
+	organizer := h.scheduling.MailboxAddress()
+	if organizer == "" {
 		return merged
 	}
-	merged.Sequence = current.Sequence + 1
-	status := h.sendRequest(ctx, organizer, merged)
-	recordSchedulingOutcome(&merged, organizer, status)
+	if native, _ := serverSchedulesEvents(ctx, b); native {
+		return merged
+	}
+
+	removed := removedRecipients(current, merged, organizer)
+	timeLocChanged := significantChange(current, merged)
+	if len(removed) == 0 && !timeLocChanged && !rosterAdded(current, merged, organizer) {
+		return merged
+	}
+
+	if len(removed) > 0 {
+		// Cancel using the current (pre-patch) details — the meeting the removed
+		// attendees still hold.
+		h.sendCancelTo(ctx, organizer, current, removed)
+	}
+
+	if timeLocChanged || rosterAdded(current, merged, organizer) {
+		merged.Sequence = current.Sequence + 1
+		if timeLocChanged {
+			resetRecipientStatus(&merged, organizer)
+		}
+		status := h.sendRequest(ctx, organizer, merged)
+		recordSchedulingOutcome(&merged, organizer, status)
+	} else {
+		// A removal-only change: nothing to re-invite, but the event still advanced.
+		merged.Sequence = current.Sequence + 1
+	}
 	return merged
 }
 
 // significantChange reports whether a PATCH altered a field that, per RFC 5546,
-// warrants re-inviting attendees and bumping SEQUENCE: the start, end, or location.
-// A summary- or body-only edit is not significant and re-sends no REQUEST. Deferred:
-// differential handling of an added attendee (a fresh REQUEST) or a removed one (a
-// CANCEL), and resetting PARTSTAT to NEEDS-ACTION on the change.
+// warrants re-inviting attendees, bumping SEQUENCE, and resetting their PARTSTAT:
+// the start, end, or location. A summary- or body-only edit is not significant. An
+// attendee-set change is handled separately (see reinviteOnUpdate) and does not
+// reset existing attendees' responses.
 func significantChange(current, merged calendar.Event) bool {
 	return !current.Start.Equal(merged.Start) ||
 		!current.End.Equal(merged.End) ||
@@ -405,9 +498,37 @@ func mergeEventPatch(current calendar.Event, ge *api.MicrosoftGraphEvent) (calen
 		}
 	}
 	if len(ge.Attendees) > 0 {
-		merged.Attendees = graphToAttendees(ge.Attendees)
+		merged.Attendees = mergeAttendees(current.Attendees, graphToAttendees(ge.Attendees))
 	}
 	return merged, nil
+}
+
+// mergeAttendees overlays a PATCH's attendee roster onto the current one, carrying
+// each retained attendee's stored response (and SCHEDULE-STATUS) forward when the
+// patch does not restate it — a Graph client that re-lists attendees by address
+// alone should not silently drop their existing PARTSTAT. Attendees only on the
+// patch are added; those only on the current roster are dropped (a removal).
+func mergeAttendees(current, patched []calendar.Attendee) []calendar.Attendee {
+	byEmail := make(map[string]calendar.Attendee, len(current))
+	for _, a := range current {
+		byEmail[strings.ToLower(a.Email)] = a
+	}
+	out := make([]calendar.Attendee, 0, len(patched))
+	for _, p := range patched {
+		if prev, ok := byEmail[strings.ToLower(p.Email)]; ok {
+			// Carry the stored response forward only when the patch omits it; but
+			// SCHEDULE-STATUS has no Graph representation, so a patch can never
+			// restate it — always preserve the stored value.
+			if p.Status == "" {
+				p.Status = prev.Status
+			}
+			if p.ScheduleStatus == "" {
+				p.ScheduleStatus = prev.ScheduleStatus
+			}
+		}
+		out = append(out, p)
+	}
+	return out
 }
 
 // graphToTime parses a Graph dateTimeTimeZone back into an instant — the inverse
