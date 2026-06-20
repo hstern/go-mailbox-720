@@ -370,3 +370,24 @@ func TestInjectDeltaTokenParams(t *testing.T) {
 		t.Errorf("non-delta path params modified: %v", plain)
 	}
 }
+
+func TestStripSendResponseDefault(t *testing.T) {
+	props := map[string]any{
+		"SendResponse": map[string]any{"type": "boolean", "default": false},
+		"Comment":      map[string]any{"type": "string"},
+	}
+	doc := map[string]any{"any": map[string]any{"properties": props}}
+
+	stripSendResponseDefault(doc)
+
+	sr := props["SendResponse"].(map[string]any)
+	if _, ok := sr["default"]; ok {
+		t.Errorf("SendResponse still carries a default: %+v", sr)
+	}
+	if sr["type"] != "boolean" {
+		t.Errorf("SendResponse type should be preserved, got %+v", sr)
+	}
+	if _, ok := props["Comment"]; !ok {
+		t.Error("sibling property Comment should be untouched")
+	}
+}

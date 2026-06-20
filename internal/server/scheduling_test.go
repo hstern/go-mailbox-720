@@ -2,6 +2,9 @@ package server
 
 import (
 	"context"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -195,5 +198,33 @@ func TestMeEventsEventAcceptNativeNotAnAttendee(t *testing.T) {
 	}
 	if errRes, ok := res.(*api.ErrorStatusCode); !ok || errRes.StatusCode != 400 {
 		t.Errorf("response = %T, want a 400 (mailbox not an attendee)", res)
+	}
+}
+
+// TestMeEventsEventAcceptOmittedSendResponseSendsReply is the regression guard for
+// the SendResponse spec-default fix: an empty {} body (omitted SendResponse) goes
+// through the real ogen decode — unlike the Go-literal tests above — and must
+// default to true and send the reply. With Graph's default:false left in place it
+// would decode to false and silently skip the reply.
+func TestMeEventsEventAcceptOmittedSendResponseSendsReply(t *testing.T) {
+	sender := &fakeSender{}
+	srv, err := New(nil, fakeCalendarProvider{backend: seededInvite()}, nil,
+		fakeSchedulingProvider{sender: sender, addr: "me@example.com"})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	resp, err := http.Post(ts.URL+"/v1.0/me/events/evt-1/accept", "application/json", strings.NewReader("{}"))
+	if err != nil {
+		t.Fatalf("POST accept: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204", resp.StatusCode)
+	}
+	if sender.from == "" {
+		t.Error("omitted SendResponse did not send a reply — default:false regression")
 	}
 }

@@ -187,6 +187,11 @@ func Subset(full []byte, cfg Config) (*Result, error) {
 		"components": components,
 	}
 
+	// Microsoft Graph declares `default: false` on the SendResponse property of the
+	// meeting-response actions; ogen would apply it on decode, defeating the
+	// documented default of true. Strip it so an omitted field stays unset.
+	stripSendResponseDefault(subset)
+
 	data, err := yaml.Marshal(subset)
 	if err != nil {
 		return nil, fmt.Errorf("marshal subset: %w", err)
@@ -199,6 +204,31 @@ func Subset(full []byte, cfg Config) (*Result, error) {
 	res.RequestBodies = len(out["requestBodies"])
 	res.Paths = len(kept)
 	return res, nil
+}
+
+// stripSendResponseDefault recursively removes the `default` key from any schema
+// property named SendResponse. Microsoft Graph declares `default: false` on the
+// meeting-response actions (accept/decline/tentativelyAccept); ogen would emit a
+// setDefaults applying it on decode, so an omitted sendResponse would arrive as
+// false and the server would skip the reply — the opposite of Graph's documented
+// default (true). Stripping the default lets an omitted field stay unset, which
+// the handler treats as true.
+func stripSendResponseDefault(node any) {
+	switch n := node.(type) {
+	case map[string]any:
+		if props, ok := n["properties"].(map[string]any); ok {
+			if sr, ok := props["SendResponse"].(map[string]any); ok {
+				delete(sr, "default")
+			}
+		}
+		for _, v := range n {
+			stripSendResponseDefault(v)
+		}
+	case []any:
+		for _, v := range n {
+			stripSendResponseDefault(v)
+		}
+	}
 }
 
 // stripXMS flattens nullable-anyOf, removes x-ms-* keys, drops navigation

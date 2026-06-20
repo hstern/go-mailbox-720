@@ -71,9 +71,9 @@ func (p clientCalendarProvider) Calendar(context.Context) (calendar.Backend, err
 // INTERIM: only the "native" signal is faked (one injected OPTIONS header) —
 // everything else is real (handler, adapter, CalDAV PUT/GET). Replacing this with
 // a real RFC 6638 server (Stalwart, which advertises calendar-auto-schedule and
-// actually emits the reply) is tracked separately. The request sends an explicit
-// SendResponse:true because an omitted field currently decodes to false (a spec
-// default the handler can't override yet — also tracked separately).
+// actually emits the reply) is tracked separately. The request body is empty ({}),
+// so an omitted SendResponse must default to true (a regression guard for the
+// subsetter that strips Graph's spec-level default:false).
 func TestRadicaleNativeSchedulingGating(t *testing.T) {
 	if _, err := exec.LookPath("docker"); err != nil {
 		t.Skip("docker not available")
@@ -130,7 +130,7 @@ func TestRadicaleNativeSchedulingGating(t *testing.T) {
 	gateway := httptest.NewServer(graphSrv)
 	defer gateway.Close()
 
-	resp, err := http.Post(gateway.URL+"/v1.0/me/events/"+created.ID+"/accept", "application/json", bytes.NewReader([]byte(`{"SendResponse": true}`)))
+	resp, err := http.Post(gateway.URL+"/v1.0/me/events/"+created.ID+"/accept", "application/json", bytes.NewReader([]byte(`{}`)))
 	if err != nil {
 		t.Fatalf("POST accept: %v", err)
 	}
