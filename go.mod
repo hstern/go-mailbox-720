@@ -24,7 +24,8 @@ require (
 )
 
 require (
-	github.com/hstern/go-access-tokens v0.2.0
+	github.com/hstern/go-access-tokens v0.3.0
+	github.com/hstern/go-bearer-token v0.1.0
 	github.com/hstern/go-token-introspection v0.1.0
 )
 
