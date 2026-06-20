@@ -134,13 +134,19 @@ go run ./cmd/mailboxd \
 | `-cal-caldav-url` / `-cal-caldav-username` | CalDAV calendar backend (password via `MAILBOXD_CALDAV_PASSWORD`). |
 | `-contacts-carddav-url` / `-contacts-carddav-username` | CardDAV contacts backend (password via `MAILBOXD_CARDDAV_PASSWORD`). |
 
-JWT access tokens are validated locally against the issuer's JWKS. Opaque access
-tokens (e.g. Kanidm's default) are validated via RFC 7662 introspection when
-`-auth-introspect-client-id` is set; for introspected tokens the audience is
+JWT access tokens are validated locally: the JWS is verified against the issuer's
+JWKS (signature, the issuer's discovery-advertised algorithms, audience, expiry),
+then the verified claims are checked against the **RFC 9068** JWT-profile access
+token (`at+jwt`). RFC 9068 §2.2 requires `iss`, `sub`, `aud`, `exp`, `iat`, `jti`,
+and `client_id`, so a JWT lacking `jti` or `client_id` is rejected on this path —
+configure your IdP to issue RFC 9068 access tokens, or use the opaque path. Opaque
+access tokens (e.g. Kanidm's default) are validated via **RFC 7662** introspection
+when `-auth-introspect-client-id` is set; for introspected tokens the audience is
 enforced when the introspection response carries an `aud` (otherwise the resource
 server's own introspection credentials are the binding). The mailbox identity is
 an RFC 9493 `iss_sub` Subject Identifier (issuer + subject), so mailboxes stay
-distinct across multiple issuers.
+distinct across multiple issuers. (JWT validation uses `hstern/go-access-tokens`;
+introspection uses `hstern/go-token-introspection`.)
 
 With one or more issuers configured the server fails closed: it refuses to start
 if an issuer cannot be discovered, and rejects any request without a valid token.

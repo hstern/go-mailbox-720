@@ -6,18 +6,18 @@
 // Each configured issuer is discovered via .well-known/openid-configuration at
 // New time. Two token shapes are supported:
 //
-//   - JWT access tokens are validated locally: signature against the issuer's
-//     JWKS (fetched + cached + refreshed by go-oidc), issuer, audience, and
-//     expiry/not-before.
-//   - Opaque access tokens (e.g. Kanidm's default) are validated via RFC 7662
-//     token introspection against the issuer's introspection endpoint, using the
-//     resource server's own client credentials.
+//   - JWT access tokens: the JWS is verified against the issuer's JWKS (signature,
+//     algorithm pinning, issuer, audience, expiry) by go-oidc, then the verified
+//     payload is validated against the RFC 9068 "JWT Profile for OAuth 2.0 Access
+//     Tokens" claim set by go-access-tokens. RFC 9068 §2.2 requires iss, sub, aud,
+//     exp, iat, jti, and client_id — so a JWT lacking jti or client_id is rejected
+//     on this path. (Opaque tokens are unaffected.)
+//   - Opaque access tokens (e.g. Kanidm's default) are validated via RFC 7662 token
+//     introspection (go-token-introspection) against the issuer's introspection
+//     endpoint, using the resource server's own client credentials.
 //
 // Either way the middleware enforces the required scopes, maps a configurable
 // claim to the mailbox identity ("me"), and stashes it in the request context.
-//
-// Reusing Henry's go-oidc-federation / go-authzen is a future option; this is the
-// minimal resource-server validation built directly on coreos/go-oidc.
 package auth
 
 import (
@@ -25,12 +25,14 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
-	"net/url"
 	"strings"
 
 	"github.com/coreos/go-oidc/v3/oidc"
-	"github.com/hstern/go-subjectid"
+	accesstoken "github.com/hstern/go-access-tokens"
+	subjectid "github.com/hstern/go-subjectid"
+	introspection "github.com/hstern/go-token-introspection"
 
 	"github.com/hstern/go-mailbox-720/internal/grapherr"
 )
@@ -42,7 +44,7 @@ type Config struct {
 	// Audience is the expected token aud (the resource we represent). Empty skips
 	// the audience check (not recommended outside local testing).
 	Audience string
-	// RequiredScopes must all be present in the token's scp/scope or roles.
+	// RequiredScopes must all be present in the token's scope or roles.
 	RequiredScopes []string
 	// SubjectClaim names the claim mapped to the mailbox identity ("me"), e.g.
 	// "sub", "oid", or "preferred_username". Defaults to "sub".
@@ -61,10 +63,8 @@ type IntrospectionConfig struct {
 
 // Authenticator validates bearer tokens against the configured issuers.
 type Authenticator struct {
-	verifiers      map[string]*oidc.IDTokenVerifier // JWT validation, keyed by issuer
-	introspectURLs map[string]string                // RFC 7662 endpoints, keyed by issuer
-	introspect     *IntrospectionConfig
-	httpClient     *http.Client
+	verifiers      map[string]*oidc.IDTokenVerifier // JWS verification, keyed by issuer
+	introspectors  map[string]*introspection.Client // RFC 7662 clients, keyed by issuer
 	audience       string
 	requiredScopes []string
 	subjectClaim   string
@@ -82,9 +82,7 @@ func New(ctx context.Context, cfg Config) (*Authenticator, error) {
 	}
 	a := &Authenticator{
 		verifiers:      make(map[string]*oidc.IDTokenVerifier, len(cfg.Issuers)),
-		introspectURLs: make(map[string]string),
-		introspect:     cfg.Introspection,
-		httpClient:     http.DefaultClient,
+		introspectors:  make(map[string]*introspection.Client),
 		audience:       cfg.Audience,
 		requiredScopes: cfg.RequiredScopes,
 		subjectClaim:   subjectClaim,
@@ -103,14 +101,35 @@ func New(ctx context.Context, cfg Config) (*Authenticator, error) {
 				IntrospectionEndpoint string `json:"introspection_endpoint"`
 			}
 			if err := provider.Claims(&meta); err == nil && meta.IntrospectionEndpoint != "" {
-				a.introspectURLs[iss] = meta.IntrospectionEndpoint
+				a.introspectors[iss] = introspection.NewClient(meta.IntrospectionEndpoint,
+					introspection.WithBasicAuth(cfg.Introspection.ClientID, cfg.Introspection.ClientSecret),
+					introspection.WithHTTPClient(http.DefaultClient))
 			}
 		}
 	}
-	if cfg.Introspection != nil && len(a.introspectURLs) == 0 {
+	if cfg.Introspection != nil && len(a.introspectors) == 0 {
 		return nil, fmt.Errorf("auth: introspection configured but no issuer advertises introspection_endpoint")
 	}
 	return a, nil
+}
+
+// principal is the validated, backend-neutral result of either token path: the
+// issuer that vouched for the subject and the granted scopes. Both the JWT and the
+// introspection path produce one, so Middleware stays uniform.
+type principal struct {
+	issuer  string
+	subject string
+	scopes  map[string]struct{}
+}
+
+// hasScopes reports whether every required scope is present.
+func (p *principal) hasScopes(required []string) bool {
+	for _, r := range required {
+		if _, ok := p.scopes[r]; !ok {
+			return false
+		}
+	}
+	return true
 }
 
 // Middleware wraps next, rejecting any request without a valid bearer token.
@@ -121,19 +140,19 @@ func (a *Authenticator) Middleware(next http.Handler) http.Handler {
 			grapherr.Write(w, http.StatusUnauthorized)
 			return
 		}
-		claims, issuer, err := a.validate(r.Context(), raw)
+		p, err := a.validate(r.Context(), raw)
 		if err != nil {
 			grapherr.Write(w, http.StatusUnauthorized)
 			return
 		}
-		if !claims.hasScopes(a.requiredScopes) {
+		if !p.hasScopes(a.requiredScopes) {
 			grapherr.Write(w, http.StatusForbidden)
 			return
 		}
 		// The mailbox identity is the RFC 9493 (issuer, subject) pair: a bare
 		// subject is unique only within its issuer, so scoping it to the issuer
 		// keeps mailboxes distinct (and unspoofable) across multiple BYO IdPs.
-		mailbox := subjectid.IssSubID{Iss: issuer, Sub: claims.string(a.subjectClaim)}
+		mailbox := subjectid.IssSubID{Iss: p.issuer, Sub: p.subject}
 		if mailbox.Validate() != nil {
 			grapherr.Write(w, http.StatusUnauthorized)
 			return
@@ -142,77 +161,172 @@ func (a *Authenticator) Middleware(next http.Handler) http.Handler {
 	})
 }
 
-// validate resolves a bearer token to its claims. A JWT from a known issuer is
-// validated locally against that issuer's JWKS; anything else (an opaque token,
-// or a JWT whose issuer we only introspect) is validated via RFC 7662.
-func (a *Authenticator) validate(ctx context.Context, raw string) (claims claimSet, issuer string, err error) {
+// validate resolves a bearer token to a principal. A JWT from a known issuer is
+// validated locally against that issuer's JWKS + the RFC 9068 profile; anything
+// else (an opaque token, or a JWT whose issuer we only introspect) is validated
+// via RFC 7662.
+func (a *Authenticator) validate(ctx context.Context, raw string) (*principal, error) {
 	if looksLikeJWT(raw) {
 		if iss, err := unverifiedIssuer(raw); err == nil {
 			if verifier, ok := a.verifiers[iss]; ok {
-				tok, err := verifier.Verify(ctx, raw)
-				if err != nil {
-					return nil, "", err
-				}
-				var claims claimSet
-				if err := tok.Claims(&claims); err != nil {
-					return nil, "", err
-				}
-				return claims, iss, nil
+				return a.validateJWT(ctx, verifier, iss, raw)
 			}
 		}
 	}
-	if len(a.introspectURLs) > 0 {
+	if len(a.introspectors) > 0 {
 		return a.introspectToken(ctx, raw)
 	}
-	return nil, "", fmt.Errorf("auth: no validator for the presented token")
+	return nil, fmt.Errorf("auth: no validator for the presented token")
+}
+
+// validateJWT verifies the token's JWS — signature, the issuer's discovery-pinned
+// algorithms, issuer, audience, and expiry, via go-oidc — then validates the RFC
+// 9068 access-token claim profile (go-access-tokens) over the now-verified payload.
+// Keeping go-oidc for the crypto preserves algorithm pinning; go-access-tokens adds
+// the §2.2 required-claim and §4 checks an ID-token verifier does not make.
+func (a *Authenticator) validateJWT(ctx context.Context, verifier *oidc.IDTokenVerifier, iss, raw string) (*principal, error) {
+	if _, err := verifier.Verify(ctx, raw); err != nil {
+		return nil, err
+	}
+	// The signature is verified; decode the (now trusted) payload for the RFC 9068
+	// validator rather than re-running the crypto.
+	payload, err := jwtPayload(raw)
+	if err != nil {
+		return nil, err
+	}
+	claims, err := accesstoken.ParseClaims(payload)
+	if err != nil {
+		return nil, fmt.Errorf("auth: parse access token: %w", err)
+	}
+	opts := []accesstoken.Option{accesstoken.WithIssuer(iss)}
+	if a.audience != "" {
+		opts = append(opts, accesstoken.WithAudience(a.audience))
+	}
+	if err := claims.Validate(opts...); err != nil {
+		return nil, fmt.Errorf("auth: validate access token: %w", err)
+	}
+	return &principal{
+		issuer:  iss,
+		subject: subjectFromClaims(claims, a.subjectClaim),
+		scopes:  toSet(append(claims.ScopeValues(), claims.Roles...)),
+	}, nil
 }
 
 // introspectToken validates an opaque token against the configured introspection
-// endpoints, returning the claims and issuer of the first that reports it active.
-// Opaque tokens carry no readable issuer, so each endpoint is tried in turn.
-func (a *Authenticator) introspectToken(ctx context.Context, raw string) (claimSet, string, error) {
-	for iss, endpoint := range a.introspectURLs {
-		claims, err := introspect(ctx, a.httpClient, endpoint, a.introspect.ClientID, a.introspect.ClientSecret, raw)
+// endpoints, returning the principal of the first that reports it active and
+// audience-bound. Opaque tokens carry no readable issuer, so each is tried in turn.
+func (a *Authenticator) introspectToken(ctx context.Context, raw string) (*principal, error) {
+	for iss, client := range a.introspectors {
+		resp, err := client.Introspect(ctx, &introspection.Request{
+			Token:         raw,
+			TokenTypeHint: introspection.TokenTypeHintAccessToken,
+		})
 		if err != nil {
+			// A transport/auth failure at the endpoint is a misconfiguration, not a
+			// normal "inactive" answer — surface it (then try the next issuer).
+			log.Printf("auth: introspection at issuer %q failed: %v", iss, err)
 			continue
 		}
-		if active, _ := claims["active"].(bool); active && claims.audienceAllows(a.audience) {
-			return claims, iss, nil
+		if !resp.Active {
+			continue
 		}
+		if !audienceAllows(resp.Audience, a.audience) {
+			continue
+		}
+		return &principal{
+			issuer:  iss,
+			subject: subjectFromResponse(resp, a.subjectClaim),
+			scopes:  toSet(resp.Scopes()),
+		}, nil
 	}
-	return nil, "", fmt.Errorf("auth: token not active for this resource per introspection")
+	return nil, fmt.Errorf("auth: token not active for this resource per introspection")
 }
 
-// introspect performs an RFC 7662 introspection request, authenticating with the
-// resource server's client credentials.
-func introspect(ctx context.Context, client *http.Client, endpoint, clientID, clientSecret, token string) (claimSet, error) {
-	form := url.Values{"token": {token}, "token_type_hint": {"access_token"}}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(form.Encode()))
-	if err != nil {
-		return nil, err
+// subjectFromClaims extracts the configured mailbox-identity claim from a validated
+// RFC 9068 claim set: a typed field for the registered claims, else an extension
+// claim (oid, preferred_username, …) via GetExtra.
+func subjectFromClaims(c *accesstoken.Claims, claim string) string {
+	switch claim {
+	case "", "sub":
+		return c.Subject
+	case "client_id":
+		return c.ClientID
+	case "iss":
+		return c.Issuer
+	case "jti":
+		return c.JWTID
+	default:
+		var s string
+		if ok, _ := c.GetExtra(claim, &s); ok {
+			return s
+		}
+		return ""
 	}
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.Header.Set("Accept", "application/json")
-	req.SetBasicAuth(clientID, clientSecret)
+}
 
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, err
+// subjectFromResponse extracts the configured mailbox-identity claim from an RFC
+// 7662 introspection response, mirroring subjectFromClaims.
+func subjectFromResponse(r *introspection.Response, claim string) string {
+	switch claim {
+	case "", "sub":
+		return r.Subject
+	case "client_id":
+		return r.ClientID
+	case "iss":
+		return r.Issuer
+	case "username":
+		return r.Username
+	default:
+		var s string
+		if ok, _ := r.GetExtra(claim, &s); ok {
+			return s
+		}
+		return ""
 	}
-	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("introspection endpoint returned %s", resp.Status)
+}
+
+// audienceAllows reports whether an introspected token may be used here. An empty
+// want skips the check. A response that omits aud is gated only by the resource
+// server's own introspection credentials — some IdPs (e.g. Kanidm) omit aud and
+// refuse to introspect another client's token at all; a present aud must name this
+// resource server.
+func audienceAllows(aud introspection.Audience, want string) bool {
+	if want == "" || len(aud) == 0 {
+		return true
 	}
-	var claims claimSet
-	if err := json.NewDecoder(resp.Body).Decode(&claims); err != nil {
-		return nil, fmt.Errorf("decode introspection response: %w", err)
+	return aud.Contains(want)
+}
+
+// toSet collects non-empty strings into a set.
+func toSet(items []string) map[string]struct{} {
+	set := make(map[string]struct{}, len(items))
+	for _, s := range items {
+		if s != "" {
+			set[s] = struct{}{}
+		}
 	}
-	return claims, nil
+	return set
 }
 
 // looksLikeJWT reports whether raw has the three dot-separated segments of a JWS.
 func looksLikeJWT(raw string) bool {
 	return strings.Count(raw, ".") == 2
+}
+
+// jwtPayload returns the decoded JSON payload (the second segment) of a compact
+// JWS. It is only called after the signature has been verified, so the bytes are
+// trusted; it lets the RFC 9068 validator run on the verified payload without
+// re-doing signature crypto.
+func jwtPayload(raw string) ([]byte, error) {
+	parts := strings.Split(raw, ".")
+	if len(parts) != 3 {
+		return nil, fmt.Errorf("auth: malformed jwt")
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return nil, fmt.Errorf("auth: decode jwt payload: %w", err)
+	}
+	return payload, nil
 }
 
 // bearerToken extracts the token from an "Authorization: Bearer <token>" header.
@@ -248,89 +362,6 @@ func unverifiedIssuer(raw string) (string, error) {
 		return "", fmt.Errorf("jwt missing iss")
 	}
 	return claims.Iss, nil
-}
-
-// claimSet is the decoded token claims (from a JWT or an introspection response),
-// kept generic so the mailbox-identity claim can be configured.
-type claimSet map[string]any
-
-// scopes gathers the union of granted scopes from scp/scope (space-delimited
-// strings or arrays) and roles (arrays).
-func (c claimSet) scopes() map[string]struct{} {
-	set := map[string]struct{}{}
-	add := func(s string) {
-		if s != "" {
-			set[s] = struct{}{}
-		}
-	}
-	for _, key := range []string{"scp", "scope"} {
-		switch v := c[key].(type) {
-		case string:
-			for s := range strings.FieldsSeq(v) {
-				add(s)
-			}
-		case []any:
-			for _, s := range v {
-				if str, ok := s.(string); ok {
-					add(str)
-				}
-			}
-		}
-	}
-	if roles, ok := c["roles"].([]any); ok {
-		for _, s := range roles {
-			if str, ok := s.(string); ok {
-				add(str)
-			}
-		}
-	}
-	return set
-}
-
-// audienceAllows reports whether the token may be used for want. The JWT path
-// has the verifier enforce aud; for introspected tokens we check the response's
-// aud member when present (string or array). Some IdPs omit aud from the
-// introspection response; when it is absent the call is gated only by the
-// resource server's own introspection credentials, the best available binding.
-// (Kanidm, for one, both returns aud=client_id and refuses to introspect another
-// client's token at all, so this fallback does not apply to it.)
-func (c claimSet) audienceAllows(want string) bool {
-	if want == "" {
-		return true
-	}
-	switch v := c["aud"].(type) {
-	case string:
-		return v == want
-	case []any:
-		for _, a := range v {
-			if s, ok := a.(string); ok && s == want {
-				return true
-			}
-		}
-		return false
-	default:
-		return true // aud absent or unrecognized shape: cannot check here.
-	}
-}
-
-// hasScopes reports whether every required scope is present.
-func (c claimSet) hasScopes(required []string) bool {
-	if len(required) == 0 {
-		return true
-	}
-	have := c.scopes()
-	for _, r := range required {
-		if _, ok := have[r]; !ok {
-			return false
-		}
-	}
-	return true
-}
-
-// string returns claim key as a string, or "" if absent or not a string.
-func (c claimSet) string(key string) string {
-	s, _ := c[key].(string)
-	return s
 }
 
 type ctxKey struct{}

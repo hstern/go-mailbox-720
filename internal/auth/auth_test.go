@@ -121,10 +121,14 @@ func baseClaims(iss string) map[string]any {
 		"iss": iss,
 		"aud": testAud,
 		"sub": "user@example.com",
-		"scp": "Mail.Read",
-		"iat": now.Unix(),
-		"nbf": now.Add(-time.Minute).Unix(),
-		"exp": now.Add(time.Hour).Unix(),
+		// RFC 9068 §2.2 requires the access-token claim set, including jti and
+		// client_id; scope (not scp) carries the granted scopes.
+		"scope":     "Mail.Read",
+		"jti":       "jti-1",
+		"client_id": "test-client",
+		"iat":       now.Unix(),
+		"nbf":       now.Add(-time.Minute).Unix(),
+		"exp":       now.Add(time.Hour).Unix(),
 	}
 }
 
@@ -154,7 +158,7 @@ func TestMiddleware(t *testing.T) {
 		{"valid", func() string { return idp.sign(t, baseClaims(idp.issuer)) }, http.StatusOK, "user@example.com"},
 		{"scope via roles", func() string {
 			c := baseClaims(idp.issuer)
-			delete(c, "scp")
+			delete(c, "scope")
 			c["roles"] = []any{"Mail.Read", "other"}
 			return idp.sign(t, c)
 		}, http.StatusOK, "user@example.com"},
@@ -178,7 +182,7 @@ func TestMiddleware(t *testing.T) {
 		}, http.StatusUnauthorized, ""},
 		{"missing scope", func() string {
 			c := baseClaims(idp.issuer)
-			c["scp"] = "openid"
+			c["scope"] = "openid"
 			return idp.sign(t, c)
 		}, http.StatusForbidden, ""},
 	}
