@@ -28,17 +28,23 @@ func parseMessageFilter(raw api.OptString) (*odata.Filter, *api.ErrorStatusCode)
 }
 
 // badFilterResponse builds the Graph 400 response for an invalid $filter. It
-// uses the Graph "BadRequest" error code and carries the parse/validation
-// message through verbatim so a client sees why the filter was rejected (the
-// odata sentinels — malformed, unsupported operator/function, unknown field —
-// all map to the same 400).
+// carries the parse/validation message through verbatim so a client sees why the
+// filter was rejected (the odata sentinels — malformed, unsupported operator/
+// function, unknown field — all map to the same 400).
 func badFilterResponse(err error) *api.ErrorStatusCode {
+	return badRequest(err.Error())
+}
+
+// badRequest builds a Graph 400 (BadRequest) error response carrying message.
+// *ErrorStatusCode satisfies every operation's response interface, so handlers
+// return it directly to reject malformed input.
+func badRequest(message string) *api.ErrorStatusCode {
 	return &api.ErrorStatusCode{
 		StatusCode: http.StatusBadRequest,
 		Response: api.MicrosoftGraphODataErrorsODataError{
 			Error: api.MicrosoftGraphODataErrorsMainError{
 				Code:    "BadRequest",
-				Message: err.Error(),
+				Message: message,
 			},
 		},
 	}
