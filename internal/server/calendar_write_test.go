@@ -698,3 +698,131 @@ func TestMeUpdateEventsNativeSchedulerDoesNotReinvite(t *testing.T) {
 		t.Error("emailed a REQUEST even though the server schedules natively")
 	}
 }
+
+// backendWithEvent seeds a writable backend whose GetEvent resolves one event (for
+// the PATCH-scheduling tests that need a specific attendee roster).
+func backendWithEvent(ev calendar.Event) *writableCalendarBackend {
+	return &writableCalendarBackend{
+		fakeCalendarBackend: fakeCalendarBackend{
+			calendars: []calendar.Calendar{{ID: "cal-primary", Name: "Calendar"}},
+			events:    map[string][]calendar.Event{"cal-primary": {ev}},
+		},
+	}
+}
+
+func attendeeReq(emails ...string) []api.MicrosoftGraphAttendee {
+	out := make([]api.MicrosoftGraphAttendee, 0, len(emails))
+	for _, e := range emails {
+		out = append(out, api.MicrosoftGraphAttendee{
+			EmailAddress: api.NewOptMicrosoftGraphEmailAddress(api.MicrosoftGraphEmailAddress{Address: api.NewOptNilString(e)}),
+		})
+	}
+	return out
+}
+
+// A significant (start) change resets the recipients' PARTSTAT to notResponded —
+// a significant change requires them to respond afresh.
+func TestMeUpdateEventsSignificantChangeResetsPartStat(t *testing.T) {
+	ev := seededEvent
+	ev.Attendees = []calendar.Attendee{{Email: "bob@example.com", Status: "accepted"}}
+	backend := backendWithEvent(ev)
+	h := Handler{
+		calendar:   writableCalendarProvider{backend: backend},
+		scheduling: fakeSchedulingProvider{sender: &fakeSender{}, addr: "me@example.com"},
+	}
+
+	req := &api.MicrosoftGraphEvent{
+		Start: api.NewOptMicrosoftGraphDateTimeTimeZone(api.MicrosoftGraphDateTimeTimeZone{DateTime: api.NewOptString("2026-06-21T11:00:00.0000000")}),
+	}
+	if _, err := h.MeUpdateEvents(context.Background(), req, api.MeUpdateEventsParams{EventID: "evt-1"}); err != nil {
+		t.Fatalf("MeUpdateEvents: %v", err)
+	}
+	for _, a := range backend.updatedEvent.Attendees {
+		if a.Email == "bob@example.com" && a.Status != "notResponded" {
+			t.Errorf("Bob status after significant change = %q, want notResponded (reset)", a.Status)
+		}
+	}
+}
+
+// Removing an attendee via PATCH sends them a METHOD:CANCEL and bumps SEQUENCE,
+// without re-inviting the attendees who remain.
+func TestMeUpdateEventsAttendeeRemovedCancels(t *testing.T) {
+	ev := seededEvent
+	ev.Attendees = []calendar.Attendee{{Email: "bob@example.com"}, {Email: "carol@example.com"}}
+	backend := backendWithEvent(ev)
+	sender := &fakeSender{}
+	h := Handler{
+		calendar:   writableCalendarProvider{backend: backend},
+		scheduling: fakeSchedulingProvider{sender: sender, addr: "me@example.com"},
+	}
+
+	// PATCH keeps only Bob — Carol is dropped.
+	req := &api.MicrosoftGraphEvent{Attendees: attendeeReq("bob@example.com")}
+	if _, err := h.MeUpdateEvents(context.Background(), req, api.MeUpdateEventsParams{EventID: "evt-1"}); err != nil {
+		t.Fatalf("MeUpdateEvents: %v", err)
+	}
+	inv, err := scheduling.Parse(sender.raw)
+	if err != nil {
+		t.Fatalf("parse sent message: %v", err)
+	}
+	if inv.Method != scheduling.MethodCancel {
+		t.Errorf("sent method = %q, want CANCEL", inv.Method)
+	}
+	if len(sender.to) != 1 || sender.to[0] != "carol@example.com" {
+		t.Errorf("CANCEL to = %v, want [carol@example.com]", sender.to)
+	}
+	if backend.updatedEvent.Sequence != 1 {
+		t.Errorf("SEQUENCE = %d, want 1 (bumped)", backend.updatedEvent.Sequence)
+	}
+}
+
+// Adding an attendee re-sends a REQUEST (bumping SEQUENCE) but does NOT reset the
+// existing attendees' responses — an add is not a significant change.
+func TestMeUpdateEventsAttendeeAddedReinvitesWithoutReset(t *testing.T) {
+	ev := seededEvent
+	ev.Attendees = []calendar.Attendee{{Email: "bob@example.com", Status: "accepted"}}
+	backend := backendWithEvent(ev)
+	sender := &fakeSender{}
+	h := Handler{
+		calendar:   writableCalendarProvider{backend: backend},
+		scheduling: fakeSchedulingProvider{sender: sender, addr: "me@example.com"},
+	}
+
+	req := &api.MicrosoftGraphEvent{Attendees: attendeeReq("bob@example.com", "carol@example.com")}
+	if _, err := h.MeUpdateEvents(context.Background(), req, api.MeUpdateEventsParams{EventID: "evt-1"}); err != nil {
+		t.Fatalf("MeUpdateEvents: %v", err)
+	}
+	inv, err := scheduling.Parse(sender.raw)
+	if err != nil {
+		t.Fatalf("parse sent message: %v", err)
+	}
+	if inv.Method != scheduling.MethodRequest {
+		t.Errorf("sent method = %q, want REQUEST", inv.Method)
+	}
+	if backend.updatedEvent.Sequence != 1 {
+		t.Errorf("SEQUENCE = %d, want 1 (bumped)", backend.updatedEvent.Sequence)
+	}
+	for _, a := range backend.updatedEvent.Attendees {
+		if a.Email == "bob@example.com" && a.Status != "accepted" {
+			t.Errorf("Bob status after an attendee-add = %q, want accepted (not reset)", a.Status)
+		}
+	}
+}
+
+// A PATCH that restates a retained attendee WITH an explicit response must still
+// preserve that attendee's stored SCHEDULE-STATUS (which has no Graph field, so the
+// patch can never carry it) — guarding the mergeAttendees fix.
+func TestMergeAttendeesPreservesScheduleStatusWithExplicitStatus(t *testing.T) {
+	current := []calendar.Attendee{{Email: "bob@example.com", Status: "notResponded", ScheduleStatus: "1.1"}}
+	patched := []calendar.Attendee{{Email: "bob@example.com", Status: "accepted"}} // explicit response, no ScheduleStatus
+	got := mergeAttendees(current, patched)
+	if len(got) != 1 {
+		t.Fatalf("merged attendees = %d, want 1", len(got))
+	}
+	if got[0].Status != "accepted" {
+		t.Errorf("Status = %q, want accepted (the patch's explicit value)", got[0].Status)
+	}
+	if got[0].ScheduleStatus != "1.1" {
+		t.Errorf("ScheduleStatus = %q, want 1.1 (carried forward despite explicit Status)", got[0].ScheduleStatus)
+	}
+}
