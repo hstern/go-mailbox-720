@@ -12,7 +12,6 @@ import (
 	"context"
 	"fmt"
 	"net/http"
-	"net/url"
 	"strings"
 	"time"
 
@@ -32,16 +31,8 @@ type Options struct {
 
 // Client is a CalDAV-backed calendar.Backend over a single authenticated
 // principal.
-//
-// http and endpoint mirror the connection that gocaldav.Client wraps, but are
-// held here too so the delta path can issue a raw sync-collection REPORT
-// (RFC 6578): go-webdav v0.7.0's caldav Client exposes no SyncCollection method
-// and keeps its internal HTTP client unexported, so the adapter performs that
-// one request itself against the same authenticated transport and base URL.
 type Client struct {
-	c        *gocaldav.Client
-	http     webdav.HTTPClient
-	endpoint *url.URL
+	c *gocaldav.Client
 }
 
 var _ calendar.Backend = (*Client)(nil)
@@ -63,14 +54,7 @@ func Dial(endpoint, username, password string, o *Options) (*Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("caldav: new client for %s: %w", endpoint, err)
 	}
-	u, err := url.Parse(endpoint)
-	if err != nil {
-		return nil, fmt.Errorf("caldav: parse endpoint %s: %w", endpoint, err)
-	}
-	if u.Path == "" {
-		u.Path = "/" // mirror internal.NewClient, so path.Join stays well-formed
-	}
-	return &Client{c: c, http: httpClient, endpoint: u}, nil
+	return &Client{c: c}, nil
 }
 
 // Close releases the backend. The CalDAV client holds no persistent connection
