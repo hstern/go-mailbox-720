@@ -114,7 +114,7 @@ jobs:
           cache: true
 
       - name: IMAP adapter integration (Dovecot)
-        run: go test -tags dockertest -timeout 180s -run TestDovecotIntegration ./internal/mail/imap/
+        run: go test -tags dockertest -timeout 240s -run "TestDovecot" ./internal/mail/imap/
 
   caldav-e2e:
     # Runs the CalDAV adapter against a real Radicale server in Docker (build tag
@@ -132,5 +132,5 @@ jobs:
           cache: true
 
       - name: CalDAV adapter integration (Radicale)
-        run: go test -tags dockertest -timeout 180s -run TestRadicaleIntegration ./internal/calendar/caldav/
+        run: go test -tags dockertest -timeout 240s -run "TestRadicale" ./internal/calendar/caldav/
 
