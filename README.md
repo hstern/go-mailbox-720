@@ -34,8 +34,8 @@ with. This project is not affiliated with or endorsed by Microsoft.
 | Area | Operations |
 | --- | --- |
 | Mail (IMAP) | `GET /me/messages` (with `$filter` → IMAP SEARCH), `GET /me/mailFolders`, `GET /me/messages/{id}`, `PATCH` (isRead) + `DELETE`, `GET /me/messages/delta` (incremental sync) |
-| Calendar (CalDAV) | `GET /me/events`, `GET /me/calendars`, `POST` / `PATCH` / `DELETE /me/events` |
-| Contacts (CardDAV) | `GET /me/contacts`, `POST` / `PATCH` / `DELETE /me/contacts` |
+| Calendar (CalDAV) | `GET /me/events`, `GET /me/calendars`, `POST` / `PATCH` / `DELETE /me/events`, `GET /me/events/delta`, `POST /me/events/{id}/accept` / `decline` / `tentativelyAccept` (iMIP reply) |
+| Contacts (CardDAV) | `GET /me/contacts`, `POST` / `PATCH` / `DELETE /me/contacts`, `GET /me/contacts/delta` |
 | Protocol | `POST /$batch` (JSON batching), `POST` / `GET` / `DELETE /v1.0/subscriptions` (change notifications, with IMAP-IDLE-driven delivery) |
 | Auth | JWT (JWKS) + opaque-token (RFC 7662 introspection) validation, RFC 9493 subject identity |
 
@@ -48,14 +48,22 @@ flags, so they stay out of the process table.
 
 Built but not yet fully wired, or deliberately first-cut:
 
-- **iTIP/iMIP scheduling** (`internal/scheduling`, `internal/itip`, `internal/smtp`):
-  the full engine — parse, reply, request/cancel, iMIP email composition, and the
-  orchestration core (inbound REQUEST → tentative event; accept/decline → emailed
-  reply) — plus an SMTP send port. The inbound-mail trigger loop and the RFC 6638
-  capability switch are not yet wired.
-- **Delta**: mail delta is additive (new messages); deletions/flag changes await
-  CONDSTORE/QRESYNC. Calendar/contacts delta operations are generated but return
-  501 pending CalDAV/CardDAV sync-token (RFC 6578) wiring.
+- **iTIP/iMIP scheduling** (`internal/scheduling`, `internal/itip`, `internal/smtp`,
+  `internal/schedrun`): the full engine (parse, reply, request/cancel, iMIP email
+  composition) plus both directions wired — `POST /me/events/{id}/accept|decline|
+  tentativelyAccept` email an iMIP reply to the organizer (needs `-smtp-addr` +
+  `-mailbox-email`), and an opt-in inbound trigger loop (`-enable-scheduling`) turns
+  REQUEST mail into tentative calendar events. Still open: the RFC 6638 capability
+  switch (run only when the CalDAV server doesn't schedule natively) and updating a
+  stored event's `responseStatus` on accept/decline.
+- **Delta**: all three delta endpoints (`/me/messages`, `/me/events`,
+  `/me/contacts`) report created/updated items **and** `@removed` tombstones for
+  deletions. Mail uses IMAP **CONDSTORE/QRESYNC** (RFC 7162) — `CHANGEDSINCE` for
+  new + flag/read-state changes, `VANISHED` for expungements — and **requires a
+  QRESYNC-capable server** (it returns 501 otherwise, rather than silently
+  degrading). Calendar/contacts use CalDAV/CardDAV **sync-collection** (RFC 6578).
+  Mail delta consumes QRESYNC client support from a go-imap fork via a `go.mod`
+  replace, pending upstream [emersion/go-imap#757](https://github.com/emersion/go-imap/pull/757).
 - **Subscriptions**: single-tenant in-memory store (per-identity keying is a
   prerequisite before multi-mailbox use); notification delivery is created-only.
 - **Update PATCH** of events/contacts merges provided fields; partial collection

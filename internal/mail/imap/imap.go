@@ -2,10 +2,10 @@
 // emersion/go-imap (v2) for the protocol and emersion/go-message for MIME
 // parsing. A Client is bound to one authenticated IMAP session.
 //
-// First cut: the read paths (folders, message listing, single-message fetch with
-// body). Deferred to their own issues: IDLE→push (MB720-9), CONDSTORE/QRESYNC
-// delta tokens (MB720-8), $filter execution (MB720-6), SMTP submission, and
-// connection pooling.
+// The adapter covers folders, message listing/fetch, $filter→IMAP SEARCH, read-
+// state + delete writes, an IDLE watcher, raw-message fetch, and CONDSTORE/QRESYNC
+// delta (changes via CHANGEDSINCE, deletions via VANISHED). Connection pooling is
+// still deferred (each request dials its own session).
 package imap
 
 import (
