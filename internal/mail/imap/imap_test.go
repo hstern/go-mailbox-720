@@ -584,6 +584,63 @@ func TestDeltaUIDValidityReset(t *testing.T) {
 	}
 }
 
+// TestWatch verifies the IDLE watcher against the in-process imapmemserver,
+// whose mailbox tracker delivers cross-session EXISTS notifications: a watcher
+// idling on INBOX must see onChange fire when a second session APPENDs, and
+// Watch must return promptly once ctx is cancelled.
+//
+// The append runs on a SEPARATE Client/connection because IDLE monopolizes the
+// watcher's own session — exactly the dedicated-connection discipline the
+// mail.Watcher doc calls for.
+func TestWatch(t *testing.T) {
+	addr := newMemoryIMAP(t)
+
+	watcher, err := Dial(addr, testUser, testPass, &Options{TLS: false})
+	if err != nil {
+		t.Fatalf("Dial (watcher): %v", err)
+	}
+	t.Cleanup(func() { _ = watcher.Close() })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	changed := make(chan struct{}, 8)
+	done := make(chan error, 1)
+	go func() {
+		done <- watcher.Watch(ctx, folderID("INBOX"), func() { changed <- struct{}{} })
+	}()
+
+	// Give the watcher a moment to SELECT and enter IDLE before the append, so
+	// the arrival is delivered as a live unilateral EXISTS rather than missed.
+	time.Sleep(200 * time.Millisecond)
+
+	appender, err := Dial(addr, testUser, testPass, &Options{TLS: false})
+	if err != nil {
+		t.Fatalf("Dial (appender): %v", err)
+	}
+	t.Cleanup(func() { _ = appender.Close() })
+	appender.appendRaw(t, "INBOX", testRawMessage)
+
+	select {
+	case <-changed:
+		// onChange fired as expected.
+	case <-time.After(5 * time.Second):
+		t.Fatal("Watch did not fire onChange within 5s of an APPEND")
+	}
+
+	// Cancelling ctx must make Watch return (nil — cancellation is the normal
+	// stop) promptly.
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("Watch returned %v, want nil on ctx cancel", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Watch did not return within 5s of ctx cancel")
+	}
+}
+
 func equalStrings(a, b []string) bool {
 	if len(a) != len(b) {
 		return false

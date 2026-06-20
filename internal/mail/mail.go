@@ -139,3 +139,33 @@ type DeltaReader interface {
 	// IMAP CONDSTORE/QRESYNC and is future work (note this in the doc).
 	Delta(ctx context.Context, folderID string, token string) (msgs []Message, next string, err error)
 }
+
+// Watcher is the optional change-watch capability: block on a folder and signal
+// whenever it changes (a message arrives or is removed). It is the primitive the
+// change-notification delivery loop (subscriptions, MB720-9) and the scheduling
+// trigger (MB720-10) build on. Like Writer and DeltaReader it is kept separate
+// from Backend so that an adapter without watch support, and the server's
+// read-path fakes, need not implement it, and so adding it does not disturb
+// Backend's existing implementers. An adapter that supports watching implements
+// Watcher in addition to Backend; consumers type-assert for it:
+//
+//	if wch, ok := backend.(mail.Watcher); ok {
+//		err := wch.Watch(ctx, folderID, func() { resync() })
+//	}
+//
+// A Watcher is bound to the same authenticated mailbox identity as its Backend.
+//
+// In the IMAP adapter Watch is implemented with IDLE, which monopolizes the
+// connection: while a Watch is running no other command can be sent on that
+// session. A Watcher should therefore own a dedicated Backend/connection rather
+// than sharing one with the read/write paths.
+type Watcher interface {
+	// Watch blocks until ctx is cancelled (or an error occurs), invoking
+	// onChange each time the folder changes (a message arrives or is removed).
+	// onChange is a coalesced signal, NOT a description of what changed — the
+	// caller re-syncs (e.g. via DeltaReader) to discover specifics. An empty
+	// folderID watches the inbox. onChange may fire once more concurrently with,
+	// or just after, Watch returns, so a caller must not free state onChange
+	// captures until it is sure no such call is in flight.
+	Watch(ctx context.Context, folderID string, onChange func()) error
+}

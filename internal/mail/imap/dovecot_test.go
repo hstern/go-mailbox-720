@@ -188,6 +188,55 @@ func TestDovecotDelta(t *testing.T) {
 	}
 }
 
+// TestDovecotIdle exercises the IDLE watcher against a real Dovecot server,
+// which supports IDLE natively: a watcher idling on INBOX must see onChange fire
+// when a message is appended, and Watch must return nil once ctx is cancelled.
+// The append uses a fresh session (appendToINBOX dials its own connection),
+// since IDLE monopolizes the watcher's session.
+func TestDovecotIdle(t *testing.T) {
+	if _, err := exec.LookPath("docker"); err != nil {
+		t.Skip("docker not available")
+	}
+	addr := startDovecot(t)
+
+	watcher, err := Dial(addr, dovecotUser, dovecotPass, &Options{TLS: false})
+	if err != nil {
+		t.Fatalf("Dial (watcher): %v", err)
+	}
+	defer func() { _ = watcher.Close() }()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	changed := make(chan struct{}, 8)
+	done := make(chan error, 1)
+	go func() {
+		done <- watcher.Watch(ctx, folderID("INBOX"), func() { changed <- struct{}{} })
+	}()
+
+	// Let the watcher SELECT and enter IDLE before the append so the arrival is
+	// delivered live.
+	time.Sleep(500 * time.Millisecond)
+	appendToINBOX(t, addr, testRawMessage)
+
+	select {
+	case <-changed:
+		// onChange fired.
+	case <-time.After(10 * time.Second):
+		t.Fatal("Watch did not fire onChange within 10s of an APPEND")
+	}
+
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("Watch returned %v, want nil on ctx cancel", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Watch did not return within 10s of ctx cancel")
+	}
+}
+
 func subjectOrEmpty(msgs []mail.Message) string {
 	if len(msgs) == 0 {
 		return ""

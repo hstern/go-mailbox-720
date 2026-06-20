@@ -16,6 +16,7 @@ import (
 	"io"
 	"slices"
 	"strings"
+	"sync"
 
 	goimap "github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/imapclient"
@@ -36,6 +37,14 @@ type Options struct {
 // Client is an IMAP-backed mail.Backend over a single authenticated session.
 type Client struct {
 	c *imapclient.Client
+
+	// mu guards onUnilateral, the watch callback the IDLE goroutine fires.
+	// go-imap invokes the UnilateralDataHandler (installed at Dial time) from
+	// an arbitrary goroutine, while Watch sets and clears onUnilateral; the
+	// mutex makes that handoff race-free. A nil callback is a no-op, so the
+	// handler is harmless outside a Watch.
+	mu           sync.Mutex
+	onUnilateral func()
 }
 
 var _ mail.Backend = (*Client)(nil)
@@ -45,14 +54,31 @@ func Dial(addr, username, password string, o *Options) (*Client, error) {
 	if o == nil {
 		o = &Options{TLS: true}
 	}
+	cl := &Client{}
+	// Install a unilateral-data handler at dial time (the only place go-imap
+	// accepts one). It forwards EXISTS/EXPUNGE notifications to whatever callback
+	// Watch has registered, guarded by cl.mu; with no Watch active the callback is
+	// nil and the handler does nothing, leaving the read/write paths unchanged.
+	opts := &imapclient.Options{
+		UnilateralDataHandler: &imapclient.UnilateralDataHandler{
+			// Mailbox carries a NumMessages change on EXISTS (new mail).
+			Mailbox: func(data *imapclient.UnilateralDataMailbox) {
+				if data != nil && data.NumMessages != nil {
+					cl.fireUnilateral()
+				}
+			},
+			// Expunge fires when a message is removed.
+			Expunge: func(uint32) { cl.fireUnilateral() },
+		},
+	}
 	var (
 		c   *imapclient.Client
 		err error
 	)
 	if o.TLS {
-		c, err = imapclient.DialTLS(addr, nil)
+		c, err = imapclient.DialTLS(addr, opts)
 	} else {
-		c, err = imapclient.DialInsecure(addr, nil)
+		c, err = imapclient.DialInsecure(addr, opts)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("imap: dial %s: %w", addr, err)
@@ -61,7 +87,27 @@ func Dial(addr, username, password string, o *Options) (*Client, error) {
 		_ = c.Close()
 		return nil, fmt.Errorf("imap: login: %w", err)
 	}
-	return &Client{c: c}, nil
+	cl.c = c
+	return cl, nil
+}
+
+// fireUnilateral invokes the currently-registered watch callback, if any. It is
+// called from go-imap's unilateral-data goroutine; the mutex serializes it with
+// Watch installing and clearing the callback.
+func (cl *Client) fireUnilateral() {
+	cl.mu.Lock()
+	cb := cl.onUnilateral
+	cl.mu.Unlock()
+	if cb != nil {
+		cb()
+	}
+}
+
+// setUnilateral registers (or with nil clears) the watch callback.
+func (cl *Client) setUnilateral(cb func()) {
+	cl.mu.Lock()
+	cl.onUnilateral = cb
+	cl.mu.Unlock()
 }
 
 // Close logs out and closes the connection.
