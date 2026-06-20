@@ -137,6 +137,47 @@ func TestDovecotIntegration(t *testing.T) {
 	}
 }
 
+func TestDovecotRawMessage(t *testing.T) {
+	if _, err := exec.LookPath("docker"); err != nil {
+		t.Skip("docker not available")
+	}
+	addr := startDovecot(t)
+	appendToINBOX(t, addr, testRawMessage)
+
+	cl, err := Dial(addr, dovecotUser, dovecotPass, &Options{TLS: false})
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	defer func() { _ = cl.Close() }()
+	ctx := context.Background()
+
+	msgs, err := cl.ListMessages(ctx, folderID("INBOX"), mail.Page{}, nil)
+	if err != nil || len(msgs) != 1 {
+		t.Fatalf("ListMessages: %v (n=%d)", err, len(msgs))
+	}
+
+	raw, err := cl.RawMessage(ctx, msgs[0].ID)
+	if err != nil {
+		t.Fatalf("RawMessage: %v", err)
+	}
+	got := string(raw)
+	if !strings.Contains(got, "Subject: Hello there") {
+		t.Errorf("raw message missing Subject header; got %q", got)
+	}
+	if !strings.Contains(got, "This is the body of the message.") {
+		t.Errorf("raw message missing body; got %q", got)
+	}
+
+	// Peek validation against a real server: RawMessage must not set \Seen.
+	after, err := cl.ListMessages(ctx, folderID("INBOX"), mail.Page{}, nil)
+	if err != nil {
+		t.Fatalf("ListMessages (post-raw): %v", err)
+	}
+	if len(after) == 1 && after[0].IsRead {
+		t.Error("RawMessage marked the message read — BODY[] fetch is missing PEEK")
+	}
+}
+
 func TestDovecotDelta(t *testing.T) {
 	if _, err := exec.LookPath("docker"); err != nil {
 		t.Skip("docker not available")

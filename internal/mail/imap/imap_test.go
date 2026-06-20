@@ -180,6 +180,51 @@ func TestGetMessageStaleID(t *testing.T) {
 	}
 }
 
+func TestRawMessage(t *testing.T) {
+	cl := dialTest(t)
+	ctx := context.Background()
+
+	msgs, err := cl.ListMessages(ctx, folderID("INBOX"), mail.Page{}, nil)
+	if err != nil || len(msgs) != 1 {
+		t.Fatalf("ListMessages: %v (n=%d)", err, len(msgs))
+	}
+	if msgs[0].IsRead {
+		t.Fatal("freshly appended message is read")
+	}
+
+	raw, err := cl.RawMessage(ctx, msgs[0].ID)
+	if err != nil {
+		t.Fatalf("RawMessage: %v", err)
+	}
+	// The raw bytes are the full RFC822 message: headers (the Subject line) plus
+	// the body fragment.
+	got := string(raw)
+	if !strings.Contains(got, "Subject: Hello there") {
+		t.Errorf("raw message missing Subject header; got %q", got)
+	}
+	if !strings.Contains(got, "This is the body of the message.") {
+		t.Errorf("raw message missing body; got %q", got)
+	}
+
+	// PEEK discipline: reading the raw message must not have set \Seen.
+	after, err := cl.ListMessages(ctx, folderID("INBOX"), mail.Page{}, nil)
+	if err != nil || len(after) != 1 {
+		t.Fatalf("ListMessages (post-raw): %v (n=%d)", err, len(after))
+	}
+	if after[0].IsRead {
+		t.Error("RawMessage marked the message read — BODY[] fetch is missing PEEK")
+	}
+}
+
+func TestRawMessageStaleID(t *testing.T) {
+	cl := dialTest(t)
+	// Same mailbox + uid but a wrong UIDVALIDITY must be rejected, not mis-served.
+	stale := messageID("INBOX", 999999, 1)
+	if _, err := cl.RawMessage(context.Background(), stale); err == nil {
+		t.Error("RawMessage with stale UIDVALIDITY = nil error, want error")
+	}
+}
+
 func TestSetRead(t *testing.T) {
 	cl := dialTest(t)
 	ctx := context.Background()

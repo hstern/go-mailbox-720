@@ -140,6 +140,28 @@ type DeltaReader interface {
 	Delta(ctx context.Context, folderID string, token string) (msgs []Message, next string, err error)
 }
 
+// RawReader is the optional raw-message capability: fetch the full, unparsed
+// RFC822 bytes of a message by its opaque id. It is kept separate from Backend
+// (like Writer, DeltaReader, and Watcher) so that an adapter without raw access,
+// and the server's read-path fakes, need not implement it, and so adding it does
+// not disturb Backend's existing implementers. An adapter that supports raw reads
+// implements RawReader in addition to Backend; consumers type-assert for it:
+//
+//	if r, ok := backend.(mail.RawReader); ok {
+//		raw, err := r.RawMessage(ctx, id)
+//	}
+//
+// It is the primitive the iTIP/iMIP scheduling trigger (MB720-10) builds on:
+// finding a message's text/calendar part requires the whole MIME message, which
+// Backend.GetMessage's parsed body does not expose. A RawReader is bound to the
+// same authenticated mailbox identity as its Backend.
+type RawReader interface {
+	// RawMessage returns the full RFC822 bytes of the message with the given
+	// opaque id, without marking it read. The bytes are the wire form a MIME
+	// parser (e.g. the scheduling engine) can consume directly.
+	RawMessage(ctx context.Context, id string) ([]byte, error)
+}
+
 // Watcher is the optional change-watch capability: block on a folder and signal
 // whenever it changes (a message arrives or is removed). It is the primitive the
 // change-notification delivery loop (subscriptions, MB720-9) and the scheduling
