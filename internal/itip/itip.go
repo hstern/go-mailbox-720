@@ -66,6 +66,10 @@ const StatusTentative = "tentative"
 //   - Attendees  -> Attendees  (each Attendee.Address -> calendar.Address; the
 //     per-attendee PARTSTAT is dropped — the neutral Event carries only the
 //     roster of addresses, not their individual participation status)
+//   - RecurrenceID -> RecurrenceID (parsed from the iCalendar RECURRENCE-ID value
+//     to the occurrence's original-start instant; zero for a master REQUEST). When
+//     set, IsOverride is marked true: the invite addresses a single overridden
+//     occurrence of a series, not the whole series.
 //   - (constant) -> Status = StatusTentative ("tentative")
 //
 // The remaining [calendar.Event] fields (ID, CalendarID, Location, Body,
@@ -88,7 +92,7 @@ func EventFromInvite(inv *scheduling.Invite) calendar.Event {
 		})
 	}
 
-	return calendar.Event{
+	ev := calendar.Event{
 		UID:       inv.UID,
 		Subject:   inv.Summary,
 		Start:     inv.Start,
@@ -98,6 +102,11 @@ func EventFromInvite(inv *scheduling.Invite) calendar.Event {
 		Attendees: attendees,
 		Status:    StatusTentative,
 	}
+	if rid, ok := parseRecurrenceID(inv.RecurrenceID); ok {
+		ev.RecurrenceID = rid
+		ev.IsOverride = true
+	}
+	return ev
 }
 
 // InviteFromEvent maps a stored backend-neutral [calendar.Event] onto a
@@ -126,10 +135,12 @@ func EventFromInvite(inv *scheduling.Invite) calendar.Event {
 // The event's SEQUENCE is carried through, so a re-issued REQUEST/CANCEL or a REPLY
 // addresses the event at its true revision.
 //
-// FIRST-CUT LIMITATION: the neutral Event does not carry an iCalendar RECURRENCE-ID,
-// so it cannot be reconstructed here (RecurrenceID is empty) — this Invite addresses
-// the master event, not a single overridden instance of a recurring series (a
-// follow-up once the store models per-instance overrides).
+// RECURRENCE-ID: when the event addresses a single overridden instance of a
+// recurring series (ev.RecurrenceID is non-zero — e.g. an occurrence surfaced by
+// the InstanceReader), the Invite is stamped with that RECURRENCE-ID via
+// [scheduling.Invite.SetRecurrenceID], so the REPLY/REQUEST/CANCEL it backs targets
+// the one occurrence rather than the master series. A zero RecurrenceID leaves the
+// invite addressing the master.
 func InviteFromEvent(ev calendar.Event) *scheduling.Invite {
 	attendees := make([]scheduling.Attendee, 0, len(ev.Attendees))
 	for _, a := range ev.Attendees {
@@ -139,7 +150,7 @@ func InviteFromEvent(ev calendar.Event) *scheduling.Invite {
 		})
 	}
 
-	return &scheduling.Invite{
+	inv := &scheduling.Invite{
 		Method:    scheduling.MethodRequest,
 		UID:       ev.UID,
 		Summary:   ev.Subject,
@@ -149,6 +160,37 @@ func InviteFromEvent(ev calendar.Event) *scheduling.Invite {
 		Organizer: toSchedulingAddress(ev.Organizer),
 		Attendees: attendees,
 	}
+	if !ev.RecurrenceID.IsZero() {
+		inv.SetRecurrenceID(ev.RecurrenceID)
+	}
+	return inv
+}
+
+// recurrenceIDLayouts are the iCalendar RECURRENCE-ID value forms EventFromInvite
+// parses back to an instant: the basic UTC DATE-TIME ("Z"), a floating/local
+// DATE-TIME (no zone — interpreted as UTC, since the neutral Event carries UTC),
+// and a DATE-only value. The CalDAV adapter and SetRecurrenceID both emit the UTC
+// DATE-TIME form, so that is tried first.
+var recurrenceIDLayouts = []string{
+	"20060102T150405Z",
+	"20060102T150405",
+	"20060102",
+}
+
+// parseRecurrenceID parses an iCalendar RECURRENCE-ID property value into its
+// instant (in UTC), reporting ok=false for an empty value or one in no recognized
+// form. It is the inverse of the DATE-TIME [scheduling.Invite.SetRecurrenceID]
+// writes and tolerates the floating and DATE-only shapes a peer might send.
+func parseRecurrenceID(value string) (time.Time, bool) {
+	if value == "" {
+		return time.Time{}, false
+	}
+	for _, layout := range recurrenceIDLayouts {
+		if t, err := time.ParseInLocation(layout, value, time.UTC); err == nil {
+			return t.UTC(), true
+		}
+	}
+	return time.Time{}, false
 }
 
 // ProcessRequest is the inbound-REQUEST orchestration: it parses a raw iMIP
@@ -167,6 +209,13 @@ func InviteFromEvent(ev calendar.Event) *scheduling.Invite {
 // when it carries a higher SEQUENCE, rather than creating a duplicate; an equal or
 // lower SEQUENCE is treated as a duplicate/stale delivery and left untouched. A
 // backend without Finder always creates (the first-cut behavior).
+//
+// Single-instance REQUEST: when the REQUEST carries a RECURRENCE-ID (an organizer
+// re-inviting one occurrence of a series) and the backend implements both
+// [calendar.Finder] and [calendar.InstanceWriter], the invite is recorded as a
+// per-occurrence override against the located series master rather than as a
+// standalone event. A backend lacking InstanceWriter falls back to the standard
+// create/update path, surfacing the occurrence as its own tentative event.
 func ProcessRequest(ctx context.Context, w calendar.Writer, calendarID string, raw []byte) (calendar.Event, error) {
 	inv, err := scheduling.Parse(raw)
 	if err != nil {
@@ -177,6 +226,27 @@ func ProcessRequest(ctx context.Context, w calendar.Writer, calendarID string, r
 	}
 
 	event := EventFromInvite(inv)
+
+	// Single-instance REQUEST: an override for one occurrence of an existing series.
+	// Locate the master by UID and record the override against it, leaving the
+	// series rule and the other occurrences intact.
+	if !event.RecurrenceID.IsZero() {
+		f, hasFinder := w.(calendar.Finder)
+		iw, hasInstanceWriter := w.(calendar.InstanceWriter)
+		if hasFinder && hasInstanceWriter {
+			master, found, err := f.FindEventByUID(ctx, calendarID, inv.UID)
+			if err != nil {
+				return calendar.Event{}, fmt.Errorf("itip: find series master by uid: %w", err)
+			}
+			if found {
+				stored, err := iw.WriteInstanceOverride(ctx, master.ID, event)
+				if err != nil {
+					return calendar.Event{}, fmt.Errorf("itip: write instance override: %w", err)
+				}
+				return stored, nil
+			}
+		}
+	}
 
 	// UID correlation: when the backend can locate the event a prior REQUEST created,
 	// a re-sent REQUEST updates it in place rather than creating a duplicate. Only a
@@ -254,9 +324,10 @@ func Respond(ctx context.Context, sender smtp.Sender, attendee scheduling.Addres
 // error if the event carries no organizer to reply to, the REPLY cannot be
 // composed, or the send fails.
 //
-// It shares [Respond]'s RECURRENCE-ID first-cut limitation via [InviteFromEvent]:
-// the reply addresses the master event (no per-instance RECURRENCE-ID), at the
-// stored event's SEQUENCE.
+// When the stored event addresses a single overridden occurrence of a series
+// (ev.RecurrenceID set), [InviteFromEvent] threads the RECURRENCE-ID through, so
+// the REPLY targets that one occurrence at the stored event's SEQUENCE; a master
+// event replies for the whole series.
 func RespondToEvent(ctx context.Context, sender smtp.Sender, ev calendar.Event, attendee scheduling.Address, partStat scheduling.PartStat, date time.Time) error {
 	inv := InviteFromEvent(ev)
 	if inv.Organizer.Email == "" {

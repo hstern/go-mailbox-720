@@ -378,6 +378,29 @@ func newScheduling(method Method, uid string, sequence int) (*ical.Calendar, *ic
 	return cal, ev
 }
 
+// SetRecurrenceID stamps the invite to address a single overridden instance of a
+// recurring series at the given original-occurrence instant (the RECURRENCE-ID).
+// It sets both RecurrenceID (the raw value, for correlation) and the preserved
+// property [Reply]/[Request]/[Cancel] echo, building the latter as a UTC
+// DATE-TIME so the generated VEVENT carries a well-typed RECURRENCE-ID. A zero t
+// clears the instance marker, returning the invite to addressing the master.
+//
+// It is the constructor counterpart to the RECURRENCE-ID that [Parse] reads off an
+// inbound message: callers building an Invite from a stored event (which carries a
+// time, not the original iCalendar property) use it to thread the instance
+// through, so accept/decline/cancel/re-invite can target one occurrence.
+func (inv *Invite) SetRecurrenceID(t time.Time) {
+	if t.IsZero() {
+		inv.RecurrenceID = ""
+		inv.recurrenceProp = nil
+		return
+	}
+	prop := ical.NewProp(ical.PropRecurrenceID)
+	prop.SetDateTime(t.UTC())
+	inv.RecurrenceID = prop.Value
+	inv.recurrenceProp = prop
+}
+
 // echoRecurrenceID copies a preserved RECURRENCE-ID property from inv onto ev so
 // its DATE-TIME value type and TZID/RANGE parameters survive — SetText would
 // force an incorrect VALUE=TEXT. It is a no-op for a master (non-instance)
