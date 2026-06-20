@@ -174,7 +174,8 @@ func TestEventToICalRoundTrip(t *testing.T) {
 		End:       time.Date(2026, 6, 19, 14, 30, 0, 0, time.UTC),
 		Organizer: calendar.Address{Name: "Alice Smith", Email: "alice@example.com"},
 		Attendees: []calendar.Attendee{
-			{Name: "Bob Jones", Email: "bob@example.com"},
+			// Status (PARTSTAT) and ScheduleStatus (SCHEDULE-STATUS) both round-trip.
+			{Name: "Bob Jones", Email: "bob@example.com", Status: "accepted", ScheduleStatus: "1.1"},
 			{Email: "carol@example.com"},
 		},
 		Body: calendar.Body{ContentType: "text", Content: "Discuss roadmap and OKRs."},

@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"fmt"
+	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -11,6 +12,8 @@ import (
 
 	"github.com/hstern/go-mailbox-720/internal/calendar"
 	"github.com/hstern/go-mailbox-720/internal/graph/api"
+	"github.com/hstern/go-mailbox-720/internal/itip"
+	"github.com/hstern/go-mailbox-720/internal/scheduling"
 	"github.com/hstern/go-mailbox-720/internal/tz"
 )
 
@@ -49,10 +52,109 @@ func (h Handler) MeCreateEvents(ctx context.Context, req *api.MicrosoftGraphEven
 	if err != nil {
 		return nil, fmt.Errorf("create event: %w", err)
 	}
+	// Organizer side of the iTIP engine: email the attendees a METHOD:REQUEST and
+	// record the delivery outcome. Best-effort — the create has already succeeded.
+	created = h.inviteAttendees(ctx, b, w, created)
 	return &api.MicrosoftGraphEventStatusCode{
 		StatusCode: http.StatusCreated,
 		Response:   toGraphEvent(created),
 	}, nil
+}
+
+// inviteAttendees is the organizer half of the iTIP engine: when an event is
+// created with attendees on the dumb-backend tier, it emails them a METHOD:REQUEST
+// iMIP invitation and records the per-attendee delivery outcome as an RFC 6638
+// SCHEDULE-STATUS, returning the event with those statuses (and the creator stamped
+// as organizer) persisted.
+//
+// It no-ops unless there is something to send AND we are the scheduler: no
+// scheduling provider, no known mailbox address, no attendees besides the
+// organizer, or a backend that schedules natively (RFC 6638) — in which case the
+// server sends the invitations itself and double-driving must be avoided.
+//
+// Per Graph/Exchange semantics the create itself always succeeds (201); a send
+// failure is never an HTTP error. It is surfaced out of band instead — logged, and
+// recorded as SCHEDULE-STATUS=5.1 on the attendees (the protocol's delivery-status
+// channel, read back via CalDAV) — never silently swallowed.
+func (h Handler) inviteAttendees(ctx context.Context, b calendar.Backend, w calendar.Writer, event calendar.Event) calendar.Event {
+	if h.scheduling == nil {
+		return event
+	}
+	organizer := h.scheduling.MailboxAddress()
+	if organizer == "" {
+		return event
+	}
+	isRecipient := func(a calendar.Attendee) bool {
+		return a.Email != "" && !strings.EqualFold(a.Email, organizer)
+	}
+	hasRecipient := false
+	for _, a := range event.Attendees {
+		if isRecipient(a) {
+			hasRecipient = true
+			break
+		}
+	}
+	if !hasRecipient {
+		return event
+	}
+	// Capability switch: an RFC 6638 server schedules on our behalf.
+	if native, _ := serverSchedulesEvents(ctx, b); native {
+		return event
+	}
+
+	status := h.sendRequest(ctx, organizer, event)
+
+	// Record the outcome where RFC 6638 puts it — a per-attendee SCHEDULE-STATUS —
+	// and stamp the creator as organizer (you organize events you invite others to).
+	// Persisted via UpdateEvent so a later CalDAV read reflects it.
+	if !strings.EqualFold(event.Organizer.Email, organizer) {
+		event.Organizer = calendar.Address{Email: organizer}
+	}
+	for i := range event.Attendees {
+		if isRecipient(event.Attendees[i]) {
+			event.Attendees[i].ScheduleStatus = string(status)
+		}
+	}
+	updated, err := w.UpdateEvent(ctx, event)
+	if err != nil {
+		log.Printf("calendar: persist SCHEDULE-STATUS for event %s: %v", event.ID, err)
+		return event
+	}
+	return updated
+}
+
+// sendRequest submits the METHOD:REQUEST iMIP invitation to the event's attendees
+// (other than the organizer) and returns the resulting SCHEDULE-STATUS. A failure
+// is logged and mapped to SchedStatusNoDelivery, never returned as an error: per
+// Graph/Exchange the create succeeds regardless of invitation delivery.
+func (h Handler) sendRequest(ctx context.Context, organizer string, event calendar.Event) scheduling.ScheduleStatus {
+	inv := itip.InviteFromEvent(event)
+	// Force the organizer to the configured mailbox, but keep the display name the
+	// client supplied when they already named themselves as organizer (CN is lost
+	// only when we have to synthesize the organizer, where no name is available).
+	if !strings.EqualFold(inv.Organizer.Email, organizer) {
+		inv.Organizer = scheduling.Address{Email: organizer}
+	}
+	recipients := make([]scheduling.Attendee, 0, len(inv.Attendees))
+	for _, a := range inv.Attendees {
+		if a.Email != "" && !strings.EqualFold(a.Email, organizer) {
+			recipients = append(recipients, a)
+		}
+	}
+	inv.Attendees = recipients
+
+	sender, err := h.scheduling.Sender(ctx)
+	if err != nil {
+		log.Printf("calendar: iMIP REQUEST for event %s: smtp sender: %v", event.ID, err)
+		return scheduling.SchedStatusNoDelivery
+	}
+	defer func() { _ = sender.Close() }()
+
+	if err := itip.Invite(ctx, sender, inv.Organizer, inv, time.Now()); err != nil {
+		log.Printf("calendar: iMIP REQUEST send failed for event %s: %v", event.ID, err)
+		return scheduling.SchedStatusNoDelivery
+	}
+	return scheduling.SchedStatusSent
 }
 
 // MeUpdateEvents implements PATCH /me/events/{event-id}. PATCH is a partial

@@ -32,3 +32,8 @@ func attendeeStatus(prop *ical.Prop) string {
 	}
 	return partStatToStatus[strings.ToUpper(prop.Params.Get(ical.ParamParticipationStatus))]
 }
+
+// paramScheduleStatus is the RFC 6638 SCHEDULE-STATUS ATTENDEE parameter, carrying
+// the delivery status of a scheduling message. go-ical has no constant for it (it
+// is a CalDAV-scheduling extension, not core iCalendar), so it is named here.
+const paramScheduleStatus = "SCHEDULE-STATUS"

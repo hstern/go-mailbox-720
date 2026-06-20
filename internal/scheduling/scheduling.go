@@ -82,6 +82,23 @@ const (
 	StatusCancelled Status = "CANCELLED"
 )
 
+// ScheduleStatus is an RFC 6638 SCHEDULE-STATUS value: an iTIP REQUEST-STATUS code
+// (RFC 5546 §3.6) recording the delivery outcome of a scheduling message, which a
+// server stamps on each ATTENDEE it tried to notify. Only the two outcomes the
+// engine produces for an iMIP REQUEST are modelled; the iMIP transport is
+// fire-and-forget after SMTP submission, so success is "sent", not "delivered".
+type ScheduleStatus string
+
+const (
+	// SchedStatusSent ("1.1") means the scheduling message was successfully
+	// submitted to the SMTP relay. Final delivery to the attendee is unconfirmed.
+	SchedStatusSent ScheduleStatus = "1.1"
+	// SchedStatusNoDelivery ("5.1") means the scheduling message could not be
+	// delivered (SMTP submission failed). RFC 5546 also defines 3.7 for an invalid
+	// calendar user; distinguishing it needs the SMTP reply code, a later refinement.
+	SchedStatusNoDelivery ScheduleStatus = "5.1"
+)
+
 // Address is a calendar-user address: a display name plus an email. It mirrors
 // calendar.Address; iCalendar carries these as CAL-ADDRESS values (a "mailto:"
 // URI with an optional CN parameter for the display name).

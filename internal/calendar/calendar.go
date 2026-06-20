@@ -32,6 +32,13 @@ type Attendee struct {
 	Name   string
 	Email  string
 	Status string
+	// ScheduleStatus is the RFC 6638 SCHEDULE-STATUS for this attendee: an iTIP
+	// REQUEST-STATUS code (e.g. "1.1" sent, "5.1" undeliverable) recording the
+	// delivery outcome of the last scheduling message the server sent them. Empty
+	// when no scheduling message has been sent (or a native server tracks it
+	// out-of-band). The CalDAV adapter carries it as the ATTENDEE SCHEDULE-STATUS
+	// parameter; Graph has no equivalent field, so it does not surface in /me/events.
+	ScheduleStatus string
 }
 
 // Body is an event description in a single representation. Calendars almost
