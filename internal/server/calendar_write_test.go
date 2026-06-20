@@ -173,10 +173,9 @@ func (p writableCalendarProvider) Calendar(_ context.Context) (calendar.Backend,
 	return p.backend, nil
 }
 
-// TestMeCreateEventsRejectsNonUTCTimeZone: a naive wall-clock dateTime with a
-// non-UTC (Windows) zone name must be rejected with a 400 rather than silently
-// stored at the wrong instant.
-func TestMeCreateEventsRejectsNonUTCTimeZone(t *testing.T) {
+// TestMeCreateEventsRejectsUnknownTimeZone: an unresolvable zone name is a 400
+// rather than a silent mis-store.
+func TestMeCreateEventsRejectsUnknownTimeZone(t *testing.T) {
 	backend := newWritableCalendarBackend()
 	h := Handler{calendar: writableCalendarProvider{backend: backend}}
 
@@ -184,7 +183,7 @@ func TestMeCreateEventsRejectsNonUTCTimeZone(t *testing.T) {
 		Subject: api.NewOptNilString("Planning"),
 		Start: api.NewOptMicrosoftGraphDateTimeTimeZone(api.MicrosoftGraphDateTimeTimeZone{
 			DateTime: api.NewOptString("2026-06-20T09:00:00.0000000"),
-			TimeZone: api.NewOptNilString("Pacific Standard Time"),
+			TimeZone: api.NewOptNilString("Totally Bogus Zone"),
 		}),
 	}
 
@@ -200,7 +199,33 @@ func TestMeCreateEventsRejectsNonUTCTimeZone(t *testing.T) {
 		t.Errorf("status = %d, want 400", errRes.StatusCode)
 	}
 	if backend.createdCalID != "" {
-		t.Error("CreateEvent was called despite an unsupported time zone")
+		t.Error("CreateEvent was called despite an unknown time zone")
+	}
+}
+
+// TestMeCreateEventsResolvesWindowsZone: a Windows zone name is resolved and the
+// naive wall-clock is interpreted in that zone. 2026-06-20 is daylight time in
+// the US Pacific zone (PDT, UTC-7), so 09:00 -> 16:00 UTC.
+func TestMeCreateEventsResolvesWindowsZone(t *testing.T) {
+	backend := newWritableCalendarBackend()
+	h := Handler{calendar: writableCalendarProvider{backend: backend}}
+
+	req := &api.MicrosoftGraphEvent{
+		Subject: api.NewOptNilString("Planning"),
+		Start: api.NewOptMicrosoftGraphDateTimeTimeZone(api.MicrosoftGraphDateTimeTimeZone{
+			DateTime: api.NewOptString("2026-06-20T09:00:00.0000000"),
+			TimeZone: api.NewOptNilString("Pacific Standard Time"),
+		}),
+	}
+	if _, err := h.MeCreateEvents(context.Background(), req); err != nil {
+		t.Fatalf("MeCreateEvents: %v", err)
+	}
+	if backend.createdCalID == "" {
+		t.Fatal("CreateEvent was not called (zone should resolve)")
+	}
+	want := time.Date(2026, 6, 20, 16, 0, 0, 0, time.UTC)
+	if got := backend.createdEvent.Start; !got.Equal(want) {
+		t.Errorf("mapped start = %v, want %v (09:00 Pacific = 16:00 UTC in June/PDT)", got, want)
 	}
 }
 
@@ -271,8 +296,8 @@ func TestMeUpdateEventsPartialMergeLeavesAbsentFields(t *testing.T) {
 	}
 }
 
-// TestMeUpdateEventsRejectsNonUTCTimeZone: a PATCH whose Start carries a non-UTC
-// (Windows) zone name must be rejected with a 400, and UpdateEvent must not run.
+// TestMeUpdateEventsRejectsNonUTCTimeZone: a PATCH whose Start carries an
+// unresolvable zone name must be rejected with a 400, and UpdateEvent must not run.
 func TestMeUpdateEventsRejectsNonUTCTimeZone(t *testing.T) {
 	backend := newWritableCalendarBackendSeeded()
 	h := Handler{calendar: writableCalendarProvider{backend: backend}}
@@ -280,7 +305,7 @@ func TestMeUpdateEventsRejectsNonUTCTimeZone(t *testing.T) {
 	req := &api.MicrosoftGraphEvent{
 		Start: api.NewOptMicrosoftGraphDateTimeTimeZone(api.MicrosoftGraphDateTimeTimeZone{
 			DateTime: api.NewOptString("2026-06-20T09:00:00.0000000"),
-			TimeZone: api.NewOptNilString("Pacific Standard Time"),
+			TimeZone: api.NewOptNilString("Totally Bogus Zone"),
 		}),
 	}
 

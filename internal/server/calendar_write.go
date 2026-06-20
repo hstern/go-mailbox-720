@@ -11,6 +11,7 @@ import (
 
 	"github.com/hstern/go-mailbox-720/internal/calendar"
 	"github.com/hstern/go-mailbox-720/internal/graph/api"
+	"github.com/hstern/go-mailbox-720/internal/tz"
 )
 
 // MeCreateEvents implements POST /me/events. It maps the inbound Graph event
@@ -201,11 +202,11 @@ func mergeEventPatch(current calendar.Event, ge *api.MicrosoftGraphEvent) (calen
 
 // graphToTime parses a Graph dateTimeTimeZone back into an instant — the inverse
 // of graphDateTime. An RFC3339 dateTime carries its own offset and is honored as
-// given. Otherwise the dateTime is a naive wall-clock that we can only place on
-// the timeline if its timeZone is UTC (or absent): Graph sends Windows zone names
-// like "Pacific Standard Time", and rather than silently storing the wrong
-// instant we reject a non-UTC zone until a Windows->IANA mapping lands. An absent
-// or unparseable dateTime yields the zero time, which the backend treats as unset.
+// given. Otherwise the dateTime is a naive wall-clock interpreted in the event's
+// timeZone: Graph sends Windows zone names like "Pacific Standard Time" (resolved
+// via internal/tz), IANA names, or "UTC"/absent (treated as UTC). An unknown zone
+// is a 400-worthy error rather than a silent mis-store; an absent or unparseable
+// dateTime yields the zero time, which the backend treats as unset.
 func graphToTime(dt api.MicrosoftGraphDateTimeTimeZone) (time.Time, error) {
 	s, ok := dt.DateTime.Get()
 	if !ok || s == "" {
@@ -215,12 +216,17 @@ func graphToTime(dt api.MicrosoftGraphDateTimeTimeZone) (time.Time, error) {
 	if t, err := time.Parse(time.RFC3339, s); err == nil {
 		return t.UTC(), nil
 	}
-	// Naive wall-clock: only UTC (or an unspecified zone) can be placed exactly.
-	if tz, ok := dt.TimeZone.Get(); ok && tz != "" && !strings.EqualFold(tz, "UTC") {
-		return time.Time{}, fmt.Errorf("unsupported time zone %q: only UTC is supported", tz)
+	// Naive wall-clock: interpret it in the declared zone, then normalize to UTC.
+	loc := time.UTC
+	if name, ok := dt.TimeZone.Get(); ok && name != "" && !strings.EqualFold(name, "UTC") {
+		l, err := tz.Lookup(name)
+		if err != nil {
+			return time.Time{}, fmt.Errorf("time zone: %w", err)
+		}
+		loc = l
 	}
 	for _, layout := range []string{"2006-01-02T15:04:05.0000000", "2006-01-02T15:04:05"} {
-		if t, err := time.Parse(layout, s); err == nil {
+		if t, err := time.ParseInLocation(layout, s, loc); err == nil {
 			return t.UTC(), nil
 		}
 	}

@@ -22,6 +22,9 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	// Embed the IANA time-zone database so event time-zone resolution
+	// (internal/tz) works regardless of the host's system zoneinfo.
+	_ "time/tzdata"
 
 	"github.com/hstern/go-mailbox-720/internal/auth"
 	"github.com/hstern/go-mailbox-720/internal/batch"
