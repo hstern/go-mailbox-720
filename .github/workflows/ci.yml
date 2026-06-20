@@ -98,7 +98,31 @@ jobs:
 
       - name: OIDC e2e (Kanidm + mailboxd)
         working-directory: test/e2e-oidc
-        run: go test -timeout 360s ./...
+        run: go test -timeout 360s -run TestOIDCEndToEnd ./...
+
+  dumb-backend-e2e:
+    # The MB720-15 unified dumb-backend-tier e2e: stands up the whole stack —
+    # Kanidm (OIDC IdP), Dovecot (IMAP), Radicale (CalDAV + CardDAV) — plus an
+    # in-process SMTP sink, and drives the real mailboxd wired to all of them with
+    # the client-side iTIP/iMIP scheduling engine ON. It exercises auth, message/
+    # folder + delta, event/calendar + contacts CRUD + delta, and the inbound +
+    # outbound invite scheduling cooperation that this tier (no RFC 6638 server-side
+    # scheduling) must drive itself. Docker is available on GitHub-hosted runners.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # The e2e builds mailboxd, which imports the generated package.
+      - name: Generate (fetch upstream spec + ogen)
+        run: go generate ./internal/graph
+
+      - name: Dumb-backend e2e (Kanidm + Dovecot + Radicale + mailboxd)
+        working-directory: test/e2e-oidc
+        run: go test -timeout 600s -run TestDumbBackendEndToEnd ./...
 
   mail-imap-e2e:
     # Runs the IMAP adapter against a real Dovecot server in Docker (build tag
