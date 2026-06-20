@@ -145,6 +145,7 @@ func TestMiddleware(t *testing.T) {
 		Audience:       testAud,
 		RequiredScopes: []string{"Mail.Read"},
 		SubjectClaim:   "sub",
+		ScopeClaims:    []string{"scope", "scp", "roles"}, // Entra-style: read scp
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -341,5 +342,35 @@ func TestNewFailsOnUndiscoverableIssuer(t *testing.T) {
 	defer srv.Close()
 	if _, err := New(context.Background(), Config{Issuers: []string{srv.URL}}); err == nil {
 		t.Error("New should error when an issuer cannot be discovered")
+	}
+}
+
+// With the default ScopeClaims (scope, roles), a token that carries its scope only
+// in the non-standard "scp" claim does NOT satisfy RequiredScopes — scp is opt-in
+// for Entra deployments, not read by default.
+func TestScopeClaimsDefaultDoesNotReadScp(t *testing.T) {
+	idp := newIDP(t)
+	a, err := New(context.Background(), Config{
+		Issuers:        []string{idp.issuer},
+		Audience:       testAud,
+		RequiredScopes: []string{"Mail.Read"},
+		// ScopeClaims omitted -> defaults to ["scope", "roles"].
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	var ran bool
+	next := http.HandlerFunc(func(http.ResponseWriter, *http.Request) { ran = true })
+	req := httptest.NewRequest(http.MethodGet, "/v1.0/me/messages", nil)
+	req.Header.Set("Authorization", "Bearer "+idp.sign(t, baseClaims(idp.issuer))) // scope in scp
+	rec := httptest.NewRecorder()
+	a.Middleware(next).ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Errorf("status = %d, want 403 (scp not a default scope claim)", rec.Code)
+	}
+	if ran {
+		t.Error("next ran despite the scope being only in scp under default ScopeClaims")
 	}
 }

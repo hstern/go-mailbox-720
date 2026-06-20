@@ -51,6 +51,16 @@ type Config struct {
 	// SubjectClaim names the claim mapped to the mailbox identity ("me"), e.g.
 	// "sub", "oid", or "preferred_username". Defaults to "sub".
 	SubjectClaim string
+	// ScopeClaims names the claims that carry granted scopes; each value (a
+	// space-delimited string or a JSON array of strings) is unioned for the
+	// RequiredScopes check. Defaults to ["scope", "roles"] — the standardized scope
+	// claim (RFC 8693 §4.2, used by RFC 9068 §2.2.3) plus app roles.
+	//
+	// Microsoft Entra / Azure AD does not use the standard claim: it carries
+	// delegated permissions in a non-standard "scp" claim (and app permissions in
+	// "roles"). "scp" is not RFC- or IANA-registered, so it is not read by default;
+	// an Entra-fronted deployment should set ScopeClaims to ["scope", "scp", "roles"].
+	ScopeClaims []string
 	// Introspection, when set, enables RFC 7662 validation of opaque (non-JWT)
 	// tokens against each issuer's introspection endpoint.
 	Introspection *IntrospectionConfig
@@ -70,6 +80,7 @@ type Authenticator struct {
 	audience       string
 	requiredScopes []string
 	subjectClaim   string
+	scopeClaims    []string
 }
 
 // New discovers each configured issuer and builds the Authenticator. It errors
@@ -82,12 +93,17 @@ func New(ctx context.Context, cfg Config) (*Authenticator, error) {
 	if subjectClaim == "" {
 		subjectClaim = "sub"
 	}
+	scopeClaims := cfg.ScopeClaims
+	if len(scopeClaims) == 0 {
+		scopeClaims = []string{"scope", "roles"}
+	}
 	a := &Authenticator{
 		verifiers:      make(map[string]*oidc.IDTokenVerifier, len(cfg.Issuers)),
 		introspectors:  make(map[string]*introspection.Client),
 		audience:       cfg.Audience,
 		requiredScopes: cfg.RequiredScopes,
 		subjectClaim:   subjectClaim,
+		scopeClaims:    scopeClaims,
 	}
 	for _, iss := range cfg.Issuers {
 		provider, err := oidc.NewProvider(ctx, iss)
@@ -211,21 +227,61 @@ func (a *Authenticator) validateJWT(ctx context.Context, verifier *oidc.IDTokenV
 	return &principal{
 		issuer:  iss,
 		subject: subjectFromClaims(&tok.Claims, a.subjectClaim),
-		scopes:  toSet(scopesFromClaims(&tok.Claims)),
+		scopes:  toSet(scopesFromClaims(&tok.Claims, a.scopeClaims)),
 	}, nil
 }
 
-// scopesFromClaims gathers granted scopes across the conventions IdPs actually use:
-// the RFC 9068/8693 "scope" claim, the app-role "roles" claim, and "scp" (Microsoft
-// Entra and others). The set is the union; an absent claim contributes nothing.
-func scopesFromClaims(c *accesstoken.Claims) []string {
-	out := append([]string{}, c.ScopeValues()...)
-	out = append(out, c.Roles...)
-	var scp string
-	if ok, _ := c.GetExtra("scp", &scp); ok {
-		out = append(out, strings.Fields(scp)...)
+// scopesFromClaims gathers the granted scopes from the configured claims of a JWT
+// access token, unioning their values. The standard "scope" and the typed RFC 9068
+// list claims use their typed accessors; any other configured claim (e.g. Entra's
+// "scp") is read from the extension claims.
+func scopesFromClaims(c *accesstoken.Claims, claimNames []string) []string {
+	var out []string
+	for _, name := range claimNames {
+		switch name {
+		case "scope":
+			out = append(out, c.ScopeValues()...)
+		case "roles":
+			out = append(out, c.Roles...)
+		case "groups":
+			out = append(out, c.Groups...)
+		case "entitlements":
+			out = append(out, c.Entitlements...)
+		default:
+			out = append(out, extraScopes(c.GetExtra, name)...)
+		}
 	}
 	return out
+}
+
+// scopesFromResponse is the introspection-side analog of scopesFromClaims: RFC 7662
+// standardizes only "scope" (typed here), so any other configured claim is read
+// from the response's extension members.
+func scopesFromResponse(r *introspection.Response, claimNames []string) []string {
+	var out []string
+	for _, name := range claimNames {
+		if name == "scope" {
+			out = append(out, r.Scopes()...)
+			continue
+		}
+		out = append(out, extraScopes(r.GetExtra, name)...)
+	}
+	return out
+}
+
+// extraScopes reads a non-typed scope-bearing claim via the claim set's GetExtra,
+// accepting either a space-delimited string (e.g. Entra's "scp") or a JSON array of
+// strings. A claim that is absent — or present but neither shape — contributes none.
+func extraScopes(getExtra func(string, any) (bool, error), name string) []string {
+	var s string
+	if ok, err := getExtra(name, &s); ok && err == nil {
+		return strings.Fields(s)
+	}
+	var arr []string
+	if ok, err := getExtra(name, &arr); ok && err == nil {
+		return arr
+	}
+	return nil
 }
 
 // introspectToken validates an opaque token against the configured introspection
@@ -252,7 +308,7 @@ func (a *Authenticator) introspectToken(ctx context.Context, raw string) (*princ
 		return &principal{
 			issuer:  iss,
 			subject: subjectFromResponse(resp, a.subjectClaim),
-			scopes:  toSet(resp.Scopes()),
+			scopes:  toSet(scopesFromResponse(resp, a.scopeClaims)),
 		}, nil
 	}
 	return nil, fmt.Errorf("auth: token not active for this resource per introspection")

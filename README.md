@@ -127,7 +127,8 @@ go run ./cmd/mailboxd \
 | --- | --- |
 | `-auth-issuer` | Comma-separated trusted OIDC issuer URL(s). Empty disables auth. |
 | `-auth-audience` | Expected token audience (`aud`). |
-| `-auth-scope` | Comma-separated required scopes (matched against `scp`/`scope`/`roles`). |
+| `-auth-scope` | Comma-separated required scopes. |
+| `-auth-scope-claims` | Comma-separated claims that carry granted scopes (default `scope,roles`; Microsoft Entra: `scope,scp,roles`). |
 | `-auth-subject-claim` | Token claim mapped to the mailbox identity (default `sub`). |
 | `-auth-introspect-client-id` | OAuth2 client id enabling RFC 7662 introspection of **opaque** tokens (secret via `MAILBOXD_INTROSPECT_CLIENT_SECRET`). |
 | `-mail-imap-addr` / `-mail-imap-username` / `-mail-imap-tls` | IMAP mail backend (password via `MAILBOXD_IMAP_PASSWORD`). |
@@ -140,8 +141,13 @@ the access-control gate. The token's `typ` then selects how strictly it is decod
 a token that declares itself an **RFC 9068** access token (`typ=at+jwt`) is held to
 that profile (the §2.2 required claims, incl. `jti`/`client_id`), while a plain
 `typ=JWT` token — as Microsoft Entra and many IdPs issue — is accepted on signature
-+ audience like any bearer JWT. Scopes are read from `scope`, `scp`, or `roles`.
-Opaque access tokens (e.g. Kanidm's default) are validated via **RFC 7662**
++ audience like any bearer JWT. Granted scopes are read from the claims named by
+`-auth-scope-claims` (default `scope` — the RFC 8693 §4.2 / RFC 9068 §2.2.3 claim —
+plus app `roles`). **Microsoft Entra / Azure AD** does not use the standard claim:
+it carries delegated permissions in a non-standard `scp` claim, so an Entra-fronted
+deployment should set `-auth-scope-claims scope,scp,roles` (`scp` is opt-in because
+it is not an RFC- or IANA-registered claim). Opaque access tokens (e.g. Kanidm's
+default) are validated via **RFC 7662**
 introspection when `-auth-introspect-client-id` is set; for introspected tokens the
 audience is enforced when the introspection response carries an `aud` (otherwise the
 resource server's own introspection credentials are the binding). The mailbox
