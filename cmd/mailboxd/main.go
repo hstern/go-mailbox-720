@@ -47,6 +47,7 @@ func main() {
 	audience := flag.String("auth-audience", "", "expected token audience (aud)")
 	scopes := flag.String("auth-scope", "", "comma-separated required scopes")
 	subjectClaim := flag.String("auth-subject-claim", "sub", "token claim mapped to the mailbox identity")
+	scopeClaims := flag.String("auth-scope-claims", "scope,roles", "comma-separated claims that carry granted scopes (Microsoft Entra/Azure AD: \"scope,scp,roles\" — scp is Entra's non-standard delegated-scope claim)")
 	introspectID := flag.String("auth-introspect-client-id", "", "OAuth2 client id for RFC 7662 introspection of opaque tokens (enables introspection; secret from MAILBOXD_INTROSPECT_CLIENT_SECRET)")
 	imapAddr := flag.String("mail-imap-addr", "", "IMAP server address host:port for the mail backend (empty: mail operations return 501; password from MAILBOXD_IMAP_PASSWORD)")
 	imapUser := flag.String("mail-imap-username", "", "IMAP username for the mail backend")
@@ -68,6 +69,7 @@ func main() {
 		Audience:       *audience,
 		RequiredScopes: splitList(*scopes),
 		SubjectClaim:   *subjectClaim,
+		ScopeClaims:    splitList(*scopeClaims),
 	}
 	if *introspectID != "" {
 		// The secret is taken from the environment, never a flag, so it does not
