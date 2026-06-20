@@ -107,3 +107,28 @@ type Writer interface {
 	// semantics); a caller wanting idempotent cleanup can ignore it.
 	DeleteEvent(ctx context.Context, id string) error
 }
+
+// DeltaReader is the optional incremental-sync capability: report the events
+// that have changed in a calendar since a prior point, identified by an opaque
+// token. It is kept separate from Backend (like Writer) so that an adapter
+// without delta support, and the server's read-path fakes, need not implement
+// it, and so adding it does not disturb Backend's existing implementers. An
+// adapter that supports delta implements DeltaReader in addition to Backend;
+// consumers type-assert for it:
+//
+//	if d, ok := backend.(calendar.DeltaReader); ok {
+//		events, next, err := d.Delta(ctx, calendarID, token)
+//	}
+//
+// This is the backing for Microsoft Graph's GET /me/events/delta. A
+// DeltaReader is bound to the same authenticated principal as its Backend.
+type DeltaReader interface {
+	// Delta returns the events in the calendar changed since the opaque token
+	// (an RFC 6578 sync-token). An empty token means initial sync: all current
+	// events + a fresh token. The returned next token is fed back next call.
+	//
+	// This first cut is ADDITIVE — it reports created/updated events. The
+	// sync-collection response also reports removed resources (deleted hrefs);
+	// surfacing those as tombstones (Graph's @removed) is future work.
+	Delta(ctx context.Context, calendarID string, token string) (changed []Event, next string, err error)
+}

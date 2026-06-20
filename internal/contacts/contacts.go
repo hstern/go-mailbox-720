@@ -96,3 +96,28 @@ type Writer interface {
 	// DELETE semantics); a caller wanting idempotent cleanup can ignore it.
 	DeleteContact(ctx context.Context, id string) error
 }
+
+// DeltaReader is the optional incremental-sync capability: report the contacts
+// in an address book that have changed since a prior point, identified by an
+// opaque token (an RFC 6578 sync-token). It is kept separate from Backend (like
+// Writer) so that an adapter without delta support, and the server's read-path
+// fakes, need not implement it, and so adding it does not disturb Backend's
+// existing implementers. An adapter that supports delta implements DeltaReader
+// in addition to Backend; consumers type-assert for it:
+//
+//	if d, ok := backend.(contacts.DeltaReader); ok {
+//		changed, next, err := d.Delta(ctx, addressBookID, token)
+//	}
+//
+// This is the backing for Microsoft Graph's GET /me/contacts/delta. A
+// DeltaReader is bound to the same authenticated principal as its Backend.
+type DeltaReader interface {
+	// Delta returns the contacts in the address book changed since the opaque
+	// token (an RFC 6578 sync-token). An empty token means initial sync: all
+	// current contacts + a fresh token; the next token is fed back next call.
+	//
+	// This first cut is ADDITIVE — it reports created/updated contacts. Reporting
+	// deletions (the sync-response's removed hrefs) needs the deleted-href path
+	// and is future work, matching the mail delta's additive first cut.
+	Delta(ctx context.Context, addressBookID string, token string) (changed []Contact, next string, err error)
+}

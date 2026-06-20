@@ -275,6 +275,93 @@ func TestRadicaleWrite(t *testing.T) {
 	}
 }
 
+// TestRadicaleDelta exercises the DeltaReader capability end to end against
+// Radicale (which supports RFC 6578 sync-collection): an initial Delta with an
+// empty token returns the seeded event and a non-empty sync-token; after a
+// second event is created, an incremental Delta with that token returns the new
+// event and an advanced token.
+func TestRadicaleDelta(t *testing.T) {
+	if _, err := exec.LookPath("docker"); err != nil {
+		t.Skip("docker not available")
+	}
+	base := startRadicale(t)
+	seedCalendar(t, base)
+
+	cl, err := Dial(base, radicaleUser, radicalePass, nil)
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	defer func() { _ = cl.Close() }()
+	ctx := context.Background()
+
+	// The adapter must advertise the delta capability.
+	d, ok := interface{}(cl).(calendar.DeltaReader)
+	if !ok {
+		t.Fatal("*Client does not implement calendar.DeltaReader")
+	}
+
+	cals, err := cl.ListCalendars(ctx)
+	if err != nil {
+		t.Fatalf("ListCalendars: %v", err)
+	}
+	var work *calendar.Calendar
+	for i := range cals {
+		if cals[i].Name == calendarName {
+			work = &cals[i]
+			break
+		}
+	}
+	if work == nil {
+		t.Fatalf("calendar %q not listed: %+v", calendarName, cals)
+	}
+
+	// Initial sync: an empty token returns the current events and a fresh token.
+	initial, token, err := d.Delta(ctx, work.ID, "")
+	if err != nil {
+		t.Fatalf("initial Delta: %v", err)
+	}
+	if token == "" {
+		t.Fatal("initial Delta returned an empty sync-token")
+	}
+	if findSubject(initial, eventSummary) == nil {
+		t.Fatalf("initial Delta missing seeded event %q: %+v", eventSummary, initial)
+	}
+
+	// Create a second event so the incremental sync has a change to report.
+	w, ok := interface{}(cl).(calendar.Writer)
+	if !ok {
+		t.Fatal("*Client does not implement calendar.Writer")
+	}
+	const deltaSubject = "Planning"
+	deltaStart := time.Date(2026, 8, 1, 10, 0, 0, 0, time.UTC)
+	if _, err := w.CreateEvent(ctx, work.ID, calendar.Event{
+		Subject: deltaSubject,
+		Start:   deltaStart,
+		End:     deltaStart.Add(time.Hour),
+	}); err != nil {
+		t.Fatalf("CreateEvent: %v", err)
+	}
+
+	// Incremental sync: the prior token returns only the new event and a token
+	// that has advanced past the initial one.
+	changed, next, err := d.Delta(ctx, work.ID, token)
+	if err != nil {
+		t.Fatalf("incremental Delta: %v", err)
+	}
+	if next == "" {
+		t.Fatal("incremental Delta returned an empty sync-token")
+	}
+	if next == token {
+		t.Errorf("incremental Delta token did not advance: %q", next)
+	}
+	if findSubject(changed, deltaSubject) == nil {
+		t.Fatalf("incremental Delta missing new event %q: %+v", deltaSubject, changed)
+	}
+	if findSubject(changed, eventSummary) != nil {
+		t.Errorf("incremental Delta unexpectedly re-reported unchanged event %q: %+v", eventSummary, changed)
+	}
+}
+
 // findSubject returns the first event with the given subject, or nil.
 func findSubject(events []calendar.Event, subject string) *calendar.Event {
 	for i := range events {
