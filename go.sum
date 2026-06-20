@@ -1,3 +1,5 @@
+git.sr.ht/~rockorager/go-jmap v0.5.3 h1:PjnobX0ySPHKG5TiUqLM6PlM3ngYHlLJeWLOeorZ7IY=
+git.sr.ht/~rockorager/go-jmap v0.5.3/go.mod h1:aOTCtwpZSINpDDSOkLGpHU0Kbbm5lcSDMcobX3ZtOjY=
 github.com/CiscoM31/godata v1.0.11 h1:w7y8twuW02LdH6mak3/GJ5i0GrCv2IoZUJVqa/g5Yeo=
 github.com/CiscoM31/godata v1.0.11/go.mod h1:ZMiT6JuD3Rm83HEtiTx4JEChsd25YCrxchKGag/sdTc=
 github.com/cespare/xxhash/v2 v2.3.0 h1:UL815xU9SqsFlibzuggzjXhog7bL6oX9BbNZnL2UFvs=
