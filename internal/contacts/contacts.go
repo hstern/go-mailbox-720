@@ -116,8 +116,8 @@ type DeltaReader interface {
 	// token (an RFC 6578 sync-token). An empty token means initial sync: all
 	// current contacts + a fresh token; the next token is fed back next call.
 	//
-	// This first cut is ADDITIVE — it reports created/updated contacts. Reporting
-	// deletions (the sync-response's removed hrefs) needs the deleted-href path
-	// and is future work, matching the mail delta's additive first cut.
-	Delta(ctx context.Context, addressBookID string, token string) (changed []Contact, next string, err error)
+	// changed holds created/updated contacts; removed holds the opaque IDs of
+	// contacts the sync-collection reported as deleted (so the handler can emit
+	// Graph @removed tombstones). On an initial sync removed is empty.
+	Delta(ctx context.Context, addressBookID string, token string) (changed []Contact, removed []string, next string, err error)
 }

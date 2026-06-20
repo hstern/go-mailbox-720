@@ -127,8 +127,8 @@ type DeltaReader interface {
 	// (an RFC 6578 sync-token). An empty token means initial sync: all current
 	// events + a fresh token. The returned next token is fed back next call.
 	//
-	// This first cut is ADDITIVE — it reports created/updated events. The
-	// sync-collection response also reports removed resources (deleted hrefs);
-	// surfacing those as tombstones (Graph's @removed) is future work.
-	Delta(ctx context.Context, calendarID string, token string) (changed []Event, next string, err error)
+	// changed holds created/updated events; removed holds the opaque IDs of events
+	// the sync-collection reported as deleted (so the handler can emit Graph
+	// @removed tombstones). On an initial sync removed is empty.
+	Delta(ctx context.Context, calendarID string, token string) (changed []Event, removed []string, next string, err error)
 }

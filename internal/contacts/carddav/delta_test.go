@@ -125,7 +125,7 @@ func TestSyncDelta(t *testing.T) {
 	abID := addressBookID(testAddressBook)
 
 	// Initial sync: empty token in, current contact + fresh token out.
-	changed, next, err := cl.Delta(context.Background(), abID, deltaInitialToken)
+	changed, _, next, err := cl.Delta(context.Background(), abID, deltaInitialToken)
 	if err != nil {
 		t.Fatalf("Delta(initial): %v", err)
 	}
@@ -156,7 +156,7 @@ func TestSyncDelta(t *testing.T) {
 	}
 
 	// Next call: feed the returned token back; assert it reaches the server.
-	if _, _, err := cl.Delta(context.Background(), abID, next); err != nil {
+	if _, _, _, err := cl.Delta(context.Background(), abID, next); err != nil {
 		t.Fatalf("Delta(next): %v", err)
 	}
 	if stub.gotSyncToken != deltaServerToken {
@@ -167,7 +167,7 @@ func TestSyncDelta(t *testing.T) {
 func TestSyncDeltaInvalidAddressBookID(t *testing.T) {
 	stub := &syncStubServer{abPath: testAddressBook, cardPath: testCardPath, cardBody: serverCard}
 	cl, stub := newSyncClient(t, stub)
-	if _, _, err := cl.Delta(context.Background(), "!!!", ""); err == nil {
+	if _, _, _, err := cl.Delta(context.Background(), "!!!", ""); err == nil {
 		t.Error("Delta(invalid id) = nil error, want error")
 	}
 	if stub.reportCalls != 0 {

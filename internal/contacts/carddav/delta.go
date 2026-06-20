@@ -17,10 +17,9 @@ var _ contacts.DeltaReader = (*Client)(nil)
 // The returned next token is the sync-response's SyncToken, fed back on the
 // following call to fetch only what changed since.
 //
-// This first cut is ADDITIVE — it maps the sync-response's updated address
-// objects to Contacts (stamping each with its opaque id, the same codec as the
-// read paths) and returns them. The sync-response's deleted hrefs are ignored
-// here; reporting deletions is future work (see contacts.DeltaReader).
+// It maps the sync-response's updated address objects to Contacts (stamping each
+// with its opaque id, the same codec as the read paths), and returns the deleted
+// hrefs as opaque IDs the caller can emit as Graph @removed tombstones.
 //
 // go-webdav gotcha: a sync-collection response reports only WHICH hrefs changed
 // (path/etag/last-modified) — go-webdav's SyncResponse.Updated objects carry no
@@ -29,10 +28,10 @@ var _ contacts.DeltaReader = (*Client)(nil)
 // (the same call GetContact uses) and map it through contactFromObject. An
 // updated object whose card cannot be fetched or mapped is skipped rather than
 // failing the whole delta, mirroring ListContacts.
-func (cl *Client) Delta(ctx context.Context, abID string, token string) ([]contacts.Contact, string, error) {
+func (cl *Client) Delta(ctx context.Context, abID string, token string) (changed []contacts.Contact, removed []string, next string, err error) {
 	abPath, err := decodeAddressBookID(abID)
 	if err != nil {
-		return nil, "", err
+		return nil, nil, "", err
 	}
 	query := &gocarddav.SyncQuery{
 		// Ask for the vCard data; even though go-webdav does not surface it on
@@ -43,16 +42,15 @@ func (cl *Client) Delta(ctx context.Context, abID string, token string) ([]conta
 	}
 	res, err := cl.c.SyncCollection(ctx, abPath, query)
 	if err != nil {
-		return nil, "", fmt.Errorf("carddav: delta: %w", err)
+		return nil, nil, "", fmt.Errorf("carddav: delta: %w", err)
 	}
-	var changed []contacts.Contact
 	for _, obj := range res.Updated {
 		card := obj.Card
 		if len(card) == 0 {
 			// The sync response listed the href but not its card; fetch it.
-			full, err := cl.c.GetAddressObject(ctx, obj.Path)
-			if err != nil {
-				return nil, "", fmt.Errorf("carddav: delta: get %q: %w", obj.Path, err)
+			full, gerr := cl.c.GetAddressObject(ctx, obj.Path)
+			if gerr != nil {
+				return nil, nil, "", fmt.Errorf("carddav: delta: get %q: %w", obj.Path, gerr)
 			}
 			card = full.Card
 		}
@@ -60,6 +58,8 @@ func (cl *Client) Delta(ctx context.Context, abID string, token string) ([]conta
 			changed = append(changed, c)
 		}
 	}
-	// res.Deleted holds the removed hrefs; ignored for this additive first cut.
-	return changed, res.SyncToken, nil
+	for _, href := range res.Deleted {
+		removed = append(removed, contactID(href))
+	}
+	return changed, removed, res.SyncToken, nil
 }

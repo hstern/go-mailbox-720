@@ -316,7 +316,7 @@ func TestRadicaleDelta(t *testing.T) {
 	}
 
 	// Initial sync: an empty token returns the current events and a fresh token.
-	initial, token, err := d.Delta(ctx, work.ID, "")
+	initial, _, token, err := d.Delta(ctx, work.ID, "")
 	if err != nil {
 		t.Fatalf("initial Delta: %v", err)
 	}
@@ -344,7 +344,7 @@ func TestRadicaleDelta(t *testing.T) {
 
 	// Incremental sync: the prior token returns only the new event and a token
 	// that has advanced past the initial one.
-	changed, next, err := d.Delta(ctx, work.ID, token)
+	changed, _, next, err := d.Delta(ctx, work.ID, token)
 	if err != nil {
 		t.Fatalf("incremental Delta: %v", err)
 	}

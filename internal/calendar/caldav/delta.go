@@ -33,12 +33,12 @@ func eventCompRequest() gocaldav.CalendarCompRequest {
 // path as ListEvents — each Event stamped with the opaque event id encoding its
 // href.
 //
-// This first cut is additive: removed resources (SyncResponse.Deleted) are
-// ignored. Surfacing them as Graph @removed tombstones is future work.
-func (cl *Client) Delta(ctx context.Context, calID string, token string) ([]calendar.Event, string, error) {
+// Removed resources (SyncResponse.Deleted) are returned as the opaque IDs the
+// caller can emit as Graph @removed tombstones.
+func (cl *Client) Delta(ctx context.Context, calID string, token string) (changed []calendar.Event, removed []string, next string, err error) {
 	calPath, err := decodeCalendarID(calID)
 	if err != nil {
-		return nil, "", err
+		return nil, nil, "", err
 	}
 
 	sync, err := cl.c.SyncCollection(ctx, calPath, &gocaldav.SyncQuery{
@@ -46,10 +46,14 @@ func (cl *Client) Delta(ctx context.Context, calID string, token string) ([]cale
 		SyncToken:   token,
 	})
 	if err != nil {
-		return nil, "", fmt.Errorf("caldav: delta: %w", err)
+		return nil, nil, "", fmt.Errorf("caldav: delta: %w", err)
+	}
+
+	for _, href := range sync.Deleted {
+		removed = append(removed, eventID(href))
 	}
 	if len(sync.Updated) == 0 {
-		return nil, sync.SyncToken, nil
+		return nil, removed, sync.SyncToken, nil
 	}
 
 	paths := make([]string, 0, len(sync.Updated))
@@ -61,17 +65,17 @@ func (cl *Client) Delta(ctx context.Context, calID string, token string) ([]cale
 		CompRequest: eventCompRequest(),
 	})
 	if err != nil {
-		return nil, "", fmt.Errorf("caldav: delta fetch: %w", err)
+		return nil, nil, "", fmt.Errorf("caldav: delta fetch: %w", err)
 	}
 
-	events := make([]calendar.Event, 0, len(objs))
+	changed = make([]calendar.Event, 0, len(objs))
 	for _, o := range objs {
 		if o.Data == nil {
 			continue
 		}
 		if e, ok := eventFromObject(calID, o.Path, o.Data); ok {
-			events = append(events, e)
+			changed = append(changed, e)
 		}
 	}
-	return events, sync.SyncToken, nil
+	return changed, removed, sync.SyncToken, nil
 }

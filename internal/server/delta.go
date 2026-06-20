@@ -9,8 +9,6 @@ import (
 
 	ht "github.com/ogen-go/ogen/http"
 
-	"github.com/hstern/go-mailbox-720/internal/calendar"
-	"github.com/hstern/go-mailbox-720/internal/contacts"
 	"github.com/hstern/go-mailbox-720/internal/graph/api"
 	"github.com/hstern/go-mailbox-720/internal/mail"
 )
@@ -60,94 +58,6 @@ func (h Handler) MeMessagesDelta(ctx context.Context, params api.MeMessagesDelta
 		Response: api.MeMessagesDelta2XX{
 			Value:             value,
 			OdataDotDeltaLink: api.NewOptNilString(deltaLink("/me/messages/delta()", next)),
-		},
-	}, nil
-}
-
-// MeEventsDelta implements GET /me/events/delta — incremental sync of the
-// principal's primary calendar via the CalDAV adapter's calendar.DeltaReader
-// (RFC 6578 sync-token), folding the next token into @odata.deltaLink. A backend
-// without delta support yields 501; a principal with no calendar yields an empty
-// delta. Additive first cut (created/updated events; deletions are future work).
-func (h Handler) MeEventsDelta(ctx context.Context, params api.MeEventsDeltaParams) (api.MeEventsDeltaRes, error) {
-	b, err := h.calendarBackend(ctx)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = b.Close() }()
-
-	d, ok := b.(calendar.DeltaReader)
-	if !ok {
-		return nil, ht.ErrNotImplemented
-	}
-
-	calID, ok, err := defaultCalendarID(ctx, b)
-	if err != nil {
-		return nil, err
-	}
-	if !ok {
-		return &api.MeEventsDelta2XXStatusCode{
-			StatusCode: http.StatusOK,
-			Response:   api.MeEventsDelta2XX{Value: []api.MicrosoftGraphEvent{}},
-		}, nil
-	}
-
-	events, next, err := d.Delta(ctx, calID, params.Deltatoken.Or(params.Skiptoken.Or("")))
-	if err != nil {
-		return nil, fmt.Errorf("events delta: %w", err)
-	}
-	value := make([]api.MicrosoftGraphEvent, 0, len(events))
-	for _, e := range events {
-		value = append(value, toGraphEvent(e))
-	}
-	return &api.MeEventsDelta2XXStatusCode{
-		StatusCode: http.StatusOK,
-		Response: api.MeEventsDelta2XX{
-			Value:             value,
-			OdataDotDeltaLink: api.NewOptNilString(deltaLink("/me/events/delta()", next)),
-		},
-	}, nil
-}
-
-// MeContactsDelta implements GET /me/contacts/delta — incremental sync of the
-// principal's default address book via the CardDAV adapter's contacts.DeltaReader
-// (RFC 6578 sync-token). Same shape as MeEventsDelta.
-func (h Handler) MeContactsDelta(ctx context.Context, params api.MeContactsDeltaParams) (api.MeContactsDeltaRes, error) {
-	b, err := h.contactsBackend(ctx)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = b.Close() }()
-
-	d, ok := b.(contacts.DeltaReader)
-	if !ok {
-		return nil, ht.ErrNotImplemented
-	}
-
-	bookID, ok, err := defaultAddressBookID(ctx, b)
-	if err != nil {
-		return nil, err
-	}
-	if !ok {
-		return &api.MeContactsDelta2XXStatusCode{
-			StatusCode: http.StatusOK,
-			Response:   api.MeContactsDelta2XX{Value: []api.MicrosoftGraphContact{}},
-		}, nil
-	}
-
-	changed, next, err := d.Delta(ctx, bookID, params.Deltatoken.Or(params.Skiptoken.Or("")))
-	if err != nil {
-		return nil, fmt.Errorf("contacts delta: %w", err)
-	}
-	value := make([]api.MicrosoftGraphContact, 0, len(changed))
-	for _, c := range changed {
-		value = append(value, toGraphContact(c))
-	}
-	return &api.MeContactsDelta2XXStatusCode{
-		StatusCode: http.StatusOK,
-		Response: api.MeContactsDelta2XX{
-			Value:             value,
-			OdataDotDeltaLink: api.NewOptNilString(deltaLink("/me/contacts/delta()", next)),
 		},
 	}, nil
 }
