@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"path"
+	"strconv"
 	"strings"
 	"time"
 
@@ -103,6 +104,13 @@ func eventToICal(e calendar.Event) *ical.Calendar {
 	ev := ical.NewEvent()
 	ev.Props.SetText(ical.PropUID, e.UID)
 	ev.Props.SetDateTime(ical.PropDateTimeStamp, time.Now().UTC())
+	if e.Sequence > 0 {
+		// A bare integer property — SetText would tag it VALUE=TEXT, contradicting
+		// SEQUENCE's INTEGER type and tripping up strict CalDAV clients.
+		seq := ical.NewProp(ical.PropSequence)
+		seq.Value = strconv.Itoa(e.Sequence)
+		ev.Props.Set(seq)
+	}
 	if !e.Start.IsZero() {
 		ev.Props.SetDateTime(ical.PropDateTimeStart, e.Start.UTC())
 	}

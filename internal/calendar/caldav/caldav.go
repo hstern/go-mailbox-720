@@ -192,6 +192,7 @@ func mapEvent(ev *ical.Event) calendar.Event {
 		UID:       propText(ev, ical.PropUID),
 		Location:  propText(ev, ical.PropLocation),
 		Status:    strings.ToLower(propText(ev, ical.PropStatus)),
+		Sequence:  propInt(ev, ical.PropSequence),
 		Organizer: calAddress(ev.Props.Get(ical.PropOrganizer)),
 		Body: calendar.Body{
 			ContentType: "text",
@@ -235,6 +236,17 @@ func propText(ev *ical.Event, name string) string {
 		return v
 	}
 	return ""
+}
+
+// propInt returns a component property's integer value, or 0 if absent or
+// unparseable (e.g. SEQUENCE, whose RFC 5545 default is 0).
+func propInt(ev *ical.Event, name string) int {
+	if p := ev.Props.Get(name); p != nil {
+		if v, err := p.Int(); err == nil {
+			return v
+		}
+	}
+	return 0
 }
 
 // calAddress maps an iCalendar CAL-ADDRESS property (ORGANIZER / ATTENDEE) to a

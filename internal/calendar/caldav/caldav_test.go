@@ -170,6 +170,7 @@ func TestEventToICalRoundTrip(t *testing.T) {
 		UID:       "event-123@example.com",
 		Subject:   "Quarterly Planning",
 		Location:  "Conference Room B",
+		Sequence:  3,
 		Start:     time.Date(2026, 6, 19, 13, 0, 0, 0, time.UTC),
 		End:       time.Date(2026, 6, 19, 14, 30, 0, 0, time.UTC),
 		Organizer: calendar.Address{Name: "Alice Smith", Email: "alice@example.com"},
@@ -215,6 +216,9 @@ func TestEventToICalRoundTrip(t *testing.T) {
 	}
 	if got.Location != want.Location {
 		t.Errorf("Location = %q, want %q", got.Location, want.Location)
+	}
+	if got.Sequence != want.Sequence {
+		t.Errorf("Sequence = %d, want %d", got.Sequence, want.Sequence)
 	}
 	if !got.Start.Equal(want.Start) {
 		t.Errorf("Start = %v, want %v", got.Start, want.Start)
