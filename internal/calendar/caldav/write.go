@@ -91,6 +91,90 @@ func (cl *Client) putEvent(ctx context.Context, objectPath string, e calendar.Ev
 	return nil
 }
 
+var _ calendar.InstanceWriter = (*Client)(nil)
+
+// WriteInstanceOverride records a per-occurrence override of a recurring series:
+// it adds (or replaces) an override VEVENT carrying the occurrence's RECURRENCE-ID
+// inside the series object resource, leaving the master and the other overrides
+// intact. masterID is the opaque series-master ID; override.RecurrenceID names the
+// occurrence to override (it must be non-zero). It returns the stored override
+// event stamped with its instance ID.
+//
+// It implements calendar.InstanceWriter via a read-modify-write on the single
+// object resource that holds the whole series (master + overrides share one UID),
+// since CalDAV addresses a series by that one resource rather than per instance.
+func (cl *Client) WriteInstanceOverride(ctx context.Context, masterID string, override calendar.Event) (calendar.Event, error) {
+	if override.RecurrenceID.IsZero() {
+		return calendar.Event{}, fmt.Errorf("caldav: WriteInstanceOverride requires a RecurrenceID")
+	}
+	// Decode the series-master (or instance) id to the object path; both forms
+	// address the one resource holding the whole series, so the recurrence-id half
+	// of an instance id is discarded here.
+	objectPath, _, _, err := decodeInstanceEventID(masterID)
+	if err != nil {
+		return calendar.Event{}, err
+	}
+	obj, err := cl.c.GetCalendarObject(ctx, objectPath)
+	if err != nil {
+		return calendar.Event{}, fmt.Errorf("caldav: get calendar object %q: %w", objectPath, err)
+	}
+	cal := obj.Data
+	if cal == nil {
+		return calendar.Event{}, fmt.Errorf("caldav: object %q has no calendar data", objectPath)
+	}
+
+	uid := seriesUID(cal)
+	override.UID = uid
+	overrideEvent := overrideVEVENT(override)
+
+	// Replace any existing override for this RECURRENCE-ID; otherwise append.
+	rid := override.RecurrenceID.UTC()
+	children := cal.Children[:0]
+	for _, child := range cal.Children {
+		if child.Name == ical.CompEvent {
+			ev := &ical.Event{Component: child}
+			if existing, ok := recurrenceIDOf(ev); ok && existing.Equal(rid) {
+				continue // drop the stale override; the fresh one is appended below
+			}
+		}
+		children = append(children, child)
+	}
+	cal.Children = append(children, overrideEvent.Component)
+
+	if _, err := cl.c.PutCalendarObject(ctx, objectPath, cal); err != nil {
+		return calendar.Event{}, fmt.Errorf("caldav: put override into %q: %w", objectPath, err)
+	}
+
+	override.ID = instanceEventID(objectPath, rid)
+	override.CalendarID = calendarIDForObject(objectPath)
+	override.SeriesMasterID = eventID(objectPath)
+	override.IsOverride = true
+	return override, nil
+}
+
+// seriesUID returns the UID shared by the VEVENTs of a series object (the master's
+// UID), so a freshly built override VEVENT carries the matching UID. Returns "" if
+// no VEVENT carries one.
+func seriesUID(cal *ical.Calendar) string {
+	for _, ev := range cal.Events() {
+		if uid := propText(&ev, ical.PropUID); uid != "" {
+			return uid
+		}
+	}
+	return ""
+}
+
+// overrideVEVENT builds the override VEVENT for a single occurrence: the event's
+// fields plus its RECURRENCE-ID. It reuses eventToICal and lifts out the single
+// VEVENT, since eventToICal already emits the RECURRENCE-ID for an event with a
+// non-zero RecurrenceID.
+func overrideVEVENT(e calendar.Event) *ical.Event {
+	e.Recurrence = nil // an override is one occurrence, never a nested series
+	cal := eventToICal(e)
+	events := cal.Events()
+	return &events[0]
+}
+
 // eventToICal builds a VCALENDAR holding a single VEVENT from a neutral Event,
 // the inverse of mapEvent. It is the write-path counterpart used by CreateEvent
 // and UpdateEvent: a calendar object resource stored in a collection carries no
@@ -125,6 +209,25 @@ func eventToICal(e calendar.Event) *ical.Calendar {
 	}
 	if e.Body.Content != "" {
 		ev.Props.SetText(ical.PropDescription, e.Body.Content)
+	}
+	// A series master carries its recurrence rule (RRULE) and EXDATE exceptions.
+	if e.Recurrence != nil && strings.TrimSpace(e.Recurrence.RRULE) != "" {
+		rrule := ical.NewProp(ical.PropRecurrenceRule)
+		rrule.SetValueType(ical.ValueRecurrence)
+		rrule.Value = strings.TrimSpace(e.Recurrence.RRULE)
+		ev.Props.Set(rrule)
+		for _, ex := range e.Recurrence.ExceptionDates {
+			exdate := ical.NewProp(ical.PropExceptionDates)
+			exdate.SetDateTime(ex.UTC())
+			ev.Props.Add(exdate)
+		}
+	}
+	// An override (exception) instance carries a RECURRENCE-ID naming the
+	// occurrence it replaces.
+	if !e.RecurrenceID.IsZero() {
+		rid := ical.NewProp(ical.PropRecurrenceID)
+		rid.SetDateTime(e.RecurrenceID.UTC())
+		ev.Props.Set(rid)
 	}
 	if org := buildAddress(ical.PropOrganizer, e.Organizer); org != nil {
 		ev.Props.Set(org)

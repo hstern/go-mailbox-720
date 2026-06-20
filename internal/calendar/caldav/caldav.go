@@ -174,10 +174,13 @@ func (cl *Client) FindEventByUID(ctx context.Context, calID, uid string) (calend
 	return calendar.Event{}, false, nil
 }
 
-// GetEvent fetches a single event resource by opaque ID and maps its master
-// VEVENT.
+// GetEvent fetches a single event resource by opaque ID and maps it to a neutral
+// Event. A plain (master) id maps the master VEVENT; an instance id — one minted
+// by ListInstances that carries a RECURRENCE-ID — maps the addressed occurrence
+// (its stored override VEVENT when one exists, otherwise the occurrence
+// synthesized from the master's RRULE).
 func (cl *Client) GetEvent(ctx context.Context, id string) (calendar.Event, error) {
-	objectPath, err := decodeEventID(id)
+	objectPath, recurrenceID, isInstance, err := decodeInstanceEventID(id)
 	if err != nil {
 		return calendar.Event{}, err
 	}
@@ -185,11 +188,66 @@ func (cl *Client) GetEvent(ctx context.Context, id string) (calendar.Event, erro
 	if err != nil {
 		return calendar.Event{}, fmt.Errorf("caldav: get calendar object %q: %w", objectPath, err)
 	}
-	e, ok := eventFromObject(calendarIDForObject(objectPath), objectPath, obj.Data)
+	calID := calendarIDForObject(objectPath)
+	if isInstance {
+		e, ok := instanceFromObject(calID, objectPath, obj.Data, recurrenceID)
+		if !ok {
+			return calendar.Event{}, fmt.Errorf("caldav: event %s has no such occurrence", id)
+		}
+		return e, nil
+	}
+	e, ok := eventFromObject(calID, objectPath, obj.Data)
 	if !ok {
 		return calendar.Event{}, fmt.Errorf("caldav: event %s has no VEVENT", id)
 	}
 	return e, nil
+}
+
+// instanceFromObject resolves one occurrence of a series — addressed by its
+// RECURRENCE-ID instant — to a neutral Event. It prefers a stored override VEVENT
+// for that instant; failing that it synthesizes the occurrence from the master
+// (start = recurrenceID, end shifted by the master's duration). Reports false when
+// the object holds no master VEVENT.
+func instanceFromObject(calID, objectPath string, cal *ical.Calendar, recurrenceID time.Time) (calendar.Event, bool) {
+	if cal == nil {
+		return calendar.Event{}, false
+	}
+	events := cal.Events()
+	masterIdx := -1
+	for i := range events {
+		if rid, ok := recurrenceIDOf(&events[i]); ok {
+			if rid.Equal(recurrenceID) {
+				e := mapEvent(&events[i])
+				e.IsOverride = true
+				e.RecurrenceID = recurrenceID
+				e.ID = instanceEventID(objectPath, recurrenceID)
+				e.CalendarID = calID
+				e.SeriesMasterID = eventID(objectPath)
+				return e, true
+			}
+			continue
+		}
+		if masterIdx < 0 {
+			masterIdx = i
+		}
+	}
+	if masterIdx < 0 {
+		return calendar.Event{}, false
+	}
+	master := &events[masterIdx]
+	e := mapEvent(master)
+	e.Recurrence = nil // a single occurrence is not itself a series
+	start, _ := master.DateTimeStart(time.UTC)
+	end, _ := master.DateTimeEnd(time.UTC)
+	e.Start = recurrenceID
+	if !start.IsZero() && !end.IsZero() {
+		e.End = recurrenceID.Add(end.Sub(start))
+	}
+	e.RecurrenceID = recurrenceID
+	e.ID = instanceEventID(objectPath, recurrenceID)
+	e.CalendarID = calID
+	e.SeriesMasterID = eventID(objectPath)
+	return e, true
 }
 
 // propRecurrenceID is the VEVENT property marking a recurrence override instance
@@ -199,8 +257,10 @@ const propRecurrenceID = "RECURRENCE-ID"
 // eventFromObject maps one CalDAV calendar object to a single neutral Event,
 // using the master VEVENT — the component without a RECURRENCE-ID. The VEVENTs
 // in an object share one UID (a master plus recurrence overrides) and thus one
-// opaque event ID, so a series is represented by its master; recurrence
-// expansion is future work. Reports false when the object holds no VEVENT.
+// opaque event ID, so a series is represented at the collection level by its
+// master, which carries the recurrence pattern (RRULE/EXDATE). The individual
+// occurrences and overrides are surfaced separately, addressed by instance IDs,
+// via ListInstances / GetEvent. Reports false when the object holds no VEVENT.
 func eventFromObject(calID, objectPath string, cal *ical.Calendar) (calendar.Event, bool) {
 	if cal == nil {
 		return calendar.Event{}, false
@@ -255,6 +315,11 @@ func mapEvent(ev *ical.Event) calendar.Event {
 		e.CreatedAt = created
 	}
 	e.IsAllDay = isAllDay(ev)
+	e.Recurrence = recurrenceFromEvent(ev)
+	if rid, ok := recurrenceIDOf(ev); ok {
+		e.RecurrenceID = rid
+		e.IsOverride = true
+	}
 	for _, p := range ev.Props.Values(ical.PropAttendee) {
 		if a := calAddress(&p); a != (calendar.Address{}) {
 			e.Attendees = append(e.Attendees, calendar.Attendee{
