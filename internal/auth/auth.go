@@ -155,15 +155,18 @@ func (a *Authenticator) Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		raw, err := accesstoken.BearerToken(r) // RFC 6750 §2.1 bearer extraction
 		if err != nil {
+			a.challenge(w, "") // no credentials: a bare challenge, no error (RFC 6750 §3)
 			grapherr.Write(w, http.StatusUnauthorized)
 			return
 		}
 		p, err := a.validate(r.Context(), raw)
 		if err != nil {
+			a.challenge(w, "invalid_token")
 			grapherr.Write(w, http.StatusUnauthorized)
 			return
 		}
 		if !p.hasScopes(a.requiredScopes) {
+			a.challenge(w, "insufficient_scope")
 			grapherr.Write(w, http.StatusForbidden)
 			return
 		}
@@ -172,11 +175,37 @@ func (a *Authenticator) Middleware(next http.Handler) http.Handler {
 		// keeps mailboxes distinct (and unspoofable) across multiple BYO IdPs.
 		mailbox := subjectid.IssSubID{Iss: p.issuer, Sub: p.subject}
 		if mailbox.Validate() != nil {
+			a.challenge(w, "invalid_token")
 			grapherr.Write(w, http.StatusUnauthorized)
 			return
 		}
 		next.ServeHTTP(w, r.WithContext(withMailbox(r.Context(), mailbox)))
 	})
+}
+
+// challenge sets the RFC 6750 §3 "WWW-Authenticate: Bearer" header on an auth
+// failure, so a client learns how to authenticate (and why it was refused). errCode
+// is "" for a request carrying no credentials — the spec omits the error code then —
+// else "invalid_token" (401) or "insufficient_scope" (403, with the required scope).
+//
+// INTERIM: composed inline; migrates to go-bearer-token's typed Challenge once that
+// library ships (MB720-17).
+func (a *Authenticator) challenge(w http.ResponseWriter, errCode string) {
+	params := make([]string, 0, 3)
+	if a.audience != "" {
+		params = append(params, fmt.Sprintf("realm=%q", a.audience))
+	}
+	if errCode != "" {
+		params = append(params, fmt.Sprintf("error=%q", errCode))
+	}
+	if errCode == "insufficient_scope" && len(a.requiredScopes) > 0 {
+		params = append(params, fmt.Sprintf("scope=%q", strings.Join(a.requiredScopes, " ")))
+	}
+	v := "Bearer"
+	if len(params) > 0 {
+		v += " " + strings.Join(params, ", ")
+	}
+	w.Header().Set("WWW-Authenticate", v)
 }
 
 // validate resolves a bearer token to a principal. A JWT from a known issuer is
