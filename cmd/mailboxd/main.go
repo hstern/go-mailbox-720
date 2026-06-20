@@ -34,6 +34,7 @@ import (
 	"github.com/hstern/go-mailbox-720/internal/contacts/carddav"
 	"github.com/hstern/go-mailbox-720/internal/mail"
 	"github.com/hstern/go-mailbox-720/internal/mail/imap"
+	"github.com/hstern/go-mailbox-720/internal/notify"
 	"github.com/hstern/go-mailbox-720/internal/server"
 	"github.com/hstern/go-mailbox-720/internal/subscriptions"
 )
@@ -182,7 +183,7 @@ func run(addr string, authCfg auth.Config, provider server.MailProvider, calProv
 	)
 	mux.Handle(basePath+"/subscriptions", subHandler)
 	mux.Handle(basePath+"/subscriptions/", subHandler)
-	log.Println("subscriptions: enabled (in-memory store; delivery not yet wired)")
+	log.Println("subscriptions: endpoint enabled (in-memory store)")
 
 	mux.Handle("/", h)
 
@@ -209,6 +210,10 @@ func run(addr string, authCfg auth.Config, provider server.MailProvider, calProv
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// Drive change-notification delivery off the inbox when the mail backend
+	// supports IDLE + delta. It runs until ctx is cancelled (shutdown).
+	startNotifier(ctx, provider, subStore)
+
 	errc := make(chan error, 1)
 	go func() {
 		log.Println("mailboxd listening on", addr)
@@ -226,6 +231,55 @@ func run(addr string, authCfg auth.Config, provider server.MailProvider, calProv
 		defer cancel()
 		return srv.Shutdown(shutdownCtx)
 	}
+}
+
+// startNotifier launches the change-notification delivery loop in a goroutine
+// when the mail backend supports IMAP IDLE (mail.Watcher) and delta sync
+// (mail.DeltaReader). An IDLE watch monopolizes its connection, so it dials two
+// dedicated connections — one to watch, one to sync — and closes both when the
+// loop stops. A missing provider or capability is a logged no-op (the
+// subscriptions endpoint still accepts subscriptions; they just aren't delivered).
+func startNotifier(ctx context.Context, provider server.MailProvider, store subscriptions.Store) {
+	if provider == nil {
+		return
+	}
+	watchBackend, err := provider.Mail(ctx)
+	if err != nil {
+		log.Println("notifications: disabled (watch connection failed):", err)
+		return
+	}
+	watcher, ok := watchBackend.(mail.Watcher)
+	if !ok {
+		_ = watchBackend.Close()
+		log.Println("notifications: disabled (mail backend does not support IMAP IDLE)")
+		return
+	}
+	syncBackend, err := provider.Mail(ctx)
+	if err != nil {
+		_ = watchBackend.Close()
+		log.Println("notifications: disabled (sync connection failed):", err)
+		return
+	}
+	syncer, ok := syncBackend.(mail.DeltaReader)
+	if !ok {
+		_ = watchBackend.Close()
+		_ = syncBackend.Close()
+		log.Println("notifications: disabled (mail backend does not support delta)")
+		return
+	}
+
+	go func() {
+		defer func() { _ = watchBackend.Close(); _ = syncBackend.Close() }()
+		log.Println("notifications: delivery loop watching the inbox")
+		report := func(r subscriptions.Result) {
+			if r.Delivered > 0 || len(r.Errors) > 0 {
+				log.Printf("notifications: delivered %d/%d (errors=%d)", r.Delivered, r.Matched, len(r.Errors))
+			}
+		}
+		if err := notify.Run(ctx, watcher, syncer, store, subscriptions.GuardedClient(), time.Now, report); err != nil {
+			log.Println("notifications: delivery loop stopped:", err)
+		}
+	}()
 }
 
 // splitList parses a comma-separated flag value into a trimmed, non-empty slice.
