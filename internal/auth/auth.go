@@ -193,14 +193,14 @@ func (a *Authenticator) Middleware(next http.Handler) http.Handler {
 // failure, so a client learns how to authenticate (and why it was refused). errCode
 // is "" for a request carrying no credentials — the spec omits the error code then —
 // else bearer.ErrorInvalidToken or bearer.ErrorInsufficientScope (with the required
-// scope). Only the header is set here; grapherr.Write owns the status and the Graph
-// error body (so this uses Challenge.String, not Challenge.WriteHeader).
+// scope). We use Challenge.SetHeader (header only), not Respond, so grapherr.Write
+// keeps owning the status and the Graph error body.
 func (a *Authenticator) challenge(w http.ResponseWriter, errCode string) {
 	c := bearer.Challenge{Realm: a.audience, Error: errCode}
 	if errCode == bearer.ErrorInsufficientScope {
 		c.Scope = strings.Join(a.requiredScopes, " ")
 	}
-	w.Header().Set("WWW-Authenticate", c.String())
+	c.SetHeader(w)
 }
 
 // validate resolves a bearer token to a principal. A JWT from a known issuer is
