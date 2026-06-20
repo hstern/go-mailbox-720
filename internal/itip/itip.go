@@ -30,6 +30,7 @@ package itip
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -37,6 +38,13 @@ import (
 	"github.com/hstern/go-mailbox-720/internal/scheduling"
 	"github.com/hstern/go-mailbox-720/internal/smtp"
 )
+
+// ErrNotRequest is returned by ProcessRequest when the message is a valid iMIP
+// scheduling object but not a METHOD:REQUEST (e.g. a REPLY or CANCEL). Together
+// with scheduling.ErrNoCalendar (ordinary mail), it lets a mailbox-scanning loop
+// skip messages it should not turn into tentative events without treating them as
+// errors.
+var ErrNotRequest = errors.New("itip: message is not a scheduling REQUEST")
 
 // StatusTentative is the [calendar.Event.Status] marker for an inbound REQUEST
 // the user has not yet answered: a tentatively-held event surfaced on the
@@ -108,7 +116,7 @@ func ProcessRequest(ctx context.Context, w calendar.Writer, calendarID string, r
 		return calendar.Event{}, fmt.Errorf("itip: parse request: %w", err)
 	}
 	if inv.Method != scheduling.MethodRequest {
-		return calendar.Event{}, fmt.Errorf("itip: process request: method %q is not REQUEST", inv.Method)
+		return calendar.Event{}, fmt.Errorf("%w (method %q)", ErrNotRequest, inv.Method)
 	}
 
 	event := EventFromInvite(inv)

@@ -35,6 +35,7 @@ import (
 	"github.com/hstern/go-mailbox-720/internal/mail"
 	"github.com/hstern/go-mailbox-720/internal/mail/imap"
 	"github.com/hstern/go-mailbox-720/internal/notify"
+	"github.com/hstern/go-mailbox-720/internal/schedrun"
 	"github.com/hstern/go-mailbox-720/internal/server"
 	"github.com/hstern/go-mailbox-720/internal/subscriptions"
 )
@@ -53,6 +54,7 @@ func main() {
 	caldavUser := flag.String("cal-caldav-username", "", "CalDAV username for the calendar backend")
 	carddavURL := flag.String("contacts-carddav-url", "", "CardDAV base URL for the contacts backend (empty: contacts operations return 501; password from MAILBOXD_CARDDAV_PASSWORD). Use an https:// URL for TLS")
 	carddavUser := flag.String("contacts-carddav-username", "", "CardDAV username for the contacts backend")
+	enableScheduling := flag.Bool("enable-scheduling", false, "run the iTIP scheduling trigger: turn inbound mail invitations into tentative calendar events (needs IMAP + CalDAV backends; opt-in, since it writes to the calendar and the RFC 6638 capability switch is not yet implemented)")
 	flag.Parse()
 
 	cfg := auth.Config{
@@ -94,7 +96,7 @@ func main() {
 			password: os.Getenv("MAILBOXD_CARDDAV_PASSWORD"),
 		}
 	}
-	if err := run(*addr, cfg, provider, calProvider, contactsProvider); err != nil {
+	if err := run(*addr, cfg, provider, calProvider, contactsProvider, *enableScheduling); err != nil {
 		log.Fatalln("mailboxd:", err)
 	}
 }
@@ -133,7 +135,7 @@ func (p staticCardDAVProvider) Contacts(_ context.Context) (contacts.Backend, er
 	return carddav.Dial(p.url, p.username, p.password, nil)
 }
 
-func run(addr string, authCfg auth.Config, provider server.MailProvider, calProvider server.CalendarProvider, contactsProvider server.ContactsProvider) error {
+func run(addr string, authCfg auth.Config, provider server.MailProvider, calProvider server.CalendarProvider, contactsProvider server.ContactsProvider, enableScheduling bool) error {
 	h, err := server.New(provider, calProvider, contactsProvider)
 	if err != nil {
 		return err
@@ -214,6 +216,11 @@ func run(addr string, authCfg auth.Config, provider server.MailProvider, calProv
 	// supports IDLE + delta. It runs until ctx is cancelled (shutdown).
 	startNotifier(ctx, provider, subStore)
 
+	// Opt-in: turn inbound mail invitations into tentative calendar events.
+	if enableScheduling {
+		startScheduler(ctx, provider, calProvider)
+	}
+
 	errc := make(chan error, 1)
 	go func() {
 		log.Println("mailboxd listening on", addr)
@@ -278,6 +285,83 @@ func startNotifier(ctx context.Context, provider server.MailProvider, store subs
 		}
 		if err := notify.Run(ctx, watcher, syncer, store, subscriptions.GuardedClient(), time.Now, report); err != nil {
 			log.Println("notifications: delivery loop stopped:", err)
+		}
+	}()
+}
+
+// startScheduler launches the iTIP scheduling trigger in a goroutine when both a
+// mail backend (IMAP IDLE + delta + raw) and a writable calendar backend are
+// available. It watches the inbox and turns inbound REQUEST invitations into
+// tentative events in the principal's first calendar; it does NOT auto-reply.
+// Like the notifier it uses a dedicated watch connection plus a sync/raw one (an
+// IDLE watch monopolizes its connection) and closes everything when the loop
+// stops. A missing backend or capability is a logged no-op.
+func startScheduler(ctx context.Context, provider server.MailProvider, calProvider server.CalendarProvider) {
+	if provider == nil || calProvider == nil {
+		log.Println("scheduling: disabled (needs both a mail and a calendar backend)")
+		return
+	}
+	calBackend, err := calProvider.Calendar(ctx)
+	if err != nil {
+		log.Println("scheduling: disabled (calendar connection failed):", err)
+		return
+	}
+	writer, ok := calBackend.(calendar.Writer)
+	if !ok {
+		_ = calBackend.Close()
+		log.Println("scheduling: disabled (calendar backend is read-only)")
+		return
+	}
+	cals, err := calBackend.ListCalendars(ctx)
+	if err != nil || len(cals) == 0 {
+		_ = calBackend.Close()
+		log.Println("scheduling: disabled (no calendar to write to):", err)
+		return
+	}
+	calendarID := cals[0].ID
+
+	watchBackend, err := provider.Mail(ctx)
+	if err != nil {
+		_ = calBackend.Close()
+		log.Println("scheduling: disabled (watch connection failed):", err)
+		return
+	}
+	watcher, ok := watchBackend.(mail.Watcher)
+	if !ok {
+		_ = calBackend.Close()
+		_ = watchBackend.Close()
+		log.Println("scheduling: disabled (mail backend does not support IMAP IDLE)")
+		return
+	}
+	syncBackend, err := provider.Mail(ctx)
+	if err != nil {
+		_ = calBackend.Close()
+		_ = watchBackend.Close()
+		log.Println("scheduling: disabled (sync connection failed):", err)
+		return
+	}
+	syncer, okDelta := syncBackend.(mail.DeltaReader)
+	rawer, okRaw := syncBackend.(mail.RawReader)
+	if !okDelta || !okRaw {
+		_ = calBackend.Close()
+		_ = watchBackend.Close()
+		_ = syncBackend.Close()
+		log.Println("scheduling: disabled (mail backend does not support delta + raw)")
+		return
+	}
+
+	go func() {
+		defer func() { _ = watchBackend.Close(); _ = syncBackend.Close(); _ = calBackend.Close() }()
+		log.Println("scheduling: trigger watching the inbox (invitations -> tentative events; no auto-reply)")
+		report := func(e calendar.Event, err error) {
+			if err != nil {
+				log.Println("scheduling:", err)
+				return
+			}
+			log.Printf("scheduling: tentative event created for %q", e.Subject)
+		}
+		if err := schedrun.Run(ctx, watcher, syncer, rawer, writer, calendarID, report); err != nil {
+			log.Println("scheduling: trigger stopped:", err)
 		}
 	}()
 }

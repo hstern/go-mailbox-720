@@ -24,6 +24,7 @@ package scheduling
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"mime"
@@ -34,6 +35,12 @@ import (
 	"github.com/emersion/go-message"
 	"github.com/emersion/go-message/mail"
 )
+
+// ErrNoCalendar is returned by Parse when the message carries no text/calendar
+// part — i.e. it is ordinary mail, not an iMIP scheduling message. A caller
+// scanning a mailbox uses errors.Is to skip non-invites without treating them as
+// failures.
+var ErrNoCalendar = errors.New("scheduling: no text/calendar part in message")
 
 // Method is an iTIP scheduling method (RFC 5546), carried as the "method"
 // parameter of an iMIP "text/calendar" part and as the VCALENDAR METHOD
@@ -143,7 +150,7 @@ func findCalendar(mr *mail.Reader) (*ical.Calendar, error) {
 	for {
 		part, err := mr.NextPart()
 		if err == io.EOF {
-			return nil, fmt.Errorf("scheduling: no text/calendar part in message")
+			return nil, ErrNoCalendar
 		}
 		// An IsUnknownCharset error still yields a usable part; only a genuine
 		// read error aborts the walk.
