@@ -5,28 +5,16 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+
+	prm "github.com/hstern/go-protected-resource-metadata"
 )
 
-func TestMetadataHandler(t *testing.T) {
-	h := MetadataHandler(Config{
+func TestResourceMetadata(t *testing.T) {
+	m := ResourceMetadata(Config{
 		ResourceID:     "https://mailbox.example.com",
 		Issuers:        []string{"https://idp.example.com"},
 		RequiredScopes: []string{"Mail.Read"},
 	})
-
-	req := httptest.NewRequest(http.MethodGet, WellKnownProtectedResource, nil)
-	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200", rec.Code)
-	}
-	if ct := rec.Header().Get("Content-Type"); ct != "application/json" {
-		t.Errorf("Content-Type = %q, want application/json", ct)
-	}
-	var m ProtectedResourceMetadata
-	if err := json.Unmarshal(rec.Body.Bytes(), &m); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
 	if m.Resource != "https://mailbox.example.com" {
 		t.Errorf("resource = %q", m.Resource)
 	}
@@ -36,16 +24,41 @@ func TestMetadataHandler(t *testing.T) {
 	if len(m.ScopesSupported) != 1 || m.ScopesSupported[0] != "Mail.Read" {
 		t.Errorf("scopes_supported = %v", m.ScopesSupported)
 	}
-	if len(m.BearerMethodsSupported) != 1 || m.BearerMethodsSupported[0] != "header" {
+	if len(m.BearerMethodsSupported) != 1 || m.BearerMethodsSupported[0] != prm.BearerMethodHeader {
 		t.Errorf("bearer_methods_supported = %v", m.BearerMethodsSupported)
 	}
 }
 
-func TestMetadataHandlerRejectsNonGET(t *testing.T) {
-	h := MetadataHandler(Config{ResourceID: "https://r.example"})
+func TestMetadataEndpoint(t *testing.T) {
+	path, h, err := MetadataEndpoint(Config{
+		ResourceID:     "https://mailbox.example.com",
+		Issuers:        []string{"https://idp.example.com"},
+		RequiredScopes: []string{"Mail.Read"},
+	})
+	if err != nil {
+		t.Fatalf("MetadataEndpoint: %v", err)
+	}
+	if path != "/.well-known/oauth-protected-resource" {
+		t.Errorf("path = %q, want /.well-known/oauth-protected-resource", path)
+	}
+
 	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, WellKnownProtectedResource, nil))
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	var m prm.Metadata
+	if err := json.Unmarshal(rec.Body.Bytes(), &m); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if m.Resource != "https://mailbox.example.com" {
+		t.Errorf("resource = %q", m.Resource)
+	}
+
+	// prm's handler answers non-GET/HEAD with 405.
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, path, nil))
 	if rec.Code != http.StatusMethodNotAllowed {
-		t.Errorf("status = %d, want 405", rec.Code)
+		t.Errorf("POST status = %d, want 405", rec.Code)
 	}
 }

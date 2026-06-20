@@ -1,48 +1,35 @@
 package auth
 
 import (
-	"encoding/json"
 	"net/http"
+	"time"
+
+	prm "github.com/hstern/go-protected-resource-metadata"
 )
 
-// WellKnownProtectedResource is the RFC 9728 §3.1 metadata path.
-const WellKnownProtectedResource = "/.well-known/oauth-protected-resource"
-
-// ProtectedResourceMetadata is the subset of the RFC 9728 OAuth 2.0 Protected
-// Resource Metadata document this server publishes about itself: the resource
-// identifier, the authorization servers whose tokens it accepts, the scopes it
-// enforces, and how it expects the token (the Authorization header only).
-//
-// INTERIM: this minimal server-side document migrates to the
-// go-protected-resource-metadata library once it ships (MB720-17); a resource
-// server only needs to serve a static document, so the full typed model + client +
-// validation in that library are not duplicated here.
-type ProtectedResourceMetadata struct {
-	Resource               string   `json:"resource"`
-	AuthorizationServers   []string `json:"authorization_servers,omitempty"`
-	ScopesSupported        []string `json:"scopes_supported,omitempty"`
-	BearerMethodsSupported []string `json:"bearer_methods_supported,omitempty"`
-}
-
-// MetadataHandler serves this resource's RFC 9728 metadata. It is PUBLIC — clients
-// fetch it unauthenticated to discover how to obtain a usable token — so it must be
-// mounted OUTSIDE the auth middleware. The document is derived from cfg: ResourceID
-// is the required "resource" member, Issuers are the authorization servers, and
-// RequiredScopes are advertised as scopes_supported.
-func MetadataHandler(cfg Config) http.Handler {
-	doc, _ := json.Marshal(ProtectedResourceMetadata{
+// ResourceMetadata builds this resource's RFC 9728 protected-resource metadata
+// document from cfg: ResourceID is the required "resource" member, Issuers are the
+// authorization servers, RequiredScopes are advertised as scopes_supported, and the
+// only bearer method is the Authorization header (RFC 6750 §2.1).
+func ResourceMetadata(cfg Config) *prm.Metadata {
+	return &prm.Metadata{
 		Resource:               cfg.ResourceID,
 		AuthorizationServers:   cfg.Issuers,
 		ScopesSupported:        cfg.RequiredScopes,
-		BearerMethodsSupported: []string{"header"}, // RFC 6750 §2.1 only (not form/query)
-	})
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			w.Header().Set("Allow", http.MethodGet)
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write(doc)
-	})
+		BearerMethodsSupported: []string{prm.BearerMethodHeader},
+	}
+}
+
+// MetadataEndpoint returns the request path and handler that publish this resource's
+// RFC 9728 metadata document. It is PUBLIC — clients fetch it unauthenticated to
+// discover the authorization servers and scopes — so mount it OUTSIDE the auth
+// middleware. The path follows the §3.1 well-known construction for cfg.ResourceID;
+// an invalid resource identifier is reported as an error.
+func MetadataEndpoint(cfg Config) (path string, h http.Handler, err error) {
+	m := ResourceMetadata(cfg)
+	path, err = prm.WellKnownRequestPath(m.Resource)
+	if err != nil {
+		return "", nil, err
+	}
+	return path, m.Handler(prm.WithMaxAge(time.Hour)), nil
 }

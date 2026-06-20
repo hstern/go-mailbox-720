@@ -247,11 +247,15 @@ func run(addr string, authCfg auth.Config, provider server.MailProvider, calProv
 		// middleware) so a client can discover the authorization servers + scopes
 		// before it has a token.
 		if authCfg.ResourceID != "" {
+			path, metaHandler, err := auth.MetadataEndpoint(authCfg)
+			if err != nil {
+				return err
+			}
 			outer := http.NewServeMux()
-			outer.Handle(auth.WellKnownProtectedResource, auth.MetadataHandler(authCfg))
+			outer.Handle(path, metaHandler)
 			outer.Handle("/", handler)
 			handler = outer
-			log.Println("auth: publishing RFC 9728 protected-resource metadata at", auth.WellKnownProtectedResource)
+			log.Println("auth: publishing RFC 9728 protected-resource metadata at", path)
 		}
 	} else {
 		log.Println("auth: DISABLED (no -auth-issuer configured) — all requests allowed")
