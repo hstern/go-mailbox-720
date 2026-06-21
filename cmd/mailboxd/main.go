@@ -32,6 +32,7 @@ import (
 	"github.com/hstern/go-mailbox-720/internal/batch"
 	"github.com/hstern/go-mailbox-720/internal/calendar"
 	"github.com/hstern/go-mailbox-720/internal/calendar/caldav"
+	calendarjmap "github.com/hstern/go-mailbox-720/internal/calendar/jmap"
 	"github.com/hstern/go-mailbox-720/internal/contacts"
 	"github.com/hstern/go-mailbox-720/internal/contacts/carddav"
 	jmapcontacts "github.com/hstern/go-mailbox-720/internal/contacts/jmap"
@@ -62,6 +63,7 @@ func main() {
 	jmapSession := flag.String("mail-jmap-session-url", "", "JMAP session resource URL for the mail backend (empty: use IMAP, or return 501 if neither set; access token from MAILBOXD_JMAP_TOKEN). Takes precedence over the IMAP flags when set")
 	caldavURL := flag.String("cal-caldav-url", "", "CalDAV base URL for the calendar backend (empty: calendar operations return 501; password from MAILBOXD_CALDAV_PASSWORD). Use an https:// URL for TLS")
 	caldavUser := flag.String("cal-caldav-username", "", "CalDAV username for the calendar backend")
+	jmapCalSession := flag.String("cal-jmap-session-url", "", "JMAP session resource URL for the calendar backend (empty: use CalDAV, or return 501 if neither set; access token from MAILBOXD_CALENDAR_JMAP_TOKEN). Takes precedence over the CalDAV flags when set")
 	carddavURL := flag.String("contacts-carddav-url", "", "CardDAV base URL for the contacts backend (empty: contacts operations return 501; password from MAILBOXD_CARDDAV_PASSWORD). Use an https:// URL for TLS")
 	carddavUser := flag.String("contacts-carddav-username", "", "CardDAV username for the contacts backend")
 	contactsJMAP := flag.String("contacts-jmap-session-url", "", "JMAP session resource URL for the contacts backend (empty: use CardDAV, or return 501 if neither set; access token from MAILBOXD_CONTACTS_JMAP_TOKEN). Takes precedence over the CardDAV flags when set")
@@ -114,8 +116,18 @@ func main() {
 			tls:      *imapTLS,
 		}
 	}
+	// JMAP and CalDAV are alternative calendar backends behind the same port; JMAP
+	// wins when its session URL is set (it is the closer fit for the JMAP-shaped port).
 	var calProvider server.CalendarProvider
-	if *caldavURL != "" {
+	switch {
+	case *jmapCalSession != "":
+		calProvider = staticJMAPCalendarProvider{
+			sessionURL: *jmapCalSession,
+			// The token is taken from the environment, never a flag, so it does not
+			// appear in the process table.
+			token: os.Getenv("MAILBOXD_CALENDAR_JMAP_TOKEN"),
+		}
+	case *caldavURL != "":
 		calProvider = staticCalDAVProvider{
 			url:      *caldavURL,
 			username: *caldavUser,
@@ -191,6 +203,19 @@ func (p staticCalDAVProvider) Calendar(_ context.Context) (calendar.Backend, err
 	return caldav.Dial(p.url, p.username, p.password, nil)
 }
 
+// staticJMAPCalendarProvider serves every request from one configured JMAP
+// calendar account — the alternative calendar backend behind the same port
+// (mirroring the JMAP mail and contacts backends). The token is a JMAP bearer
+// access token sourced from the environment. A per-identity provider is future
+// work.
+type staticJMAPCalendarProvider struct {
+	sessionURL, token string
+}
+
+func (p staticJMAPCalendarProvider) Calendar(_ context.Context) (calendar.Backend, error) {
+	return calendarjmap.Dial(p.sessionURL, p.token, nil)
+}
+
 // staticCardDAVProvider serves every request from one configured CardDAV
 // account. A per-identity provider (mapping the token's mailbox identity to
 // credentials) is future work, mirroring staticIMAPProvider.
@@ -241,9 +266,12 @@ func run(addr string, authCfg auth.Config, revSink receiver.Sink, ssfReceiverPat
 	default:
 		log.Println("mail: no backend configured — mail operations return 501")
 	}
-	if calProvider != nil {
+	switch calProvider.(type) {
+	case staticJMAPCalendarProvider:
+		log.Println("calendar: JMAP backend enabled")
+	case staticCalDAVProvider:
 		log.Println("calendar: CalDAV backend enabled")
-	} else {
+	default:
 		log.Println("calendar: no backend configured — calendar operations return 501")
 	}
 	if contactsProvider != nil {
