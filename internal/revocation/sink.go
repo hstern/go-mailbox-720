@@ -10,7 +10,6 @@ import (
 	caep "github.com/hstern/go-caep"
 	risc "github.com/hstern/go-risc"
 	secevent "github.com/hstern/go-secevent"
-	subjectid "github.com/hstern/go-subjectid"
 )
 
 // riscRevocationEvents are the RISC account-lifecycle event-type URIs that, like a
@@ -36,7 +35,7 @@ func (s *Store) DeliverSET(_ context.Context, payload []byte) error {
 	if err != nil {
 		return err
 	}
-	sub, ok := issSubID(set.Subject)
+	sub, ok := set.IssSub()
 	if !ok {
 		// Unknown/absent subject format: nothing to revoke here. Accept (the SET
 		// was valid) rather than reject, so the transmitter does not retry.
@@ -59,21 +58,6 @@ func (s *Store) DeliverSET(_ context.Context, payload []byte) error {
 		}
 	}
 	return nil
-}
-
-// issSubID returns the SET subject as an RFC 9493 iss_sub identifier, accepting
-// either the value or the pointer form go-subjectid decodes into (secevent.Parse
-// yields *IssSubID). A subject of any other format — or none — reports false.
-func issSubID(s subjectid.SubjectIdentifier) (subjectid.IssSubID, bool) {
-	switch v := s.(type) {
-	case subjectid.IssSubID:
-		return v, true
-	case *subjectid.IssSubID:
-		if v != nil {
-			return *v, true
-		}
-	}
-	return subjectid.IssSubID{}, false
 }
 
 // sessionRevokedTime resolves a CAEP session-revoked event's effective revocation
