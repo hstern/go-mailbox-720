@@ -30,7 +30,7 @@ require (
 	github.com/hstern/go-caep v0.1.0
 	github.com/hstern/go-jscontact v0.1.0
 	github.com/hstern/go-protected-resource-metadata v0.1.0
-	github.com/hstern/go-risc v0.1.0
+	github.com/hstern/go-risc v0.2.0
 	github.com/hstern/go-secevent v0.1.0
 	github.com/hstern/go-ssf v0.1.0
 	github.com/hstern/go-token-introspection v0.1.0

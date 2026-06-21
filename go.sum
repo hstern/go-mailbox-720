@@ -56,8 +56,8 @@ github.com/hstern/go-jscontact v0.1.0 h1:hpBU64CRfhChuilMAi46q9NtJKHm8CIG63LgW7o
 github.com/hstern/go-jscontact v0.1.0/go.mod h1:gZ3k5MbT+wFpHT4aXrqmB1WIWYAd8hXoPO8LQ5Zt0Jk=
 github.com/hstern/go-protected-resource-metadata v0.1.0 h1:fdS80jxsA+ppRHlUoTuhgosaLPjLfWxLW4YFDNHwUSE=
 github.com/hstern/go-protected-resource-metadata v0.1.0/go.mod h1:thlCq+8qE2UrDhr5qTGRON+8bI+x1xIsA1zwPU53i7s=
-github.com/hstern/go-risc v0.1.0 h1:GNf/Pi0WmULIM4S4qNEJASLf6B5Pz4vcMtlu0o6R6ek=
-github.com/hstern/go-risc v0.1.0/go.mod h1:Rb4yY3DoHl4KbWFoDF64purgtgY5zUoa48gTeAz/xC0=
+github.com/hstern/go-risc v0.2.0 h1:m6MQZ2n4QU4pErrxC590oEDXkzRssEWNJtfJP5mGJNo=
+github.com/hstern/go-risc v0.2.0/go.mod h1:Rb4yY3DoHl4KbWFoDF64purgtgY5zUoa48gTeAz/xC0=
 github.com/hstern/go-secevent v0.1.0 h1:y6Of4UZAEpHlxl2jFls6EUPsxUDMtd+GOj4iVSrZvZY=
 github.com/hstern/go-secevent v0.1.0/go.mod h1:1GoZqZ/6hrwCxaJrEMgtd4NxjTFqWln9VbDMI83JLCI=
 github.com/hstern/go-ssf v0.1.0 h1:edBo5u8ugGz3RwY5eQ1c5q53a7naQKg1fYNItfUMrvk=
