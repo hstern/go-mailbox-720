@@ -152,9 +152,8 @@ func TestReceiverRejectsBadSignature(t *testing.T) {
 
 // TestDeliverSETRISCAccountDisabled exercises a RISC account-disabled event
 // directly through DeliverSET on the (already-verified) payload bytes. The SET is
-// built as raw JSON — the exact on-the-wire shape a transmitter sends — because
-// go-risc exposes no consumer-side constructor for its events (the subject lives in
-// an unexported embedded field); DeliverSET parses bytes, so this is faithful.
+// built with the typed go-risc producer API — the same construction path a real
+// transmitter uses — then encoded to the on-the-wire bytes DeliverSET parses.
 func TestDeliverSETRISCAccountDisabled(t *testing.T) {
 	store := NewStore()
 	iat := time.Date(2026, 6, 20, 9, 0, 0, 0, time.UTC)
@@ -206,29 +205,26 @@ func TestDeliverSETMalformedRejected(t *testing.T) {
 	}
 }
 
-// riscAccountDisabledSET marshals a SET (raw JSON) carrying a RISC account-disabled
-// event for sub, issued at iat. The event payload carries its own subject (RISC
-// puts the subject inside the event, distinct from the SET sub_id).
+// riscAccountDisabledSET builds a SET carrying a RISC account-disabled event for
+// sub, issued at iat, via the typed go-risc producer API (NewAccountDisabled +
+// risc.AddTo). The event carries its own subject (RISC puts the subject inside
+// the event, distinct from the SET sub_id); the constructor sets it from sub.
 func riscAccountDisabledSET(t *testing.T, sub subjectid.IssSubID, iat time.Time) []byte {
 	t.Helper()
-	subJSON, err := sub.MarshalJSON()
-	if err != nil {
-		t.Fatal(err)
+	events := secevent.Events{}
+	if err := risc.AddTo(events, risc.NewAccountDisabled(sub)); err != nil {
+		t.Fatalf("add event: %v", err)
 	}
-	doc := map[string]any{
-		"iss":    sub.Iss,
-		"iat":    iat.Unix(),
-		"jti":    "set-risc",
-		"sub_id": json.RawMessage(subJSON),
-		"events": map[string]any{
-			risc.AccountDisabledURI: map[string]any{
-				"subject": json.RawMessage(subJSON),
-			},
-		},
+	set := secevent.SET{
+		Issuer:   sub.Iss,
+		IssuedAt: iat,
+		JWTID:    "set-risc",
+		Subject:  sub,
+		Events:   events,
 	}
-	b, err := json.Marshal(doc)
+	b, err := set.Encode()
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("encode SET: %v", err)
 	}
 	return b
 }
