@@ -15,7 +15,7 @@ require (
 	github.com/go-faster/errors v0.7.1
 	github.com/go-faster/jx v1.2.0
 	github.com/go-jose/go-jose/v4 v4.1.4
-	github.com/hstern/go-subjectid v0.0.0-20260525222327-b47140763585
+	github.com/hstern/go-subjectid v0.2.0
 	github.com/ogen-go/ogen v1.22.0
 	go.opentelemetry.io/otel v1.44.0
 	go.opentelemetry.io/otel/metric v1.44.0
@@ -32,7 +32,7 @@ require (
 	github.com/hstern/go-jscontact v0.1.0
 	github.com/hstern/go-protected-resource-metadata v0.1.0
 	github.com/hstern/go-risc v0.2.0
-	github.com/hstern/go-secevent v0.1.0
+	github.com/hstern/go-secevent v0.2.0
 	github.com/hstern/go-ssf v0.1.0
 	github.com/hstern/go-token-introspection v0.1.0
 	github.com/teambition/rrule-go v1.8.2

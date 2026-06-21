@@ -76,6 +76,15 @@ var mailboxConfig = specsubset.Config{
 		// Mailbox storage quota / usage (unifiedStorageQuota), backed by the IMAP
 		// QUOTA extension (RFC 9208) — MB720-23.
 		"/me/settings/storage/quota",
+		// Inbox rules / mail filters (messageRule), translated to the backend filter
+		// mechanism (Sieve over ManageSieve; JMAP Sieve RFC 9661) — MB720-19. A
+		// nested navigation path under mailFolders/{id}, like events/{id}/instances;
+		// messageRule is a leaf entity (its predicates/actions are complex types, not
+		// nav-properties back to messages), so it adds no recursion to the closure.
+		"/me/mailFolders/{mailFolder-id}/messageRules",
+		"/me/mailFolders/{mailFolder-id}/messageRules/{messageRule-id}",
+		"/users/{user-id}/mailFolders/{mailFolder-id}/messageRules",
+		"/users/{user-id}/mailFolders/{mailFolder-id}/messageRules/{messageRule-id}",
 		"/users/{user-id}/events/{event-id}/instances",
 		"/users/{user-id}/messages",
 		"/users/{user-id}/messages/{message-id}",

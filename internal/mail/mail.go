@@ -229,3 +229,114 @@ type QuotaReader interface {
 // ErrNoQuota is returned by QuotaReader.Quota when the server reports no storage
 // quota for the mailbox.
 var ErrNoQuota = errors.New("mail: no storage quota")
+
+// MessageRule is a backend-neutral inbox rule (a mail filter): an ordered,
+// optionally-disabled rule whose Conditions, when all match an arriving message,
+// trigger its Actions. It is the neutral shape the server maps Microsoft Graph's
+// messageRule onto, and that a FilterReader/FilterWriter adapter translates to the
+// backend filter mechanism — Sieve managed over ManageSieve (RFC 5804) on the IMAP
+// tier, or JMAP for Sieve Scripts (RFC 9661) on the JMAP tier (MB720-19).
+//
+// The model is a deliberate MVP: it carries the common conditions and actions that
+// have clean Sieve equivalents. Richer Graph predicates (importance, sensitivity,
+// size ranges, the many is* flags) and actions (categories, markImportance,
+// permanentDelete) are out of scope until a backend needs them; mapping a Graph
+// rule that uses them is lossy — the unsupported members are dropped, not rejected.
+type MessageRule struct {
+	// ID is an opaque, stable rule identifier the backend assigns (e.g. derived
+	// from the rule's position or name in the Sieve script). Empty on a rule being
+	// created; the FilterWriter stamps it.
+	ID string
+	// DisplayName is the human-readable rule name (Graph messageRule.displayName).
+	DisplayName string
+	// Sequence orders rule evaluation, lower first, mirroring Graph's
+	// messageRule.sequence and the top-to-bottom order of a Sieve script.
+	Sequence int
+	// Enabled reports whether the rule is applied (Graph messageRule.isEnabled).
+	Enabled    bool
+	Conditions RuleConditions
+	Actions    RuleActions
+}
+
+// RuleConditions is the conjunction of predicates a message must satisfy for a
+// rule to fire: every set condition must match (an empty RuleConditions matches
+// every message). It models the subset of Graph messageRulePredicates with clean
+// Sieve equivalents. Each *Contains slice matches when any of its substrings is
+// present (the values are OR-ed within a field, AND-ed across fields).
+type RuleConditions struct {
+	// SubjectContains matches a substring of the Subject (Sieve: header :contains
+	// "subject").
+	SubjectContains []string
+	// BodyContains matches a substring of the body (Sieve: body :contains).
+	BodyContains []string
+	// SenderContains matches a substring of the From header (Sieve: header
+	// :contains "from").
+	SenderContains []string
+	// FromAddresses matches when the message's From address equals one of these
+	// (Sieve: address :is "from").
+	FromAddresses []Address
+	// SentToAddresses matches when a To address equals one of these (Sieve:
+	// address :is "to").
+	SentToAddresses []Address
+}
+
+// RuleActions is the set of actions taken when a rule fires, the subset of Graph
+// messageRuleActions with clean Sieve equivalents.
+type RuleActions struct {
+	// MoveToFolder is the opaque ID of the destination folder (Sieve: fileinto).
+	MoveToFolder string
+	// CopyToFolder files a copy into the folder while keeping the original (Sieve:
+	// fileinto :copy).
+	CopyToFolder string
+	// MarkAsRead sets the \Seen flag (Sieve: setflag, RFC 5232 imap4flags).
+	MarkAsRead bool
+	// Delete discards the message (Sieve: discard).
+	Delete bool
+	// ForwardTo forwards a copy to the given addresses, keeping the original (Sieve:
+	// redirect with the implicit keep).
+	ForwardTo []Address
+	// RedirectTo redirects to the given addresses without keeping a local copy
+	// (Sieve: redirect).
+	RedirectTo []Address
+	// StopProcessingRules halts evaluation of later rules (Sieve: stop).
+	StopProcessingRules bool
+}
+
+// FilterReader is the optional capability to read a mailbox's inbox rules (mail
+// filters). Like the other capabilities it is kept separate from Backend so an
+// adapter without filter support need not implement it; consumers type-assert:
+//
+//	if fr, ok := backend.(mail.FilterReader); ok {
+//		rules, err := fr.ListRules(ctx)
+//	}
+//
+// It backs Graph's GET .../messageRules and .../messageRules/{id}. Graph nests
+// these under a mailFolder (conventionally the inbox), but the backend filter
+// mechanism is mailbox-global, so the rules are mailbox-scoped, not per-folder. A
+// FilterReader is bound to the same authenticated mailbox identity as its Backend.
+type FilterReader interface {
+	// ListRules returns the mailbox's rules in evaluation order (lowest Sequence
+	// first).
+	ListRules(ctx context.Context) ([]MessageRule, error)
+	// GetRule returns the rule with the given opaque id, or ErrRuleNotFound.
+	GetRule(ctx context.Context, id string) (MessageRule, error)
+}
+
+// FilterWriter is the optional capability to create, update, and delete inbox
+// rules, backing Graph's POST/PATCH/DELETE .../messageRules. Like FilterReader it
+// is type-asserted and mailbox-scoped. A FilterWriter is bound to the same
+// authenticated mailbox identity as its Backend.
+type FilterWriter interface {
+	// CreateRule persists rule (whose ID is empty) and returns it with the
+	// backend-assigned opaque ID.
+	CreateRule(ctx context.Context, rule MessageRule) (MessageRule, error)
+	// UpdateRule replaces the rule with the given id, returning the updated rule, or
+	// ErrRuleNotFound when no such rule exists.
+	UpdateRule(ctx context.Context, id string, rule MessageRule) (MessageRule, error)
+	// DeleteRule removes the rule with the given id, or returns ErrRuleNotFound.
+	DeleteRule(ctx context.Context, id string) error
+}
+
+// ErrRuleNotFound is returned by FilterReader/FilterWriter when no rule has the
+// requested id.
+var ErrRuleNotFound = errors.New("mail: message rule not found")
