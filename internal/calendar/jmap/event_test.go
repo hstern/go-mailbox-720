@@ -134,6 +134,65 @@ func TestToCalendarEventStartEndLocationAttendees(t *testing.T) {
 	}
 }
 
+// TestParticipantRoundTrip verifies that a calendar.Event with an Organizer and
+// two Attendees survives fromCalendarEvent → toCalendarEvent with no data loss
+// and no duplication: the organizer must NOT appear in the Attendees slice.
+func TestParticipantRoundTrip(t *testing.T) {
+	in := calendar.Event{
+		UID:        "uid-rt",
+		CalendarID: "c1",
+		Subject:    "Participant Round-Trip",
+		Organizer:  calendar.Address{Name: "Org Person", Email: "org@example.com"},
+		Attendees: []calendar.Attendee{
+			{Name: "Alice Attendee", Email: "alice@example.com", Status: "accepted"},
+			{Name: "Bob Attendee", Email: "bob@example.com", Status: "declined"},
+		},
+	}
+
+	ce, err := fromCalendarEvent(in)
+	if err != nil {
+		t.Fatalf("fromCalendarEvent: %v", err)
+	}
+	got, err := toCalendarEvent(ce)
+	if err != nil {
+		t.Fatalf("toCalendarEvent: %v", err)
+	}
+
+	// Organizer must be preserved.
+	if got.Organizer.Email != "org@example.com" {
+		t.Errorf("Organizer.Email: got %q, want %q", got.Organizer.Email, "org@example.com")
+	}
+	if got.Organizer.Name != "Org Person" {
+		t.Errorf("Organizer.Name: got %q, want %q", got.Organizer.Name, "Org Person")
+	}
+
+	// Exactly 2 attendees — the organizer must NOT appear in Attendees.
+	if len(got.Attendees) != 2 {
+		t.Fatalf("Attendees len: got %d, want 2 (got: %v)", len(got.Attendees), got.Attendees)
+	}
+	for _, a := range got.Attendees {
+		if a.Email == "org@example.com" {
+			t.Errorf("organizer email %q must not appear in Attendees", "org@example.com")
+		}
+	}
+
+	// Find each attendee by email and check status.
+	byEmail := make(map[string]calendar.Attendee, len(got.Attendees))
+	for _, a := range got.Attendees {
+		byEmail[a.Email] = a
+	}
+	if a, ok := byEmail["alice@example.com"]; !ok {
+		t.Errorf("alice@example.com missing from Attendees")
+	} else if a.Status != "accepted" {
+		t.Errorf("alice status: got %q, want %q", a.Status, "accepted")
+	}
+	if a, ok := byEmail["bob@example.com"]; !ok {
+		t.Errorf("bob@example.com missing from Attendees")
+	} else if a.Status != "declined" {
+		t.Errorf("bob status: got %q, want %q", a.Status, "declined")
+	}
+}
+
 func TestFromCalendarEventRoundTrip(t *testing.T) {
 	in := calendar.Event{
 		UID:        "uid-3",

@@ -102,7 +102,9 @@ func toCalendarEvent(ce *jscal.CalendarEvent) (calendar.Event, error) {
 		ev.Location = ce.Locations[jscalendar.Id(locKeys[0])].Name
 	}
 
-	// Participants: role "owner" → Organizer; all → Attendees.
+	// Participants: role "owner" → Organizer; role "attendee" → Attendees.
+	// A participant may hold both roles (owner+attendee); owner-only participants
+	// are mapped to Organizer only and are NOT added to Attendees.
 	// Keys are sorted for deterministic output (ce.Participants is a map).
 	if len(ce.Participants) > 0 {
 		partKeys := make([]string, 0, len(ce.Participants))
@@ -116,11 +118,13 @@ func toCalendarEvent(ce *jscal.CalendarEvent) (calendar.Event, error) {
 			if p.Roles["owner"] {
 				ev.Organizer = calendar.Address{Name: p.Name, Email: email}
 			}
-			ev.Attendees = append(ev.Attendees, calendar.Attendee{
-				Name:   p.Name,
-				Email:  email,
-				Status: partStatToStatus(p.ParticipationStatus),
-			})
+			if p.Roles["attendee"] {
+				ev.Attendees = append(ev.Attendees, calendar.Attendee{
+					Name:   p.Name,
+					Email:  email,
+					Status: partStatToStatus(p.ParticipationStatus),
+				})
+			}
 		}
 	}
 
@@ -190,7 +194,7 @@ func partStatToStatus(s string) string {
 	case "needs-action", "":
 		return "notResponded"
 	default:
-		return ""
+		return "needs-action"
 	}
 }
 
