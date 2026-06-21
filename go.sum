@@ -56,6 +56,8 @@ github.com/hstern/go-jscalendar v0.2.0 h1:m2zFib/COT1/gr5Wy7sKcP/NaovX9iIDwBFMS1
 github.com/hstern/go-jscalendar v0.2.0/go.mod h1:vkf8YX9O0DdOJHHgNL2kasacswWp3+e3ceTuFm64Qok=
 github.com/hstern/go-jscontact v0.1.0 h1:hpBU64CRfhChuilMAi46q9NtJKHm8CIG63LgW7ozFf8=
 github.com/hstern/go-jscontact v0.1.0/go.mod h1:gZ3k5MbT+wFpHT4aXrqmB1WIWYAd8hXoPO8LQ5Zt0Jk=
+github.com/hstern/go-managesieve v0.2.0 h1:Uwif0FdjffpCJkC9GalTB2hwFVNHhxuagRbnvhWk7Lc=
+github.com/hstern/go-managesieve v0.2.0/go.mod h1:H7vjmLjBVUgwIGmzTYzgW0qzLSVHJApN8CuAJ/c9uOw=
 github.com/hstern/go-protected-resource-metadata v0.1.0 h1:fdS80jxsA+ppRHlUoTuhgosaLPjLfWxLW4YFDNHwUSE=
 github.com/hstern/go-protected-resource-metadata v0.1.0/go.mod h1:thlCq+8qE2UrDhr5qTGRON+8bI+x1xIsA1zwPU53i7s=
 github.com/hstern/go-risc v0.2.0 h1:m6MQZ2n4QU4pErrxC590oEDXkzRssEWNJtfJP5mGJNo=
