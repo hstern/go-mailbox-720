@@ -26,6 +26,11 @@ var _ calendar.DeltaReader = (*Client)(nil)
 // calendar they belonged to. All destroyed IDs are included in removed
 // regardless of calendar. Callers should treat removed as a superset and
 // handle tombstones idempotently.
+//
+// Limitation: a single call returns one page of changes. If the server sets
+// hasMoreChanges, additional changes exist beyond the returned next token; the
+// caller must call Delta again with next until the server stops advancing.
+// This method does not loop internally.
 func (cl *Client) Delta(ctx context.Context, calendarID string, token string) (changed []calendar.Event, removed []string, next string, err error) {
 	cArgs, err := cl.do(ctx, &eventChanges{
 		Account:    cl.accountID,

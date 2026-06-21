@@ -30,6 +30,14 @@ func TestDelta(t *testing.T) {
 						"utcStart":    "2026-06-21T10:00:00Z",
 						"utcEnd":      "2026-06-21T11:00:00Z",
 					},
+					{
+						"id":          "e2",
+						"uid":         "u2",
+						"title":       "Foreign Calendar Event",
+						"calendarIds": map[string]bool{"c2": true},
+						"utcStart":    "2026-06-21T14:00:00Z",
+						"utcEnd":      "2026-06-21T15:00:00Z",
+					},
 				},
 				"notFound": []string{},
 			})
@@ -42,6 +50,8 @@ func TestDelta(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Delta: %v", err)
 	}
+	// Verify per-calendar filtering: e2 (in c2) is fetched but filtered out,
+	// leaving only e1 (in c1) in changed.
 	if len(changed) != 1 {
 		t.Fatalf("want 1 changed event, got %d: %+v", len(changed), changed)
 	}
