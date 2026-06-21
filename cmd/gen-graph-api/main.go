@@ -73,6 +73,9 @@ var mailboxConfig = specsubset.Config{
 		// occurrences, and the time-windowed calendar view that includes them.
 		"/me/events/{event-id}/instances",
 		"/me/calendarView",
+		// Mailbox storage quota / usage (unifiedStorageQuota), backed by the IMAP
+		// QUOTA extension (RFC 9208) — MB720-23.
+		"/me/settings/storage/quota",
 		"/users/{user-id}/events/{event-id}/instances",
 		"/users/{user-id}/messages",
 		"/users/{user-id}/messages/{message-id}",

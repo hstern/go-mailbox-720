@@ -202,3 +202,30 @@ type Watcher interface {
 	// captures until it is sure no such call is in flight.
 	Watch(ctx context.Context, folderID string, onChange func()) error
 }
+
+// Quota is a mailbox's storage usage, in bytes. Total is the limit; a Total of 0
+// means the mailbox has no storage limit (or the server reports none).
+type Quota struct {
+	Used  int64
+	Total int64
+}
+
+// QuotaReader is the optional capability to report mailbox storage usage — the
+// IMAP QUOTA extension (RFC 9208, obsoleting RFC 2087) on the IMAP adapter. Like
+// the other capabilities it is kept separate from Backend so an adapter without
+// quota support need not implement it; consumers type-assert for it:
+//
+//	if qr, ok := backend.(mail.QuotaReader); ok {
+//		q, err := qr.Quota(ctx)
+//	}
+//
+// A QuotaReader is bound to the same authenticated mailbox identity as its Backend.
+type QuotaReader interface {
+	// Quota returns the mailbox's storage usage. It reports ErrNoQuota when the
+	// server exposes no storage quota for the mailbox.
+	Quota(ctx context.Context) (Quota, error)
+}
+
+// ErrNoQuota is returned by QuotaReader.Quota when the server reports no storage
+// quota for the mailbox.
+var ErrNoQuota = errors.New("mail: no storage quota")
