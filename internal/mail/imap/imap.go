@@ -32,11 +32,35 @@ type Options struct {
 	// TLS dials with implicit TLS (IMAPS). When false the connection is
 	// plaintext — for local servers and tests only.
 	TLS bool
+	// ManageSieve, when non-nil, enables the inbox-rule (mail filter) capability
+	// over ManageSieve (RFC 5804) — a separate connection (typically port 4190) on
+	// which the rules live as a Sieve script. When nil the backend reports filters
+	// unsupported (the server maps that to 501).
+	ManageSieve *ManageSieveOptions
+}
+
+// ManageSieveOptions configures the ManageSieve connection used for inbox rules. It
+// is distinct from the IMAP connection; the credentials default to the IMAP ones
+// (the common Dovecot deployment shares the user across IMAP and ManageSieve).
+type ManageSieveOptions struct {
+	// Addr is the ManageSieve server host:port (e.g. "mail.example.com:4190").
+	Addr string
+	// Username / Password are the SASL PLAIN credentials; each defaults to the IMAP
+	// value when empty.
+	Username string
+	Password string
+	// STARTTLS upgrades the connection with STARTTLS (RFC 5804 §2.2) after connecting,
+	// the standard way ManageSieve secures port 4190.
+	STARTTLS bool
 }
 
 // Client is an IMAP-backed mail.Backend over a single authenticated session.
 type Client struct {
 	c *imapclient.Client
+
+	// sieve, when non-nil, is the resolved ManageSieve configuration the optional
+	// FilterReader/FilterWriter capability dials for inbox rules. Nil disables it.
+	sieve *manageSieveConfig
 
 	// mu guards onUnilateral, the watch callback the IDLE goroutine fires.
 	// go-imap invokes the UnilateralDataHandler (installed at Dial time) from
@@ -102,6 +126,7 @@ func Dial(addr, username, password string, o *Options) (*Client, error) {
 		return nil, fmt.Errorf("imap: login: %w", err)
 	}
 	cl.c = c
+	cl.sieve = resolveManageSieve(o.ManageSieve, username, password)
 	// Enable QRESYNC when the server offers it, so it reports expunges as
 	// uid-based VANISHED responses that Delta turns into deletion tombstones.
 	// Best-effort: a server without QRESYNC still serves every other path (only
