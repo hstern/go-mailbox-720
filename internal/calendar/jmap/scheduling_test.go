@@ -4,8 +4,6 @@ import (
 	"context"
 	"net/http"
 	"testing"
-
-	"github.com/hstern/go-mailbox-720/internal/calendar"
 )
 
 func TestSupportsServerScheduling(t *testing.T) {
@@ -24,5 +22,3 @@ func TestSupportsServerScheduling(t *testing.T) {
 	}
 }
 
-// Verify that Client implements the SchedulingDetector interface.
-var _ calendar.SchedulingDetector = (*Client)(nil)

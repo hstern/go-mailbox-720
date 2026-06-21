@@ -85,12 +85,6 @@ func Dial(sessionURL, accessToken string, o *Options) (*Client, error) {
 	return &Client{c: c, accountID: accountID}, nil
 }
 
-// newClient wraps an already-configured go-jmap client and account id — the seam
-// tests use to inject a client pointed at an httptest server.
-func newClient(c *gojmap.Client, accountID gojmap.ID) *Client {
-	return &Client{c: c, accountID: accountID}
-}
-
 // Close releases the backend. The JMAP client is stateless over HTTP, so there is
 // nothing to close.
 func (cl *Client) Close() error { return nil }

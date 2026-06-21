@@ -173,6 +173,7 @@ func setErrorString(se *gojmap.SetError) string {
 // echoes a nil updated entry (RFC 8620 §5.3 permits this) the input override is
 // returned with IsOverride set.
 func (cl *Client) WriteInstanceOverride(ctx context.Context, masterID string, override calendar.Event) (calendar.Event, error) {
+	// masterID is accepted for interface symmetry; the update is keyed by the synthetic instance id (override.ID), from which the server resolves the series master.
 	if override.RecurrenceID.IsZero() {
 		return calendar.Event{}, fmt.Errorf("jmap: WriteInstanceOverride requires a non-zero RecurrenceID")
 	}

@@ -322,3 +322,43 @@ func TestWriteInstanceOverrideNoID(t *testing.T) {
 		t.Error("HTTP handler was called despite empty override.ID — expected early return")
 	}
 }
+
+// TestWriteInstanceOverrideNilEcho verifies the nil-echo fallback path in
+// WriteInstanceOverride: when the server returns "updated":{"e1_i0": null}
+// (RFC 8620 §5.3 permits a null entry), the adapter returns the input override
+// with IsOverride stamped true and the original Subject intact.
+func TestWriteInstanceOverrideNilEcho(t *testing.T) {
+	cl := dialTest(t, func(w http.ResponseWriter, body map[string]any) {
+		if methodName(body) != "CalendarEvent/set" {
+			http.Error(w, "unexpected method: "+methodName(body), http.StatusBadRequest)
+			return
+		}
+		respond(w, "CalendarEvent/set", map[string]any{
+			"accountId": "acc1",
+			"oldState":  "1",
+			"newState":  "2",
+			"updated": map[string]any{
+				"e1_i0": nil,
+			},
+			"notUpdated":   nil,
+			"notDestroyed": nil,
+		})
+	})
+
+	rid := time.Date(2024, 3, 15, 10, 0, 0, 0, time.UTC)
+	override := calendar.Event{
+		ID:           "e1_i0",
+		Subject:      "Override Nil Echo",
+		RecurrenceID: rid,
+	}
+	got, err := cl.WriteInstanceOverride(context.Background(), "e1", override)
+	if err != nil {
+		t.Fatalf("WriteInstanceOverride (nil echo): %v", err)
+	}
+	if !got.IsOverride {
+		t.Errorf("IsOverride = false, want true (fallback must stamp IsOverride)")
+	}
+	if got.Subject != override.Subject {
+		t.Errorf("Subject = %q, want %q (fallback must return input override)", got.Subject, override.Subject)
+	}
+}
