@@ -21,9 +21,10 @@ var _ calendar.Writer = (*Client)(nil)
 // CalendarEvent, sets CalendarIDs from calendarID, then sends a
 // CalendarEvent/set with Create and SendSchedulingMessages=true so that the
 // server dispatches iTIP invitations. If the server rejects the create via
-// notCreated the error is surfaced; if the server returns a null/partial
-// created object we fall back to the event we sent stamped with the server's
-// assigned ID.
+// notCreated the error is surfaced; if the server returns a null created
+// object (RFC 8620 §5.3 allows this when there are no extra fields to echo),
+// the server-assigned id is not recoverable and we return the input event with
+// an empty ID — callers needing the id must re-fetch.
 func (cl *Client) CreateEvent(ctx context.Context, calendarID string, e calendar.Event) (calendar.Event, error) {
 	ce, err := fromCalendarEvent(e)
 	if err != nil {
@@ -49,11 +50,12 @@ func (cl *Client) CreateEvent(ctx context.Context, calendarID string, e calendar
 	}
 
 	// RFC 8620 §5.3: the created map MAY contain a null value for "new" when
-	// the server does not echo back any fields. Guard against this and fall
-	// back to the event we sent, stamped with whatever ID we can recover.
+	// the server does not echo back any fields. The server-assigned id is not
+	// recoverable from a null created object; return the input event with an
+	// empty ID. Callers needing the id must re-fetch.
 	created := resp.Created["new"]
 	if created == nil {
-		// No echo — return the input event as-is.
+		// No echo — return the input event as-is (ID will be empty).
 		return e, nil
 	}
 	return toCalendarEvent(created)
@@ -167,10 +169,10 @@ func patchFromCalendarEvent(ce *jscal.CalendarEvent) gojmap.Patch {
 	}
 
 	// JSCalendar Event properties populated by fromCalendarEvent.
-	p["uid"] = ce.UID
+	// uid is immutable per RFC 8984 §4.1.1 and sequence is server-managed
+	// under delegated scheduling — both are intentionally omitted from patches.
 	p["title"] = ce.Title
 	p["status"] = ce.Status
-	p["sequence"] = ce.Sequence
 	p["showWithoutTime"] = ce.ShowWithoutTime
 	p["description"] = ce.Description
 	p["descriptionContentType"] = ce.DescriptionContentType

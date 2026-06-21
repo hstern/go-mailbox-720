@@ -71,10 +71,14 @@ func TestCreateEventNilCreated(t *testing.T) {
 	}
 	// With a nil created response we fall back to the sent event; we cannot
 	// return a server-assigned ID because the server returned null. The call
-	// should not error.
-	_, err := cl.CreateEvent(context.Background(), "cal1", e)
+	// should not error, and the returned ID must be empty (known limitation:
+	// callers needing the server-assigned id must re-fetch).
+	got, err := cl.CreateEvent(context.Background(), "cal1", e)
 	if err != nil {
 		t.Fatalf("CreateEvent (nil created): %v", err)
+	}
+	if got.ID != "" {
+		t.Errorf("ID = %q, want empty (server-assigned id not recoverable from null created)", got.ID)
 	}
 }
 
