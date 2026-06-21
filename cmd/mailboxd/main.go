@@ -64,6 +64,8 @@ func main() {
 	caldavURL := flag.String("cal-caldav-url", "", "CalDAV base URL for the calendar backend (empty: calendar operations return 501; password from MAILBOXD_CALDAV_PASSWORD). Use an https:// URL for TLS")
 	caldavUser := flag.String("cal-caldav-username", "", "CalDAV username for the calendar backend")
 	jmapCalSession := flag.String("cal-jmap-session-url", "", "JMAP session resource URL for the calendar backend (empty: use CalDAV, or return 501 if neither set; access token from MAILBOXD_CALENDAR_JMAP_TOKEN). Takes precedence over the CalDAV flags when set")
+	jmapCalUsername := flag.String("cal-jmap-username", "", "JMAP calendar username for HTTP Basic auth (empty: use bearer token from MAILBOXD_CALENDAR_JMAP_TOKEN; password from MAILBOXD_CALENDAR_JMAP_PASSWORD)")
+	jmapCalAPIURL := flag.String("cal-jmap-api-url", "", "override the apiUrl advertised in the JMAP session document (for servers advertising an unreachable internal apiUrl)")
 	carddavURL := flag.String("contacts-carddav-url", "", "CardDAV base URL for the contacts backend (empty: contacts operations return 501; password from MAILBOXD_CARDDAV_PASSWORD). Use an https:// URL for TLS")
 	carddavUser := flag.String("contacts-carddav-username", "", "CardDAV username for the contacts backend")
 	contactsJMAP := flag.String("contacts-jmap-session-url", "", "JMAP session resource URL for the contacts backend (empty: use CardDAV, or return 501 if neither set; access token from MAILBOXD_CONTACTS_JMAP_TOKEN). Takes precedence over the CardDAV flags when set")
@@ -124,8 +126,14 @@ func main() {
 		calProvider = staticJMAPCalendarProvider{
 			sessionURL: *jmapCalSession,
 			// The token is taken from the environment, never a flag, so it does not
+			// appear in the process table. When username is set the adapter uses Basic
+			// auth and the token is ignored.
+			token:    os.Getenv("MAILBOXD_CALENDAR_JMAP_TOKEN"),
+			username: *jmapCalUsername,
+			// The password is taken from the environment, never a flag, so it does not
 			// appear in the process table.
-			token: os.Getenv("MAILBOXD_CALENDAR_JMAP_TOKEN"),
+			password: os.Getenv("MAILBOXD_CALENDAR_JMAP_PASSWORD"),
+			apiURL:   *jmapCalAPIURL,
 		}
 	case *caldavURL != "":
 		calProvider = staticCalDAVProvider{
@@ -205,15 +213,22 @@ func (p staticCalDAVProvider) Calendar(_ context.Context) (calendar.Backend, err
 
 // staticJMAPCalendarProvider serves every request from one configured JMAP
 // calendar account — the alternative calendar backend behind the same port
-// (mirroring the JMAP mail and contacts backends). The token is a JMAP bearer
-// access token sourced from the environment. A per-identity provider is future
-// work.
+// (mirroring the JMAP mail and contacts backends). When username is non-empty
+// the adapter uses HTTP Basic auth (username + password from env) and the token
+// is ignored; otherwise the token (bearer, from env) is used. apiURL overrides
+// the apiUrl advertised in the JMAP session document when set. A per-identity
+// provider is future work.
 type staticJMAPCalendarProvider struct {
-	sessionURL, token string
+	sessionURL, token          string
+	username, password, apiURL string
 }
 
 func (p staticJMAPCalendarProvider) Calendar(_ context.Context) (calendar.Backend, error) {
-	return calendarjmap.Dial(p.sessionURL, p.token, nil)
+	opts := &calendarjmap.Options{APIURLOverride: p.apiURL}
+	if p.username != "" {
+		opts.BasicAuth = &calendarjmap.BasicAuthCredentials{Username: p.username, Password: p.password}
+	}
+	return calendarjmap.Dial(p.sessionURL, p.token, opts)
 }
 
 // staticCardDAVProvider serves every request from one configured CardDAV
@@ -268,7 +283,11 @@ func run(addr string, authCfg auth.Config, revSink receiver.Sink, ssfReceiverPat
 	}
 	switch calProvider.(type) {
 	case staticJMAPCalendarProvider:
-		log.Println("calendar: JMAP backend enabled")
+		if p := calProvider.(staticJMAPCalendarProvider); p.username != "" {
+			log.Println("calendar: JMAP backend enabled (Basic auth)")
+		} else {
+			log.Println("calendar: JMAP backend enabled (bearer token)")
+		}
 	case staticCalDAVProvider:
 		log.Println("calendar: CalDAV backend enabled")
 	default:
