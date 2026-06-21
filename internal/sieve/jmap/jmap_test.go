@@ -373,6 +373,42 @@ func TestPutScriptRejectsInvalid(t *testing.T) {
 	}
 }
 
+func TestSetActiveContent(t *testing.T) {
+	f := newFixture()
+	cl := f.start(t)
+	ctx := context.Background()
+
+	// First publish creates and activates the named script.
+	if err := cl.SetActiveContent(ctx, "rules", sampleScript); err != nil {
+		t.Fatalf("SetActiveContent (create): %v", err)
+	}
+	_, content, ok, err := cl.ActiveScript(ctx)
+	if err != nil || !ok || content != sampleScript {
+		t.Fatalf("after create: ok=%v content=%q err=%v", ok, content, err)
+	}
+
+	// Re-publishing the same name updates content in place, keeping it active.
+	const updated = `require ["fileinto"]; fileinto "Archive";` + "\n"
+	if err := cl.SetActiveContent(ctx, "rules", updated); err != nil {
+		t.Fatalf("SetActiveContent (update active): %v", err)
+	}
+	if _, content, _, _ := cl.ActiveScript(ctx); content != updated {
+		t.Errorf("update-active content = %q, want %q", content, updated)
+	}
+
+	// Deactivate, then SetActiveContent must re-activate the existing script (the
+	// branch the FilterWriter path does not otherwise reach).
+	if err := cl.Deactivate(ctx); err != nil {
+		t.Fatalf("Deactivate: %v", err)
+	}
+	if err := cl.SetActiveContent(ctx, "rules", updated); err != nil {
+		t.Fatalf("SetActiveContent (reactivate): %v", err)
+	}
+	if _, _, ok, _ := cl.ActiveScript(ctx); !ok {
+		t.Error("SetActiveContent did not re-activate the existing inactive script")
+	}
+}
+
 func TestValidateRejectsBadScript(t *testing.T) {
 	f := newFixture()
 	cl := f.start(t)

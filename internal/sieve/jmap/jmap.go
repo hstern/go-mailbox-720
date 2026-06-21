@@ -3,6 +3,7 @@ package jmap
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -10,6 +11,11 @@ import (
 
 	gojmap "git.sr.ht/~rockorager/go-jmap"
 )
+
+// ErrNoSieveAccount reports that the JMAP session does not advertise a primary
+// account for Sieve scripts (urn:ietf:params:jmap:sieve) — the server does not
+// support RFC 9661. A consumer can map it to "filters unsupported".
+var ErrNoSieveAccount = errors.New("jmap: session advertises no primary sieve account")
 
 // Options configures the JMAP Sieve connection.
 type Options struct {
@@ -52,9 +58,21 @@ func Dial(sessionURL, accessToken string, o *Options) (*Client, error) {
 	if err := c.Authenticate(); err != nil {
 		return nil, fmt.Errorf("jmap: authenticate: %w", err)
 	}
+	return FromClient(c)
+}
+
+// FromClient wraps an already-authenticated go-jmap client as a Sieve transport,
+// resolving the primary Sieve account from its session. It lets a consumer that
+// already holds a JMAP session (e.g. the mail backend) manage Sieve scripts over the
+// same connection rather than dialing a second one. It returns ErrNoSieveAccount
+// when the session does not advertise Sieve support.
+func FromClient(c *gojmap.Client) (*Client, error) {
+	if c.Session == nil {
+		return nil, fmt.Errorf("jmap: client is not authenticated")
+	}
 	accountID, ok := c.Session.PrimaryAccounts[sieveURI]
 	if !ok || accountID == "" {
-		return nil, fmt.Errorf("jmap: session advertises no primary sieve account (%s)", sieveURI)
+		return nil, ErrNoSieveAccount
 	}
 	return &Client{c: c, accountID: accountID}, nil
 }
@@ -205,6 +223,34 @@ func (cl *Client) UpdateScriptContent(ctx context.Context, id, content string) e
 		return fmt.Errorf("jmap: script not updated: %s", setErrText(se))
 	}
 	return nil
+}
+
+// SetActiveContent makes name the account's active script carrying content: it
+// updates the script's content in place when a script of that name already exists
+// (activating it if it was not active), and otherwise creates and activates it. It
+// is the "publish this script as the mailbox's active filter" convenience a
+// consumer drives on every rule change.
+func (cl *Client) SetActiveContent(ctx context.Context, name, content string) error {
+	scripts, err := cl.ListScripts(ctx)
+	if err != nil {
+		return err
+	}
+	for _, s := range scripts {
+		if s.Name == name {
+			if err := cl.UpdateScriptContent(ctx, s.ID, content); err != nil {
+				return err
+			}
+			if s.IsActive {
+				return nil
+			}
+			return cl.Activate(ctx, s.ID)
+		}
+	}
+	created, err := cl.PutScript(ctx, name, content)
+	if err != nil {
+		return err
+	}
+	return cl.Activate(ctx, created.ID)
 }
 
 // Activate makes script id the account's single active script.
