@@ -30,6 +30,7 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/coreos/go-oidc/v3/oidc"
 	accesstoken "github.com/hstern/go-access-tokens"
@@ -71,6 +72,22 @@ type Config struct {
 	// the server serves that metadata at /.well-known/oauth-protected-resource so
 	// clients can discover the authorization servers and scopes.
 	ResourceID string
+	// Revocations, when set, is consulted on every authenticated request to reject a
+	// token a Shared Signals event has revoked (CAEP session-revoked / RISC account
+	// events), terminating long-lived sessions before their own expiry (MB720-18).
+	// Nil disables the check.
+	Revocations RevocationChecker
+}
+
+// RevocationChecker reports whether a token must be rejected as revoked. It is the
+// enforcement half of the Shared Signals receiver (internal/revocation): the
+// middleware calls Revoked after a token validates, and a true answer turns an
+// otherwise-valid token into a 401.
+type RevocationChecker interface {
+	// Revoked reports whether the token presented for sub, issued at issuedAt and
+	// bearing the given jti, has been revoked. A zero issuedAt or empty jti means
+	// that claim was absent from the token.
+	Revoked(sub subjectid.IssSubID, issuedAt time.Time, jti string) bool
 }
 
 // IntrospectionConfig holds the resource server's own OAuth2 client credentials,
@@ -91,6 +108,8 @@ type Authenticator struct {
 	// resourceMetadataURL, when set, is this resource's RFC 9728 metadata URL,
 	// added to the WWW-Authenticate challenge as the §5.1 resource_metadata param.
 	resourceMetadataURL string
+	// revocations, when set, rejects tokens revoked by a Shared Signals event.
+	revocations RevocationChecker
 }
 
 // New discovers each configured issuer and builds the Authenticator. It errors
@@ -114,6 +133,7 @@ func New(ctx context.Context, cfg Config) (*Authenticator, error) {
 		requiredScopes: cfg.RequiredScopes,
 		subjectClaim:   subjectClaim,
 		scopeClaims:    scopeClaims,
+		revocations:    cfg.Revocations,
 	}
 	if cfg.ResourceID != "" {
 		// Best-effort: a malformed resource id just omits the §5.1 link; the
@@ -155,6 +175,11 @@ type principal struct {
 	issuer  string
 	subject string
 	scopes  map[string]struct{}
+	// issuedAt and jti are the token's iat and jti, carried so the revocation check
+	// can decide session-revoked (issued-at-or-before T) and per-token (jti) cases.
+	// Either may be zero/empty when the token omitted the claim.
+	issuedAt time.Time
+	jti      string
 }
 
 // hasScopes reports whether every required scope is present.
@@ -192,6 +217,13 @@ func (a *Authenticator) Middleware(next http.Handler) http.Handler {
 		// keeps mailboxes distinct (and unspoofable) across multiple BYO IdPs.
 		mailbox := subjectid.IssSubID{Iss: p.issuer, Sub: p.subject}
 		if mailbox.Validate() != nil {
+			a.challenge(w, bearer.ErrorInvalidToken)
+			grapherr.Write(w, http.StatusUnauthorized)
+			return
+		}
+		// A Shared Signals event (CAEP session-revoked / RISC account event) may have
+		// revoked this token since it was issued; reject it like any invalid token.
+		if a.revocations != nil && a.revocations.Revoked(mailbox, p.issuedAt, p.jti) {
 			a.challenge(w, bearer.ErrorInvalidToken)
 			grapherr.Write(w, http.StatusUnauthorized)
 			return
@@ -265,10 +297,21 @@ func (a *Authenticator) validateJWT(ctx context.Context, verifier *oidc.IDTokenV
 		}
 	}
 	return &principal{
-		issuer:  iss,
-		subject: subjectFromClaims(&tok.Claims, a.subjectClaim),
-		scopes:  toSet(scopesFromClaims(&tok.Claims, a.scopeClaims)),
+		issuer:   iss,
+		subject:  subjectFromClaims(&tok.Claims, a.subjectClaim),
+		scopes:   toSet(scopesFromClaims(&tok.Claims, a.scopeClaims)),
+		issuedAt: issuedAtFromClaims(&tok.Claims),
+		jti:      tok.Claims.JWTID,
 	}, nil
+}
+
+// issuedAtFromClaims reads the token's iat as a time, or the zero time when the
+// claim is absent.
+func issuedAtFromClaims(c *accesstoken.Claims) time.Time {
+	if c.IssuedAt != nil {
+		return c.IssuedAt.Time
+	}
+	return time.Time{}
 }
 
 // scopesFromClaims gathers the granted scopes from the configured claims of a JWT
@@ -346,12 +389,23 @@ func (a *Authenticator) introspectToken(ctx context.Context, raw string) (*princ
 			continue
 		}
 		return &principal{
-			issuer:  iss,
-			subject: subjectFromResponse(resp, a.subjectClaim),
-			scopes:  toSet(scopesFromResponse(resp, a.scopeClaims)),
+			issuer:   iss,
+			subject:  subjectFromResponse(resp, a.subjectClaim),
+			scopes:   toSet(scopesFromResponse(resp, a.scopeClaims)),
+			issuedAt: issuedAtFromResponse(resp),
+			jti:      resp.JWTID,
 		}, nil
 	}
 	return nil, fmt.Errorf("auth: token not active for this resource per introspection")
+}
+
+// issuedAtFromResponse reads an introspection response's iat as a time, or the zero
+// time when the member is absent.
+func issuedAtFromResponse(r *introspection.Response) time.Time {
+	if r.IssuedAt != nil {
+		return r.IssuedAt.Time
+	}
+	return time.Time{}
 }
 
 // subjectFromClaims extracts the configured mailbox-identity claim from a validated
