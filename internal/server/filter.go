@@ -49,3 +49,18 @@ func badRequest(message string) *api.ErrorStatusCode {
 		},
 	}
 }
+
+// notFound builds a Graph 404 error response carrying message — the sibling of
+// badRequest for handlers that map a backend not-found sentinel to a Graph 404.
+// The "ErrorItemNotFound" code is the Exchange-entity not-found code.
+func notFound(message string) *api.ErrorStatusCode {
+	return &api.ErrorStatusCode{
+		StatusCode: http.StatusNotFound,
+		Response: api.MicrosoftGraphODataErrorsODataError{
+			Error: api.MicrosoftGraphODataErrorsMainError{
+				Code:    "ErrorItemNotFound",
+				Message: message,
+			},
+		},
+	}
+}
