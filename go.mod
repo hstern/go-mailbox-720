@@ -28,6 +28,7 @@ require (
 	github.com/hstern/go-access-tokens v0.3.0
 	github.com/hstern/go-bearer-token v0.2.0
 	github.com/hstern/go-caep v0.1.0
+	github.com/hstern/go-jscalendar v0.2.0
 	github.com/hstern/go-jscontact v0.1.0
 	github.com/hstern/go-protected-resource-metadata v0.1.0
 	github.com/hstern/go-risc v0.2.0
@@ -46,7 +47,6 @@ require (
 	github.com/go-logr/logr v1.4.3 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
 	github.com/google/uuid v1.6.0 // indirect
-	github.com/hstern/go-jscalendar v0.2.0 // indirect
 	github.com/mattn/go-colorable v0.1.14 // indirect
 	github.com/mattn/go-isatty v0.0.22 // indirect
 	github.com/segmentio/asm v1.2.1 // indirect
