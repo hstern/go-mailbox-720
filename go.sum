@@ -50,6 +50,8 @@ github.com/hstern/go-bearer-token v0.2.0 h1:pmG0Llvjg7Ou1uB73FySpskFZC1DEMM2D7QH
 github.com/hstern/go-bearer-token v0.2.0/go.mod h1:HQGn4hNyOl0LHfN2LVqp49waBc/uCjNmwI+oTlU2LhA=
 github.com/hstern/go-imap/v2 v2.0.0-beta.8.0.20260620025710-a2d23bc67297 h1:DEmzcK0km+tQ8OWsWl0Xt6j3QcWna+tVkyyGbYsSgw0=
 github.com/hstern/go-imap/v2 v2.0.0-beta.8.0.20260620025710-a2d23bc67297/go.mod h1:dhoFe2Q0PwLrMD7oZw8ODuaD0vLYPe5uj2wcOMnvh48=
+github.com/hstern/go-jscontact v0.1.0 h1:hpBU64CRfhChuilMAi46q9NtJKHm8CIG63LgW7ozFf8=
+github.com/hstern/go-jscontact v0.1.0/go.mod h1:gZ3k5MbT+wFpHT4aXrqmB1WIWYAd8hXoPO8LQ5Zt0Jk=
 github.com/hstern/go-protected-resource-metadata v0.1.0 h1:fdS80jxsA+ppRHlUoTuhgosaLPjLfWxLW4YFDNHwUSE=
 github.com/hstern/go-protected-resource-metadata v0.1.0/go.mod h1:thlCq+8qE2UrDhr5qTGRON+8bI+x1xIsA1zwPU53i7s=
 github.com/hstern/go-subjectid v0.0.0-20260525222327-b47140763585 h1:dDFXd9djpbmlAOSlzIbFunmu6YVnzMcOnxPH+ySINZ0=
