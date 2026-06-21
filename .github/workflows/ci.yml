@@ -80,10 +80,12 @@ jobs:
         run: go test ./...
 
   oidc-e2e:
-    # Stands up a real Kanidm IdP in a container, provisions an OAuth2 resource
-    # server, and asserts mailboxd accepts a Kanidm-issued (opaque) token via
-    # RFC 7662 introspection (-> 501) and rejects an unauthenticated request
-    # (-> 401). Docker is available on GitHub-hosted runners.
+    # Runs the vertical-slice e2e against the IdP matrix (Kanidm + Zitadel): stands
+    # up each real IdP in a container, provisions an OAuth2 resource server, and
+    # asserts mailboxd validates an IdP-issued token (Kanidm: opaque via RFC 7662
+    # introspection; Zitadel: JWT via JWKS) and rejects an unauthenticated request
+    # (-> 401). Zitadel additionally runs PostgreSQL, so allow extra time. Docker is
+    # available on GitHub-hosted runners.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -96,18 +98,19 @@ jobs:
       - name: Generate (fetch upstream spec + ogen)
         run: go generate ./internal/graph
 
-      - name: OIDC e2e (Kanidm + mailboxd)
+      - name: OIDC e2e (Kanidm + Zitadel matrix + mailboxd)
         working-directory: test/e2e-oidc
-        run: go test -timeout 360s -run TestOIDCEndToEnd ./...
+        run: go test -timeout 900s -run TestOIDCEndToEnd ./...
 
   dumb-backend-e2e:
-    # The MB720-15 unified dumb-backend-tier e2e: stands up the whole stack —
-    # Kanidm (OIDC IdP), Dovecot (IMAP), Radicale (CalDAV + CardDAV) — plus an
-    # in-process SMTP sink, and drives the real mailboxd wired to all of them with
-    # the client-side iTIP/iMIP scheduling engine ON. It exercises auth, message/
-    # folder + delta, event/calendar + contacts CRUD + delta, and the inbound +
-    # outbound invite scheduling cooperation that this tier (no RFC 6638 server-side
-    # scheduling) must drive itself. Docker is available on GitHub-hosted runners.
+    # The MB720-15 unified dumb-backend-tier e2e, run against the IdP matrix (Kanidm
+    # + Zitadel): stands up the whole stack — the IdP, Dovecot (IMAP), Radicale
+    # (CalDAV + CardDAV) — plus an in-process SMTP sink, and drives the real mailboxd
+    # wired to all of them with the client-side iTIP/iMIP scheduling engine ON. It
+    # exercises auth, message/folder + delta, event/calendar + contacts CRUD + delta,
+    # and the inbound + outbound invite scheduling cooperation that this tier (no
+    # RFC 6638 server-side scheduling) must drive itself. Docker is available on
+    # GitHub-hosted runners.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -120,9 +123,9 @@ jobs:
       - name: Generate (fetch upstream spec + ogen)
         run: go generate ./internal/graph
 
-      - name: Dumb-backend e2e (Kanidm + Dovecot + Radicale + mailboxd)
+      - name: Dumb-backend e2e (Kanidm + Zitadel matrix + Dovecot + Radicale + mailboxd)
         working-directory: test/e2e-oidc
-        run: go test -timeout 600s -run TestDumbBackendEndToEnd ./...
+        run: go test -timeout 1200s -run TestDumbBackendEndToEnd ./...
 
   mail-imap-e2e:
     # Runs the IMAP adapter against a real Dovecot server in Docker (build tag

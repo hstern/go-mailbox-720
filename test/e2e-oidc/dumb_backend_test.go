@@ -27,7 +27,6 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -49,40 +48,36 @@ func TestDumbBackendEndToEnd(t *testing.T) {
 		t.Skip("docker not available")
 	}
 
-	dir := t.TempDir()
-	if err := os.Chmod(dir, 0o755); err != nil { // readable by the container's uid
-		t.Fatal(err)
+	for _, p := range idps() {
+		t.Run(p.name(), func(t *testing.T) {
+			// --- Real services: IdP, mail, calendar+contacts, mail sink. ---
+			p.start(t)
+			p.provision(t)
+
+			dovecotAddr := startDovecot(t)
+			seedMessage(t, dovecotAddr, testMessage)
+
+			radicaleBase := startRadicale(t)
+			seedCalendar(t, radicaleBase)
+			seedAddressBook(t, radicaleBase)
+
+			sink := startSMTPSink(t)
+
+			base := startDumbBackendMailboxd(t, p, dovecotAddr, radicaleBase, sink.addr)
+			token := p.mintToken(t)
+
+			// --- Auth: unauthenticated is rejected, authenticated is accepted. ---
+			if got := status(t, base+"/me/messages", ""); got != http.StatusUnauthorized {
+				t.Errorf("unauthenticated /me/messages: status = %d, want 401", got)
+			}
+
+			t.Run("Mail", func(t *testing.T) { testMail(t, base, token) })
+			t.Run("Calendar", func(t *testing.T) { testCalendar(t, base, token) })
+			t.Run("Contacts", func(t *testing.T) { testContacts(t, base, token) })
+			t.Run("OutboundInvite", func(t *testing.T) { testOutboundInvite(t, base, token, sink) })
+			t.Run("InboundInvite", func(t *testing.T) { testInboundInvite(t, base, token, dovecotAddr) })
+		})
 	}
-	caPool := writeCerts(t, dir)
-	writeServerConfig(t, dir)
-
-	// --- Real services: IdP, mail, calendar+contacts, mail sink. ---
-	startKanidm(t, dir, caPool)
-	adminPassword := recoverAdmin(t)
-	secret := provision(t, dir, adminPassword)
-
-	dovecotAddr := startDovecot(t)
-	seedMessage(t, dovecotAddr, testMessage)
-
-	radicaleBase := startRadicale(t)
-	seedCalendar(t, radicaleBase)
-	seedAddressBook(t, radicaleBase)
-
-	sink := startSMTPSink(t)
-
-	base := startDumbBackendMailboxd(t, dir, secret, dovecotAddr, radicaleBase, sink.addr)
-	token := mintToken(t, caClient(caPool), secret)
-
-	// --- Auth: unauthenticated is rejected, authenticated is accepted. ---
-	if got := status(t, base+"/me/messages", ""); got != http.StatusUnauthorized {
-		t.Errorf("unauthenticated /me/messages: status = %d, want 401", got)
-	}
-
-	t.Run("Mail", func(t *testing.T) { testMail(t, base, token) })
-	t.Run("Calendar", func(t *testing.T) { testCalendar(t, base, token) })
-	t.Run("Contacts", func(t *testing.T) { testContacts(t, base, token) })
-	t.Run("OutboundInvite", func(t *testing.T) { testOutboundInvite(t, base, token, sink) })
-	t.Run("InboundInvite", func(t *testing.T) { testInboundInvite(t, base, token, dovecotAddr) })
 }
 
 // testMail exercises the message/folder read path and a PATCH (mark read) against
@@ -314,25 +309,15 @@ func testInboundInvite(t *testing.T, base, token, dovecotAddr string) {
 }
 
 // startDumbBackendMailboxd builds and runs mailboxd wired to the full dumb-backend
-// stack: Kanidm auth, Dovecot IMAP, Radicale CalDAV + CardDAV, the SMTP sink, and
-// the client-side scheduling engine ON. It returns the /v1.0 base URL.
-func startDumbBackendMailboxd(t *testing.T, dir, secret, imapAddr, davURL, smtpAddr string) string {
+// stack: the given IdP's auth, Dovecot IMAP, Radicale CalDAV + CardDAV, the SMTP
+// sink, and the client-side scheduling engine ON. It returns the /v1.0 base URL.
+func startDumbBackendMailboxd(t *testing.T, p idp, imapAddr, davURL, smtpAddr string) string {
 	t.Helper()
-	bin := filepath.Join(t.TempDir(), "mailboxd")
-	build := exec.Command("go", "build", "-o", bin, "./cmd/mailboxd")
-	build.Dir = "../.."
-	build.Stdout, build.Stderr = os.Stderr, os.Stderr
-	if err := build.Run(); err != nil {
-		t.Fatalf("build mailboxd (did you run `go generate ./internal/graph`?): %v", err)
-	}
+	bin := buildMailboxd(t)
 
 	addr := freeAddr(t)
-	cmd := exec.Command(bin,
-		"-addr", addr,
-		"-auth-issuer", kanidmBase+"/oauth2/openid/"+rsClientID,
-		"-auth-audience", rsClientID,
-		"-auth-scope", rsScope,
-		"-auth-introspect-client-id", rsClientID,
+	args := append([]string{"-addr", addr}, authFlags(p)...)
+	args = append(args,
 		"-mail-imap-addr", imapAddr,
 		"-mail-imap-username", dovecotUser,
 		"-mail-imap-tls=false",
@@ -346,9 +331,9 @@ func startDumbBackendMailboxd(t *testing.T, dir, secret, imapAddr, davURL, smtpA
 		"-mailbox-email", mailboxOwner,
 		"-enable-scheduling",
 	)
-	cmd.Env = append(os.Environ(),
-		"SSL_CERT_FILE="+filepath.Join(dir, "ca.pem"), // trust Kanidm's CA for discovery/introspection
-		"MAILBOXD_INTROSPECT_CLIENT_SECRET="+secret,
+	cmd := exec.Command(bin, args...)
+	cmd.Env = append(os.Environ(), authEnv(p)...)
+	cmd.Env = append(cmd.Env,
 		"MAILBOXD_IMAP_PASSWORD="+dovecotPass,
 		"MAILBOXD_CALDAV_PASSWORD="+radicalePass,
 		"MAILBOXD_CARDDAV_PASSWORD="+radicalePass,
