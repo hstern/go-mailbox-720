@@ -22,7 +22,11 @@ func dialTest(t *testing.T, api func(w http.ResponseWriter, body map[string]any)
 
 // respond writes a JMAP method-response envelope wrapping one invocation.
 func respond(w http.ResponseWriter, method string, args any) {
-	a, _ := json.Marshal(args)
+	a, err := json.Marshal(args)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
 	out := map[string]any{
 		"methodResponses": []any{[]any{method, json.RawMessage(a), "c0"}},
 		"sessionState":    "s",
@@ -41,7 +45,7 @@ func TestListCalendars(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListCalendars: %v", err)
 	}
-	if len(cals) != 1 || cals[0].ID != "c1" || cals[0].Name != "Personal" {
+	if len(cals) != 1 || cals[0].ID != "c1" || cals[0].Name != "Personal" || cals[0].Description != "mine" {
 		t.Fatalf("cals = %+v", cals)
 	}
 	_ = gojmap.ID("")
