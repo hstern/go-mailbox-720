@@ -32,6 +32,7 @@ import (
 	"github.com/hstern/go-mailbox-720/internal/calendar/caldav"
 	"github.com/hstern/go-mailbox-720/internal/contacts"
 	"github.com/hstern/go-mailbox-720/internal/contacts/carddav"
+	jmapcontacts "github.com/hstern/go-mailbox-720/internal/contacts/jmap"
 	"github.com/hstern/go-mailbox-720/internal/mail"
 	"github.com/hstern/go-mailbox-720/internal/mail/imap"
 	mailjmap "github.com/hstern/go-mailbox-720/internal/mail/jmap"
@@ -59,6 +60,7 @@ func main() {
 	caldavUser := flag.String("cal-caldav-username", "", "CalDAV username for the calendar backend")
 	carddavURL := flag.String("contacts-carddav-url", "", "CardDAV base URL for the contacts backend (empty: contacts operations return 501; password from MAILBOXD_CARDDAV_PASSWORD). Use an https:// URL for TLS")
 	carddavUser := flag.String("contacts-carddav-username", "", "CardDAV username for the contacts backend")
+	contactsJMAP := flag.String("contacts-jmap-session-url", "", "JMAP session resource URL for the contacts backend (empty: use CardDAV, or return 501 if neither set; access token from MAILBOXD_CONTACTS_JMAP_TOKEN). Takes precedence over the CardDAV flags when set")
 	enableScheduling := flag.Bool("enable-scheduling", false, "run the iTIP scheduling trigger: turn inbound mail invitations into tentative calendar events (needs IMAP + CalDAV backends; opt-in, since it writes to the calendar). Auto-disables when the CalDAV server schedules natively (RFC 6638)")
 	smtpAddr := flag.String("smtp-addr", "", "SMTP submission server host:port for emailing meeting accept/decline replies (empty: those operations return 501; password from MAILBOXD_SMTP_PASSWORD)")
 	smtpUser := flag.String("smtp-username", "", "SMTP username")
@@ -110,8 +112,18 @@ func main() {
 			password: os.Getenv("MAILBOXD_CALDAV_PASSWORD"),
 		}
 	}
+	// JMAP and CardDAV are alternative contacts backends behind the same port; JMAP
+	// wins when its session URL is set (it is the closer fit for the JMAP-shaped port).
 	var contactsProvider server.ContactsProvider
-	if *carddavURL != "" {
+	switch {
+	case *contactsJMAP != "":
+		contactsProvider = staticJMAPContactsProvider{
+			sessionURL: *contactsJMAP,
+			// The token is taken from the environment, never a flag, so it does not
+			// appear in the process table.
+			token: os.Getenv("MAILBOXD_CONTACTS_JMAP_TOKEN"),
+		}
+	case *carddavURL != "":
 		contactsProvider = staticCardDAVProvider{
 			url:      *carddavURL,
 			username: *carddavUser,
@@ -178,6 +190,18 @@ type staticCardDAVProvider struct {
 
 func (p staticCardDAVProvider) Contacts(_ context.Context) (contacts.Backend, error) {
 	return carddav.Dial(p.url, p.username, p.password, nil)
+}
+
+// staticJMAPContactsProvider serves every request from one configured JMAP contacts
+// account — the alternative contacts backend behind the same port (mirroring the
+// JMAP mail backend). The token is a JMAP bearer access token sourced from the
+// environment. A per-identity provider is future work.
+type staticJMAPContactsProvider struct {
+	sessionURL, token string
+}
+
+func (p staticJMAPContactsProvider) Contacts(_ context.Context) (contacts.Backend, error) {
+	return jmapcontacts.Dial(p.sessionURL, p.token, nil)
 }
 
 // staticSchedulingProvider answers meeting accept/decline by emailing the
