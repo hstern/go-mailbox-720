@@ -102,8 +102,15 @@ func toCalendarEvent(ce *jscal.CalendarEvent) (calendar.Event, error) {
 	}
 
 	// Participants: role "owner" → Organizer; all → Attendees.
+	// Keys are sorted for deterministic output (ce.Participants is a map).
 	if len(ce.Participants) > 0 {
-		for _, p := range ce.Participants {
+		partKeys := make([]string, 0, len(ce.Participants))
+		for k := range ce.Participants {
+			partKeys = append(partKeys, string(k))
+		}
+		sort.Strings(partKeys)
+		for _, k := range partKeys {
+			p := ce.Participants[jscalendar.Id(k)]
 			email := participantEmail(p)
 			if p.Roles["owner"] {
 				ev.Organizer = calendar.Address{Name: p.Name, Email: email}
@@ -146,6 +153,12 @@ func toCalendarEvent(ce *jscal.CalendarEvent) (calendar.Event, error) {
 
 // rruleFromRules converts structured JSCalendar recurrence rules to a single RFC 5545
 // RRULE string by routing through the ical bridge.
+//
+// Lossy collapse: RFC 8984 allows multiple recurrence rules per event, but RFC
+// 5545 iCalendar discourages it and go-ical's Props.Get returns only the first
+// RRULE property. When len(rules) > 1, only the first rule survives; the rest
+// are silently dropped. Real-world JMAP events rarely carry more than one rule,
+// so this is an acceptable trade-off for now.
 func rruleFromRules(start *jscalendar.LocalDateTime, tz jscalendar.TimeZoneId, rules []jscalendar.RecurrenceRule) (string, error) {
 	tmp := &jscalendar.Event{UID: "x", Start: start, TimeZone: tz, RecurrenceRules: rules}
 	cal, err := ical.ToICal(tmp)
@@ -205,16 +218,33 @@ func localToUTC(ldt *jscalendar.LocalDateTime, tz jscalendar.TimeZoneId) time.Ti
 // Calendar units (years, months) are added via time.AddDate; sub-day units
 // via time.Add, matching iCalendar DURATION semantics. Each sub-day unit is
 // cast individually to avoid uint64→int64 overflow from accumulated seconds.
+//
+// Overflow guard: time.Duration is int64 nanoseconds; its max is ~292 years.
+// A valid JMAP duration for a calendar event will never approach that bound
+// (RFC 8984 durations are expressed in human calendar terms), but an adversarial
+// wire value could. We clamp each uint64 sub-day component to maxSubDayUnit
+// (1<<31-1) so that even a malformed wire value produces a large-but-finite
+// offset rather than a silently-negative wrap. d.Nanos is uint32 and is safe
+// to cast directly (max ~4e9 ns < int64 max).
+const maxSubDayUnit = uint64(1<<31 - 1)
+
+func clampSubDay(v uint64) time.Duration {
+	if v > maxSubDayUnit {
+		v = maxSubDayUnit
+	}
+	return time.Duration(v)
+}
+
 func addDuration(t time.Time, d *jscalendar.Duration) time.Time {
 	if d == nil {
 		return t
 	}
 	// Calendar units first.
 	t = t.AddDate(int(d.Years), int(d.Months), int(d.Days+d.Weeks*7))
-	// Sub-day units: add each component separately to keep each cast in range.
-	t = t.Add(time.Duration(d.Hours)*time.Hour +
-		time.Duration(d.Minutes)*time.Minute +
-		time.Duration(d.Seconds)*time.Second +
+	// Sub-day units: add each component separately; clamp uint64 fields to guard overflow.
+	t = t.Add(clampSubDay(d.Hours)*time.Hour +
+		clampSubDay(d.Minutes)*time.Minute +
+		clampSubDay(d.Seconds)*time.Second +
 		time.Duration(d.Nanos))
 	return t
 }
