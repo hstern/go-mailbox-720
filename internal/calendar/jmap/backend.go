@@ -58,6 +58,18 @@ func (cl *Client) ListEvents(ctx context.Context, calendarID string, r calendar.
 	return cl.getEvents(ctx, qResp.IDs)
 }
 
+// GetEvent returns a single event by opaque ID, or an error if not found.
+func (cl *Client) GetEvent(ctx context.Context, id string) (calendar.Event, error) {
+	events, err := cl.getEvents(ctx, []gojmap.ID{gojmap.ID(id)})
+	if err != nil {
+		return calendar.Event{}, err
+	}
+	if len(events) == 0 {
+		return calendar.Event{}, fmt.Errorf("jmap: event %s not found", id)
+	}
+	return events[0], nil
+}
+
 // getEvents fetches the CalendarEvents identified by ids and maps each one to a
 // calendar.Event via toCalendarEvent. It is reused by GetEvent, ListInstances,
 // and delta-sync (Tasks 7, 9, 12). The Properties list requests all fields that

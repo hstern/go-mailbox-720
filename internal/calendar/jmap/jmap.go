@@ -9,6 +9,8 @@ import (
 	"fmt"
 
 	gojmap "git.sr.ht/~rockorager/go-jmap"
+
+	"github.com/hstern/go-mailbox-720/internal/calendar"
 )
 
 const calendarsURI gojmap.URI = "urn:ietf:params:jmap:calendars"
@@ -78,3 +80,6 @@ func (cl *Client) do(ctx context.Context, m gojmap.Method) (any, error) {
 	}
 	return args, nil
 }
+
+// Verify that Client implements the Backend interface.
+var _ calendar.Backend = (*Client)(nil)

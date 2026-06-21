@@ -155,3 +155,53 @@ func TestListEventsEmpty(t *testing.T) {
 		t.Errorf("expected nil, got %v", events)
 	}
 }
+
+func TestGetEvent(t *testing.T) {
+	cl := dialTest(t, func(w http.ResponseWriter, body map[string]any) {
+		if methodName(body) != "CalendarEvent/get" {
+			http.Error(w, "unexpected method: "+methodName(body), http.StatusBadRequest)
+			return
+		}
+		respond(w, "CalendarEvent/get", map[string]any{
+			"accountId": "acc1", "state": "1",
+			"list": []map[string]any{
+				{
+					"id":       "e1",
+					"uid":      "u1",
+					"title":    "Event One",
+					"utcStart": "2026-06-15T10:00:00Z",
+					"utcEnd":   "2026-06-15T11:00:00Z",
+				},
+			},
+			"notFound": []string{},
+		})
+	})
+	event, err := cl.GetEvent(context.Background(), "e1")
+	if err != nil {
+		t.Fatalf("GetEvent: %v", err)
+	}
+	if event.ID != "e1" {
+		t.Errorf("ID = %q, want e1", event.ID)
+	}
+	if event.Subject != "Event One" {
+		t.Errorf("Subject = %q, want Event One", event.Subject)
+	}
+}
+
+func TestGetEventNotFound(t *testing.T) {
+	cl := dialTest(t, func(w http.ResponseWriter, body map[string]any) {
+		if methodName(body) != "CalendarEvent/get" {
+			http.Error(w, "unexpected method: "+methodName(body), http.StatusBadRequest)
+			return
+		}
+		respond(w, "CalendarEvent/get", map[string]any{
+			"accountId": "acc1", "state": "1",
+			"list":    []map[string]any{},
+			"notFound": []string{"e1"},
+		})
+	})
+	_, err := cl.GetEvent(context.Background(), "e1")
+	if err == nil {
+		t.Fatalf("GetEvent: expected error for non-existent event")
+	}
+}
