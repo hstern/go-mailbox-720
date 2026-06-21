@@ -21,4 +21,3 @@ func TestSupportsServerScheduling(t *testing.T) {
 		t.Errorf("supports = %v, want true", supports)
 	}
 }
-

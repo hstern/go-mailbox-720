@@ -26,8 +26,8 @@ type calendarGet struct {
 	IDs     []gojmap.ID `json:"ids,omitempty"`
 }
 
-func (m *calendarGet) Name() string             { return "Calendar/get" }
-func (m *calendarGet) Requires() []gojmap.URI   { return []gojmap.URI{calendarsURI} }
+func (m *calendarGet) Name() string           { return "Calendar/get" }
+func (m *calendarGet) Requires() []gojmap.URI { return []gojmap.URI{calendarsURI} }
 
 type calendarGetResponse struct {
 	Account gojmap.ID       `json:"accountId"`
@@ -47,10 +47,10 @@ func (m *eventGet) Name() string           { return "CalendarEvent/get" }
 func (m *eventGet) Requires() []gojmap.URI { return []gojmap.URI{calendarsURI} }
 
 type eventGetResponse struct {
-	Account  gojmap.ID             `json:"accountId"`
-	State    string                `json:"state"`
+	Account  gojmap.ID              `json:"accountId"`
+	State    string                 `json:"state"`
 	List     []*jscal.CalendarEvent `json:"list"`
-	NotFound []gojmap.ID           `json:"notFound"`
+	NotFound []gojmap.ID            `json:"notFound"`
 }
 
 // --- CalendarEvent/query ---
@@ -100,11 +100,11 @@ type eventChangesResponse struct {
 // --- CalendarEvent/set ---
 
 type eventSet struct {
-	Account                gojmap.ID                        `json:"accountId"`
+	Account                gojmap.ID                          `json:"accountId"`
 	Create                 map[gojmap.ID]*jscal.CalendarEvent `json:"create,omitempty"`
-	Update                 map[gojmap.ID]gojmap.Patch        `json:"update,omitempty"`
-	Destroy                []gojmap.ID                       `json:"destroy,omitempty"`
-	SendSchedulingMessages bool                              `json:"sendSchedulingMessages,omitempty"`
+	Update                 map[gojmap.ID]gojmap.Patch         `json:"update,omitempty"`
+	Destroy                []gojmap.ID                        `json:"destroy,omitempty"`
+	SendSchedulingMessages bool                               `json:"sendSchedulingMessages,omitempty"`
 }
 
 func (m *eventSet) Name() string           { return "CalendarEvent/set" }

@@ -407,6 +407,7 @@ func jmapFreePort(t *testing.T) string {
 //     returns an expected error ("Updating synthetic ids is not yet supported").
 //  9. Delta — captures baseline state before CreateEvent, then asserts the
 //     token advances after the create and the event appears in changed.
+//
 // 10. DeleteEvent — verify the event is gone from ListEvents.
 func TestStalwartJMAP(t *testing.T) {
 	if _, err := exec.LookPath("docker"); err != nil {

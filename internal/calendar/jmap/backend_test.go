@@ -196,7 +196,7 @@ func TestGetEventNotFound(t *testing.T) {
 		}
 		respond(w, "CalendarEvent/get", map[string]any{
 			"accountId": "acc1", "state": "1",
-			"list":    []map[string]any{},
+			"list":     []map[string]any{},
 			"notFound": []string{"e1"},
 		})
 	})
