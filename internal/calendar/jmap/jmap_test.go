@@ -10,8 +10,11 @@ import (
 )
 
 // sessionJSON is a minimal JMAP Session advertising a primary calendars account.
+// go-jmap's Client.Do always adds urn:ietf:params:jmap:core to Using and checks
+// it against RawCapabilities, so core must appear here alongside the calendars
+// capability.
 func sessionJSON(apiURL string) string {
-	return `{"capabilities":{"urn:ietf:params:jmap:calendars":{}},` +
+	return `{"capabilities":{"urn:ietf:params:jmap:core":{},"urn:ietf:params:jmap:calendars":{}},` +
 		`"accounts":{"acc1":{"name":"u","isPersonal":true,"accountCapabilities":{}}},` +
 		`"primaryAccounts":{"urn:ietf:params:jmap:calendars":"acc1"},` +
 		`"apiUrl":"` + apiURL + `","downloadUrl":"","uploadUrl":"","eventSourceUrl":"","state":"s"}`
