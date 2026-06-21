@@ -60,6 +60,8 @@ func main() {
 	imapAddr := flag.String("mail-imap-addr", "", "IMAP server address host:port for the mail backend (empty: mail operations return 501; password from MAILBOXD_IMAP_PASSWORD)")
 	imapUser := flag.String("mail-imap-username", "", "IMAP username for the mail backend")
 	imapTLS := flag.Bool("mail-imap-tls", true, "use implicit TLS for the IMAP connection")
+	sieveAddr := flag.String("mail-managesieve-addr", "", "ManageSieve server host:port (RFC 5804) for inbox rules on the IMAP tier (empty: mail-filter operations return 501; SASL PLAIN reuses the IMAP username and MAILBOXD_IMAP_PASSWORD)")
+	sieveTLS := flag.Bool("mail-managesieve-starttls", true, "use STARTTLS on the ManageSieve connection (RFC 5804 §2.2); disabling it sends the SASL PLAIN credentials in the clear — for local servers only")
 	jmapSession := flag.String("mail-jmap-session-url", "", "JMAP session resource URL for the mail backend (empty: use IMAP, or return 501 if neither set; access token from MAILBOXD_JMAP_TOKEN). Takes precedence over the IMAP flags when set")
 	caldavURL := flag.String("cal-caldav-url", "", "CalDAV base URL for the calendar backend (empty: calendar operations return 501; password from MAILBOXD_CALDAV_PASSWORD). Use an https:// URL for TLS")
 	caldavUser := flag.String("cal-caldav-username", "", "CalDAV username for the calendar backend")
@@ -112,10 +114,12 @@ func main() {
 		}
 	case *imapAddr != "":
 		provider = staticIMAPProvider{
-			addr:     *imapAddr,
-			username: *imapUser,
-			password: os.Getenv("MAILBOXD_IMAP_PASSWORD"),
-			tls:      *imapTLS,
+			addr:      *imapAddr,
+			username:  *imapUser,
+			password:  os.Getenv("MAILBOXD_IMAP_PASSWORD"),
+			tls:       *imapTLS,
+			sieveAddr: *sieveAddr,
+			sieveTLS:  *sieveTLS,
 		}
 	}
 	// JMAP and CalDAV are alternative calendar backends behind the same port; JMAP
@@ -182,10 +186,18 @@ func main() {
 type staticIMAPProvider struct {
 	addr, username, password string
 	tls                      bool
+	// sieveAddr, when set, enables the inbox-rule capability over ManageSieve
+	// (RFC 5804) on that address, reusing the IMAP credentials.
+	sieveAddr string
+	sieveTLS  bool
 }
 
 func (p staticIMAPProvider) Mail(_ context.Context) (mail.Backend, error) {
-	return imap.Dial(p.addr, p.username, p.password, &imap.Options{TLS: p.tls})
+	o := &imap.Options{TLS: p.tls}
+	if p.sieveAddr != "" {
+		o.ManageSieve = &imap.ManageSieveOptions{Addr: p.sieveAddr, STARTTLS: p.sieveTLS}
+	}
+	return imap.Dial(p.addr, p.username, p.password, o)
 }
 
 // staticJMAPProvider serves every request from one configured JMAP account,

@@ -133,6 +133,7 @@ go run ./cmd/mailboxd \
 | `-auth-introspect-client-id` | OAuth2 client id enabling RFC 7662 introspection of **opaque** tokens (secret via `MAILBOXD_INTROSPECT_CLIENT_SECRET`). |
 | `-auth-resource` | This resource's identifier URL (RFC 8707); when set, publishes RFC 9728 protected-resource metadata at `/.well-known/oauth-protected-resource`. |
 | `-mail-imap-addr` / `-mail-imap-username` / `-mail-imap-tls` | IMAP mail backend (password via `MAILBOXD_IMAP_PASSWORD`). |
+| `-mail-managesieve-addr` / `-mail-managesieve-starttls` | Inbox rules (mail filters) over ManageSieve (RFC 5804) on the IMAP tier; reuses the IMAP credentials. STARTTLS on by default — disabling it sends the password in the clear. Empty: `messageRules` operations return 501. |
 | `-cal-caldav-url` / `-cal-caldav-username` | CalDAV calendar backend (password via `MAILBOXD_CALDAV_PASSWORD`). |
 | `-contacts-carddav-url` / `-contacts-carddav-username` | CardDAV contacts backend (password via `MAILBOXD_CARDDAV_PASSWORD`). |
 
