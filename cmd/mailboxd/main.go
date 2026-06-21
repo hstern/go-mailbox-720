@@ -26,6 +26,8 @@ import (
 	// (internal/tz) works regardless of the host's system zoneinfo.
 	_ "time/tzdata"
 
+	"github.com/hstern/go-ssf/receiver"
+
 	"github.com/hstern/go-mailbox-720/internal/auth"
 	"github.com/hstern/go-mailbox-720/internal/batch"
 	"github.com/hstern/go-mailbox-720/internal/calendar"
@@ -37,6 +39,7 @@ import (
 	"github.com/hstern/go-mailbox-720/internal/mail/imap"
 	mailjmap "github.com/hstern/go-mailbox-720/internal/mail/jmap"
 	"github.com/hstern/go-mailbox-720/internal/notify"
+	"github.com/hstern/go-mailbox-720/internal/revocation"
 	"github.com/hstern/go-mailbox-720/internal/schedrun"
 	"github.com/hstern/go-mailbox-720/internal/server"
 	"github.com/hstern/go-mailbox-720/internal/smtp"
@@ -52,6 +55,7 @@ func main() {
 	scopeClaims := flag.String("auth-scope-claims", "scope,roles", "comma-separated claims that carry granted scopes (Microsoft Entra/Azure AD: \"scope,scp,roles\" — scp is Entra's non-standard delegated-scope claim)")
 	introspectID := flag.String("auth-introspect-client-id", "", "OAuth2 client id for RFC 7662 introspection of opaque tokens (enables introspection; secret from MAILBOXD_INTROSPECT_CLIENT_SECRET)")
 	resourceID := flag.String("auth-resource", "", "this resource's identifier URL (RFC 8707); when set, publishes RFC 9728 protected-resource metadata at /.well-known/oauth-protected-resource")
+	ssfReceiverPath := flag.String("ssf-receiver-path", "/ssf/events", "public path for the Shared Signals SET receiver (CAEP/RISC revocation, MB720-18); served unauthenticated since the SET signature is the gate. Active only when auth is enabled")
 	imapAddr := flag.String("mail-imap-addr", "", "IMAP server address host:port for the mail backend (empty: mail operations return 501; password from MAILBOXD_IMAP_PASSWORD)")
 	imapUser := flag.String("mail-imap-username", "", "IMAP username for the mail backend")
 	imapTLS := flag.Bool("mail-imap-tls", true, "use implicit TLS for the IMAP connection")
@@ -69,6 +73,11 @@ func main() {
 	mailboxEmail := flag.String("mailbox-email", "", "the mailbox owner's email, used as the responding attendee when accepting/declining meetings")
 	flag.Parse()
 
+	// The revocation store is the receiver's sink AND the middleware's revocation
+	// checker: a SET delivered to the receiver mutates it; every authenticated
+	// request reads it. One shared instance ties the two halves together.
+	revStore := revocation.NewStore()
+
 	cfg := auth.Config{
 		Issuers:        splitList(*issuers),
 		Audience:       *audience,
@@ -76,6 +85,7 @@ func main() {
 		SubjectClaim:   *subjectClaim,
 		ScopeClaims:    splitList(*scopeClaims),
 		ResourceID:     *resourceID,
+		Revocations:    revStore,
 	}
 	if *introspectID != "" {
 		// The secret is taken from the environment, never a flag, so it does not
@@ -141,7 +151,7 @@ func main() {
 			mailbox:  *mailboxEmail,
 		}
 	}
-	if err := run(*addr, cfg, provider, calProvider, contactsProvider, schedProvider, *enableScheduling); err != nil {
+	if err := run(*addr, cfg, revStore, *ssfReceiverPath, provider, calProvider, contactsProvider, schedProvider, *enableScheduling); err != nil {
 		log.Fatalln("mailboxd:", err)
 	}
 }
@@ -218,7 +228,7 @@ func (p staticSchedulingProvider) Sender(_ context.Context) (smtp.Sender, error)
 
 func (p staticSchedulingProvider) MailboxAddress() string { return p.mailbox }
 
-func run(addr string, authCfg auth.Config, provider server.MailProvider, calProvider server.CalendarProvider, contactsProvider server.ContactsProvider, schedProvider server.SchedulingProvider, enableScheduling bool) error {
+func run(addr string, authCfg auth.Config, revSink receiver.Sink, ssfReceiverPath string, provider server.MailProvider, calProvider server.CalendarProvider, contactsProvider server.ContactsProvider, schedProvider server.SchedulingProvider, enableScheduling bool) error {
 	h, err := server.New(provider, calProvider, contactsProvider, schedProvider)
 	if err != nil {
 		return err
@@ -294,19 +304,43 @@ func run(addr string, authCfg auth.Config, provider server.MailProvider, calProv
 		}
 		handler = authn.Middleware(handler)
 		log.Println("auth: enforcing OIDC for issuers", authCfg.Issuers)
-		// RFC 9728: publish protected-resource metadata PUBLICLY (outside the auth
-		// middleware) so a client can discover the authorization servers + scopes
-		// before it has a token.
+
+		// Public endpoints mounted OUTSIDE the auth middleware go on an outer mux: a
+		// client must reach the RFC 9728 metadata before it has a token, and the
+		// Shared Signals transmitter POSTs SETs with no bearer of ours (the SET
+		// signature is the gate). The outer mux is created lazily so the no-public-
+		// endpoint case keeps the bare middleware as the handler.
+		var outer *http.ServeMux
+		mountPublic := func(path string, h http.Handler) {
+			if outer == nil {
+				outer = http.NewServeMux()
+				outer.Handle("/", handler)
+				handler = outer
+			}
+			outer.Handle(path, h)
+		}
+
+		// RFC 9728: publish protected-resource metadata PUBLICLY so a client can
+		// discover the authorization servers + scopes before it has a token.
 		if authCfg.ResourceID != "" {
 			path, metaHandler, err := auth.MetadataEndpoint(authCfg)
 			if err != nil {
 				return err
 			}
-			outer := http.NewServeMux()
-			outer.Handle(path, metaHandler)
-			outer.Handle("/", handler)
-			handler = outer
+			mountPublic(path, metaHandler)
 			log.Println("auth: publishing RFC 9728 protected-resource metadata at", path)
+		}
+
+		// MB720-18: mount the Shared Signals SET receiver publicly. It verifies each
+		// SET's JWS against the issuers' JWKS and feeds verified revocation events to
+		// the shared store, which the auth middleware enforces on every request.
+		if ssfReceiverPath != "" {
+			ssfHandler, err := revocation.Handler(authCfg.Issuers, revSink)
+			if err != nil {
+				return err
+			}
+			mountPublic(ssfReceiverPath, ssfHandler)
+			log.Println("revocation: Shared Signals SET receiver listening at", ssfReceiverPath)
 		}
 	} else {
 		log.Println("auth: DISABLED (no -auth-issuer configured) — all requests allowed")

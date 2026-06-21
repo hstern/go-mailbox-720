@@ -329,6 +329,96 @@ func TestMiddlewareIntrospection(t *testing.T) {
 	}
 }
 
+// stubRevocations is a RevocationChecker that revokes a fixed set of (subject)
+// and (jti) keys, recording the arguments the middleware passed for assertion.
+type stubRevocations struct {
+	revokedSubs map[subjectid.IssSubID]bool
+	revokedJTIs map[string]bool
+	gotIssuedAt time.Time
+	gotJTI      string
+}
+
+func (s *stubRevocations) Revoked(sub subjectid.IssSubID, issuedAt time.Time, jti string) bool {
+	s.gotIssuedAt = issuedAt
+	s.gotJTI = jti
+	return s.revokedSubs[sub] || s.revokedJTIs[jti]
+}
+
+// A token that validates but whose subject (or jti) a Shared Signals event has
+// revoked is rejected 401; a non-revoked token still passes, and the middleware
+// hands the token's iat + jti to the checker.
+func TestMiddlewareRevocation(t *testing.T) {
+	idp := newIDP(t)
+	rev := &stubRevocations{
+		revokedSubs: map[subjectid.IssSubID]bool{{Iss: idp.issuer, Sub: "revoked@example.com"}: true},
+		revokedJTIs: map[string]bool{"dead-jti": true},
+	}
+	a, err := New(context.Background(), Config{
+		Issuers:        []string{idp.issuer},
+		Audience:       testAud,
+		RequiredScopes: []string{"Mail.Read"},
+		ScopeClaims:    []string{"scope", "scp", "roles"},
+		Revocations:    rev,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	tests := []struct {
+		name       string
+		claims     func() map[string]any
+		wantStatus int
+	}{
+		{"revoked subject is rejected", func() map[string]any {
+			c := baseClaims(idp.issuer)
+			c["sub"] = "revoked@example.com"
+			c["jti"] = "live-jti"
+			return c
+		}, http.StatusUnauthorized},
+		{"revoked jti is rejected", func() map[string]any {
+			c := baseClaims(idp.issuer)
+			c["sub"] = "ok@example.com"
+			c["jti"] = "dead-jti"
+			return c
+		}, http.StatusUnauthorized},
+		{"non-revoked token passes", func() map[string]any {
+			c := baseClaims(idp.issuer)
+			c["sub"] = "ok@example.com"
+			c["jti"] = "live-jti"
+			return c
+		}, http.StatusOK},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var ranNext bool
+			next := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				ranNext = true
+				w.WriteHeader(http.StatusOK)
+			})
+			req := httptest.NewRequest(http.MethodGet, "/v1.0/me/messages", nil)
+			req.Header.Set("Authorization", "Bearer "+idp.sign(t, tc.claims()))
+			rec := httptest.NewRecorder()
+			a.Middleware(next).ServeHTTP(rec, req)
+
+			if rec.Code != tc.wantStatus {
+				t.Errorf("status = %d, want %d", rec.Code, tc.wantStatus)
+			}
+			if (tc.wantStatus == http.StatusOK) != ranNext {
+				t.Errorf("ranNext = %v, want %v", ranNext, tc.wantStatus == http.StatusOK)
+			}
+		})
+	}
+
+	// The iat the IdP minted (baseClaims sets it to ~now) and the jti reached the
+	// checker, so the session-revoked (issued-at-or-before T) path has real inputs.
+	if rev.gotIssuedAt.IsZero() {
+		t.Error("middleware passed a zero issuedAt to the revocation checker; iat was not propagated")
+	}
+	if rev.gotJTI == "" {
+		t.Error("middleware passed an empty jti to the revocation checker")
+	}
+}
+
 func TestNewRequiresIssuer(t *testing.T) {
 	if _, err := New(context.Background(), Config{}); err == nil {
 		t.Error("New with no issuers should error")
