@@ -281,9 +281,9 @@ func run(addr string, authCfg auth.Config, revSink receiver.Sink, ssfReceiverPat
 	default:
 		log.Println("mail: no backend configured — mail operations return 501")
 	}
-	switch calProvider.(type) {
+	switch p := calProvider.(type) {
 	case staticJMAPCalendarProvider:
-		if p := calProvider.(staticJMAPCalendarProvider); p.username != "" {
+		if p.username != "" {
 			log.Println("calendar: JMAP backend enabled (Basic auth)")
 		} else {
 			log.Println("calendar: JMAP backend enabled (bearer token)")
