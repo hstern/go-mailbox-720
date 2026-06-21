@@ -70,6 +70,37 @@ func (cl *Client) GetEvent(ctx context.Context, id string) (calendar.Event, erro
 	return events[0], nil
 }
 
+// FindEventByUID returns the event in the given calendar whose iCalendar UID
+// matches uid, and whether one was found. It issues a CalendarEvent/query with a
+// UID filter, then fetches the first result (if any) with getEvents.
+func (cl *Client) FindEventByUID(ctx context.Context, calendarID, uid string) (calendar.Event, bool, error) {
+	qArgs, err := cl.do(ctx, &eventQuery{
+		Account: cl.accountID,
+		Filter: &eventFilter{
+			InCalendars: []gojmap.ID{gojmap.ID(calendarID)},
+			UID:         uid,
+		},
+	})
+	if err != nil {
+		return calendar.Event{}, false, fmt.Errorf("jmap: CalendarEvent/query: %w", err)
+	}
+	qResp, ok := qArgs.(*eventQueryResponse)
+	if !ok {
+		return calendar.Event{}, false, fmt.Errorf("jmap: unexpected response %T for CalendarEvent/query", qArgs)
+	}
+	if len(qResp.IDs) == 0 {
+		return calendar.Event{}, false, nil
+	}
+	events, err := cl.getEvents(ctx, qResp.IDs[:1])
+	if err != nil {
+		return calendar.Event{}, false, err
+	}
+	if len(events) == 0 {
+		return calendar.Event{}, false, nil
+	}
+	return events[0], true, nil
+}
+
 // getEvents fetches the CalendarEvents identified by ids and maps each one to a
 // calendar.Event via toCalendarEvent. It is reused by GetEvent, ListInstances,
 // and delta-sync (Tasks 7, 9, 12). The Properties list requests all fields that
@@ -106,3 +137,6 @@ func (cl *Client) getEvents(ctx context.Context, ids []gojmap.ID) ([]calendar.Ev
 	}
 	return out, nil
 }
+
+// Assert that Client implements the calendar.Finder interface.
+var _ calendar.Finder = (*Client)(nil)

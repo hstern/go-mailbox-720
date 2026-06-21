@@ -205,3 +205,89 @@ func TestGetEventNotFound(t *testing.T) {
 		t.Fatalf("GetEvent: expected error for non-existent event")
 	}
 }
+
+func TestFindEventByUIDFound(t *testing.T) {
+	var capturedFilter map[string]any
+
+	cl := dialTest(t, func(w http.ResponseWriter, body map[string]any) {
+		switch methodName(body) {
+		case "CalendarEvent/query":
+			// Capture the filter for later assertion.
+			calls, _ := body["methodCalls"].([]any)
+			call, _ := calls[0].([]any)
+			args, _ := call[1].(map[string]any)
+			capturedFilter, _ = args["filter"].(map[string]any)
+			respond(w, "CalendarEvent/query", map[string]any{
+				"accountId": "acc1",
+				"ids":       []string{"e1"},
+			})
+		case "CalendarEvent/get":
+			respond(w, "CalendarEvent/get", map[string]any{
+				"accountId": "acc1", "state": "1",
+				"list": []map[string]any{
+					{
+						"id":       "e1",
+						"uid":      "uid-from-server",
+						"title":    "Event by UID",
+						"utcStart": "2026-06-15T10:00:00Z",
+						"utcEnd":   "2026-06-15T11:00:00Z",
+					},
+				},
+				"notFound": []string{},
+			})
+		default:
+			http.Error(w, "unexpected method: "+methodName(body), http.StatusBadRequest)
+		}
+	})
+
+	event, found, err := cl.FindEventByUID(context.Background(), "cal1", "uid-from-server")
+	if err != nil {
+		t.Fatalf("FindEventByUID: %v", err)
+	}
+	if !found {
+		t.Errorf("found = %v, want true", found)
+	}
+	if event.ID != "e1" {
+		t.Errorf("ID = %q, want e1", event.ID)
+	}
+	if event.Subject != "Event by UID" {
+		t.Errorf("Subject = %q, want Event by UID", event.Subject)
+	}
+
+	// Assert the query carried the uid and calendarID filter.
+	if capturedFilter == nil {
+		t.Fatal("query filter was nil")
+	}
+	inCals, _ := capturedFilter["inCalendars"].([]any)
+	if len(inCals) != 1 || inCals[0] != "cal1" {
+		t.Errorf("inCalendars = %v, want [cal1]", inCals)
+	}
+	if capturedFilter["uid"] != "uid-from-server" {
+		t.Errorf("uid = %v, want uid-from-server", capturedFilter["uid"])
+	}
+}
+
+func TestFindEventByUIDMissing(t *testing.T) {
+	cl := dialTest(t, func(w http.ResponseWriter, body map[string]any) {
+		// Only the query call should be made; get should NOT fire when ids is empty.
+		if methodName(body) != "CalendarEvent/query" {
+			http.Error(w, "unexpected method after empty query: "+methodName(body), http.StatusBadRequest)
+			return
+		}
+		respond(w, "CalendarEvent/query", map[string]any{
+			"accountId": "acc1",
+			"ids":       []string{},
+		})
+	})
+
+	event, found, err := cl.FindEventByUID(context.Background(), "cal1", "nonexistent-uid")
+	if err != nil {
+		t.Fatalf("FindEventByUID: %v", err)
+	}
+	if found {
+		t.Errorf("found = %v, want false", found)
+	}
+	if event.ID != "" {
+		t.Errorf("event.ID = %q, want empty", event.ID)
+	}
+}
