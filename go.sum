@@ -60,8 +60,8 @@ github.com/hstern/go-protected-resource-metadata v0.1.0 h1:fdS80jxsA+ppRHlUoTuhg
 github.com/hstern/go-protected-resource-metadata v0.1.0/go.mod h1:thlCq+8qE2UrDhr5qTGRON+8bI+x1xIsA1zwPU53i7s=
 github.com/hstern/go-risc v0.2.0 h1:m6MQZ2n4QU4pErrxC590oEDXkzRssEWNJtfJP5mGJNo=
 github.com/hstern/go-risc v0.2.0/go.mod h1:Rb4yY3DoHl4KbWFoDF64purgtgY5zUoa48gTeAz/xC0=
-github.com/hstern/go-secevent v0.2.0 h1:R+VJMmOuEH9jiyucT8D8JJradBdaKYzZ6iAbjLoxAJw=
-github.com/hstern/go-secevent v0.2.0/go.mod h1:NHgFWVud3F3QHrIMiNszwmo5kTYaNh/SvHr1ytH9vkY=
+github.com/hstern/go-secevent v0.2.1 h1:Ddz60up4GOy/UMronHRdzHvAQFtG8BWDrhShW9p2n/M=
+github.com/hstern/go-secevent v0.2.1/go.mod h1:NHgFWVud3F3QHrIMiNszwmo5kTYaNh/SvHr1ytH9vkY=
 github.com/hstern/go-sieve v0.2.0 h1:YDyFvOPTr+lRo3oz3J4ZESKH9ysK8015mR4k19rdIu0=
 github.com/hstern/go-sieve v0.2.0/go.mod h1:1G+kCfdL0/TgEsnaV+8NtgZK4RGn483Qc0RIvBiarKI=
 github.com/hstern/go-ssf v0.1.0 h1:edBo5u8ugGz3RwY5eQ1c5q53a7naQKg1fYNItfUMrvk=
