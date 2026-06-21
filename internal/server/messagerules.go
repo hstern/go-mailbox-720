@@ -39,6 +39,9 @@ func (h Handler) MeMailFoldersListMessageRules(ctx context.Context, _ api.MeMail
 	}
 	rules, err := fr.ListRules(ctx)
 	if err != nil {
+		if errors.Is(err, mail.ErrFiltersUnsupported) {
+			return nil, ht.ErrNotImplemented
+		}
 		return nil, fmt.Errorf("list message rules: %w", err)
 	}
 	value := make([]api.MicrosoftGraphMessageRule, 0, len(rules))
@@ -68,6 +71,9 @@ func (h Handler) MeMailFoldersGetMessageRules(ctx context.Context, params api.Me
 		if errors.Is(err, mail.ErrRuleNotFound) {
 			return notFound("message rule not found"), nil
 		}
+		if errors.Is(err, mail.ErrFiltersUnsupported) {
+			return nil, ht.ErrNotImplemented
+		}
 		return nil, fmt.Errorf("get message rule: %w", err)
 	}
 	return &api.MicrosoftGraphMessageRuleStatusCode{
@@ -91,6 +97,9 @@ func (h Handler) MeMailFoldersCreateMessageRules(ctx context.Context, req *api.M
 	// A create starts from an empty rule and overlays the request's set fields.
 	created, err := fw.CreateRule(ctx, mergeGraphRule(mail.MessageRule{}, req))
 	if err != nil {
+		if errors.Is(err, mail.ErrFiltersUnsupported) {
+			return nil, ht.ErrNotImplemented
+		}
 		return nil, fmt.Errorf("create message rule: %w", err)
 	}
 	return &api.MicrosoftGraphMessageRuleStatusCode{
@@ -121,12 +130,18 @@ func (h Handler) MeMailFoldersUpdateMessageRules(ctx context.Context, req *api.M
 		if errors.Is(err, mail.ErrRuleNotFound) {
 			return notFound("message rule not found"), nil
 		}
+		if errors.Is(err, mail.ErrFiltersUnsupported) {
+			return nil, ht.ErrNotImplemented
+		}
 		return nil, fmt.Errorf("get message rule: %w", err)
 	}
 	updated, err := fw.UpdateRule(ctx, params.MessageRuleID, mergeGraphRule(existing, req))
 	if err != nil {
 		if errors.Is(err, mail.ErrRuleNotFound) {
 			return notFound("message rule not found"), nil
+		}
+		if errors.Is(err, mail.ErrFiltersUnsupported) {
+			return nil, ht.ErrNotImplemented
 		}
 		return nil, fmt.Errorf("update message rule: %w", err)
 	}
@@ -151,6 +166,9 @@ func (h Handler) MeMailFoldersDeleteMessageRules(ctx context.Context, params api
 	if err := fw.DeleteRule(ctx, params.MessageRuleID); err != nil {
 		if errors.Is(err, mail.ErrRuleNotFound) {
 			return notFound("message rule not found"), nil
+		}
+		if errors.Is(err, mail.ErrFiltersUnsupported) {
+			return nil, ht.ErrNotImplemented
 		}
 		return nil, fmt.Errorf("delete message rule: %w", err)
 	}

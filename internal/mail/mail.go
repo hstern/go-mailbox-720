@@ -340,3 +340,9 @@ type FilterWriter interface {
 // ErrRuleNotFound is returned by FilterReader/FilterWriter when no rule has the
 // requested id.
 var ErrRuleNotFound = errors.New("mail: message rule not found")
+
+// ErrFiltersUnsupported is returned by a FilterReader/FilterWriter when the backend
+// connection cannot manage filters even though it implements the capability — e.g. a
+// JMAP session that does not advertise the Sieve capability (RFC 9661). The server
+// maps it to 501, the same posture as ErrNoQuota.
+var ErrFiltersUnsupported = errors.New("mail: filters not supported by this backend")
