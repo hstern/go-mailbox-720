@@ -184,7 +184,7 @@ and linked by `hstern/go-protected-resource-metadata`.)
 | `internal/tz` | Graph (Windows/IANA) time-zone resolution. |
 | `cmd/mailboxd` | The server binary. |
 | `test/conformance` | Black-box conformance test driving mailboxd with the official `msgraph-sdk-go` client (separate module). |
-| `test/e2e-oidc` | End-to-end: real Kanidm + Dovecot + Radicale (Docker) — an authenticated client reads mail and calendar through mailboxd (separate module). |
+| `test/e2e-oidc` | End-to-end: an IdP matrix (real Kanidm + Zitadel) + Dovecot + Radicale (Docker) — an authenticated client reads mail and calendar through mailboxd. Impersonation-capable tests are gated to IdPs that support RFC 8693 user impersonation (Zitadel; Kanidm excluded). Separate module. |
 
 ## License
 
