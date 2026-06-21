@@ -7,6 +7,8 @@ import (
 
 	"github.com/hstern/go-jscalendar"
 	jscal "github.com/hstern/go-jscalendar/jmap"
+
+	calendar "github.com/hstern/go-mailbox-720/internal/calendar"
 )
 
 func TestToCalendarEventScalars(t *testing.T) {
@@ -129,5 +131,25 @@ func TestToCalendarEventStartEndLocationAttendees(t *testing.T) {
 	// Organizer should be the owner participant (Alice, key p1).
 	if got.Organizer.Email != "alice@example.com" {
 		t.Errorf("Organizer.Email: got %q, want %q", got.Organizer.Email, "alice@example.com")
+	}
+}
+
+func TestFromCalendarEventRoundTrip(t *testing.T) {
+	in := calendar.Event{
+		UID:        "uid-3",
+		CalendarID: "c1",
+		Subject:    "Review",
+		Status:     "tentative",
+		Body:       calendar.Body{ContentType: "text", Content: "notes"},
+	}
+	ce, err := fromCalendarEvent(in)
+	if err != nil {
+		t.Fatalf("fromCalendarEvent: %v", err)
+	}
+	if ce.UID != "uid-3" || ce.Title != "Review" || ce.Status != "tentative" {
+		t.Fatalf("fields: %+v", ce.Event)
+	}
+	if !ce.CalendarIDs["c1"] {
+		t.Fatalf("calendarIds: %+v", ce.CalendarIDs)
 	}
 }

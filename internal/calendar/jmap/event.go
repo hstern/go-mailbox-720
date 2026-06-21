@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 
 	goical "github.com/emersion/go-ical"
@@ -271,4 +272,191 @@ func isExcluded(patch jscalendar.PatchObject) bool {
 		return false
 	}
 	return bytes.Equal(bytes.TrimSpace(json.RawMessage(v)), []byte("true"))
+}
+
+// statusToPartStat maps the neutral calendar.Attendee.Status vocabulary
+// to a JSCalendar participationStatus, inverting partStatToStatus.
+func statusToPartStat(s string) string {
+	switch s {
+	case "accepted":
+		return "accepted"
+	case "declined":
+		return "declined"
+	case "tentativelyAccepted":
+		return "tentative"
+	case "notResponded", "":
+		return "needs-action"
+	default:
+		return ""
+	}
+}
+
+// fromCalendarEvent maps a backend-neutral calendar.Event to a JMAP
+// CalendarEvent, inverting toCalendarEvent row-for-row.
+func fromCalendarEvent(e calendar.Event) (*jscal.CalendarEvent, error) {
+	ev := &jscalendar.Event{
+		UID:      e.UID,
+		Title:    e.Subject,
+		Status:   e.Status,
+		Sequence: uint(e.Sequence),
+	}
+
+	// ShowWithoutTime from IsAllDay.
+	ev.ShowWithoutTime = e.IsAllDay
+
+	// Description from Body.
+	if e.Body.Content != "" {
+		ev.Description = e.Body.Content
+		if e.Body.ContentType != "" && e.Body.ContentType != "text" {
+			ev.DescriptionContentType = e.Body.ContentType
+		}
+	}
+
+	// Created from CreatedAt.
+	if !e.CreatedAt.IsZero() {
+		udt := jscalendar.UTCDateTimeFromTime(e.CreatedAt)
+		ev.Created = &udt
+	}
+
+	// Start / End: emit as UTC LocalDateTime with "Etc/UTC" zone, deriving
+	// Duration from End-Start. We only set Start/Duration when Start is non-zero.
+	if !e.Start.IsZero() {
+		ldt := jscalendar.LocalDateTime{
+			Year:   e.Start.Year(),
+			Month:  int(e.Start.Month()),
+			Day:    e.Start.Day(),
+			Hour:   e.Start.Hour(),
+			Minute: e.Start.Minute(),
+			Second: e.Start.Second(),
+		}
+		ev.Start = &ldt
+		ev.TimeZone = "Etc/UTC"
+
+		if !e.End.IsZero() {
+			d := e.End.Sub(e.Start)
+			dur := jscalendar.Duration{
+				Hours:   uint64(d / time.Hour),
+				Minutes: uint64((d % time.Hour) / time.Minute),
+				Seconds: uint64((d % time.Minute) / time.Second),
+			}
+			ev.Duration = &dur
+		}
+	}
+
+	// Location: emit as a single Locations entry keyed "1".
+	if e.Location != "" {
+		ev.Locations = map[jscalendar.Id]jscalendar.Location{
+			"1": {Name: e.Location},
+		}
+	}
+
+	// Participants: Organizer → role "owner"; Attendees → role "attendee".
+	// Keys are "organizer" and "a<N>" for deterministic output.
+	if e.Organizer.Email != "" || len(e.Attendees) > 0 {
+		parts := make(map[jscalendar.Id]jscalendar.Participant)
+
+		if e.Organizer.Email != "" {
+			parts["organizer"] = jscalendar.Participant{
+				Name:   e.Organizer.Name,
+				Email:  e.Organizer.Email,
+				SendTo: map[string]string{"imip": "mailto:" + e.Organizer.Email},
+				Roles:  map[string]bool{"owner": true},
+			}
+		}
+		for i, a := range e.Attendees {
+			key := jscalendar.Id(fmt.Sprintf("a%d", i+1))
+			parts[key] = jscalendar.Participant{
+				Name:                a.Name,
+				Email:               a.Email,
+				SendTo:              map[string]string{"imip": "mailto:" + a.Email},
+				Roles:               map[string]bool{"attendee": true},
+				ParticipationStatus: statusToPartStat(a.Status),
+			}
+		}
+		ev.Participants = parts
+	}
+
+	// Recurrence: RRULE string → structured RecurrenceRules; ExceptionDates → RecurrenceOverrides.
+	if e.Recurrence != nil && e.Recurrence.RRULE != "" {
+		rules, err := rulesFromRRULE(e.Recurrence.RRULE)
+		if err != nil {
+			return nil, err
+		}
+		ev.RecurrenceRules = rules
+
+		if len(e.Recurrence.ExceptionDates) > 0 {
+			overrides := make(map[string]jscalendar.PatchObject, len(e.Recurrence.ExceptionDates))
+			for _, exd := range e.Recurrence.ExceptionDates {
+				utcExd := exd.UTC()
+				ldt := jscalendar.LocalDateTime{
+					Year:   utcExd.Year(),
+					Month:  int(utcExd.Month()),
+					Day:    utcExd.Day(),
+					Hour:   utcExd.Hour(),
+					Minute: utcExd.Minute(),
+					Second: utcExd.Second(),
+				}
+				overrides[ldt.String()] = jscalendar.PatchObject{
+					"excluded": json.RawMessage("true"),
+				}
+			}
+			ev.RecurrenceOverrides = overrides
+		}
+	}
+
+	// Wrap in CalendarEvent.
+	ce := jscal.FromEvent(ev)
+	ce.ID = jscalendar.Id(e.ID)
+	if e.CalendarID != "" {
+		ce.CalendarIDs = map[jscalendar.Id]bool{jscalendar.Id(e.CalendarID): true}
+	}
+	if e.SeriesMasterID != "" {
+		baseID := jscalendar.Id(e.SeriesMasterID)
+		ce.BaseEventID = &baseID
+	}
+
+	return ce, nil
+}
+
+// rulesFromRRULE parses an RFC 5545 RRULE property value string into a slice of
+// structured JSCalendar RecurrenceRules. It does this by round-tripping through
+// the ical bridge: it builds a throwaway VCALENDAR containing a VEVENT with the
+// RRULE property (and a minimal DTSTART so the parser accepts it), then calls
+// ical.FromICal to obtain a *jscalendar.Event and reads its RecurrenceRules.
+//
+// API deviation note: rather than constructing a goical.Calendar programmatically
+// (which would require setting mandatory PRODID/VERSION/UID/DTSTAMP properties),
+// we render a minimal ICS text string and decode it with goical.NewDecoder. This
+// matches how rruleFromRules round-trips in the opposite direction.
+func rulesFromRRULE(rrule string) ([]jscalendar.RecurrenceRule, error) {
+	if rrule == "" {
+		return nil, nil
+	}
+	ics := "BEGIN:VCALENDAR\r\n" +
+		"VERSION:2.0\r\n" +
+		"PRODID:-//go-mailbox-720//EN\r\n" +
+		"BEGIN:VEVENT\r\n" +
+		"UID:x\r\n" +
+		"DTSTAMP:20260101T000000Z\r\n" +
+		"DTSTART:20260101T000000Z\r\n" +
+		"RRULE:" + rrule + "\r\n" +
+		"END:VEVENT\r\n" +
+		"END:VCALENDAR\r\n"
+
+	cal, err := goical.NewDecoder(strings.NewReader(ics)).Decode()
+	if err != nil {
+		return nil, fmt.Errorf("jmap: rulesFromRRULE decode: %w", err)
+	}
+	objs, err := ical.FromICal(cal)
+	if err != nil {
+		return nil, fmt.Errorf("jmap: rulesFromRRULE convert: %w", err)
+	}
+	if len(objs) == 0 {
+		return nil, nil
+	}
+	ev, ok := objs[0].(*jscalendar.Event)
+	if !ok {
+		return nil, fmt.Errorf("jmap: rulesFromRRULE: unexpected object type %T", objs[0])
+	}
+	return ev.RecurrenceRules, nil
 }
