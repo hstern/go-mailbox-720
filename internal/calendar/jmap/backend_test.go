@@ -5,8 +5,11 @@ import (
 	"encoding/json"
 	"net/http"
 	"testing"
+	"time"
 
 	gojmap "git.sr.ht/~rockorager/go-jmap"
+
+	"github.com/hstern/go-mailbox-720/internal/calendar"
 )
 
 // dialTest returns a Client wired to a jmapServer with the given POST handler.
@@ -49,4 +52,106 @@ func TestListCalendars(t *testing.T) {
 		t.Fatalf("cals = %+v", cals)
 	}
 	_ = gojmap.ID("")
+}
+
+// methodName extracts the first method call name from a JMAP request body,
+// e.g. "CalendarEvent/query" or "CalendarEvent/get".
+func methodName(body map[string]any) string {
+	calls, _ := body["methodCalls"].([]any)
+	if len(calls) == 0 {
+		return ""
+	}
+	call, _ := calls[0].([]any)
+	if len(call) == 0 {
+		return ""
+	}
+	name, _ := call[0].(string)
+	return name
+}
+
+func TestListEvents(t *testing.T) {
+	var capturedFilter map[string]any
+
+	cl := dialTest(t, func(w http.ResponseWriter, body map[string]any) {
+		switch methodName(body) {
+		case "CalendarEvent/query":
+			// Capture the filter for later assertion.
+			calls, _ := body["methodCalls"].([]any)
+			call, _ := calls[0].([]any)
+			args, _ := call[1].(map[string]any)
+			capturedFilter, _ = args["filter"].(map[string]any)
+			respond(w, "CalendarEvent/query", map[string]any{
+				"accountId": "acc1",
+				"ids":       []string{"e1"},
+			})
+		case "CalendarEvent/get":
+			respond(w, "CalendarEvent/get", map[string]any{
+				"accountId": "acc1", "state": "1",
+				"list": []map[string]any{
+					{
+						"id":       "e1",
+						"uid":      "u1",
+						"title":    "M",
+						"utcStart": "2026-06-01T10:00:00Z",
+						"utcEnd":   "2026-06-01T11:00:00Z",
+					},
+				},
+				"notFound": []string{},
+			})
+		default:
+			http.Error(w, "unexpected method: "+methodName(body), http.StatusBadRequest)
+		}
+	})
+
+	start := time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC)
+	end := time.Date(2026, 6, 30, 0, 0, 0, 0, time.UTC)
+	events, err := cl.ListEvents(context.Background(), "cal1", calendar.Range{Start: start, End: end})
+	if err != nil {
+		t.Fatalf("ListEvents: %v", err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("want 1 event, got %d: %+v", len(events), events)
+	}
+	if events[0].ID != "e1" {
+		t.Errorf("ID = %q, want e1", events[0].ID)
+	}
+	if events[0].Subject != "M" {
+		t.Errorf("Subject = %q, want M", events[0].Subject)
+	}
+
+	// Assert the query carried the calendarID filter and time bounds.
+	if capturedFilter == nil {
+		t.Fatal("query filter was nil")
+	}
+	inCals, _ := capturedFilter["inCalendars"].([]any)
+	if len(inCals) != 1 || inCals[0] != "cal1" {
+		t.Errorf("inCalendars = %v, want [cal1]", inCals)
+	}
+	if capturedFilter["after"] != start.Format(time.RFC3339) {
+		t.Errorf("after = %v, want %v", capturedFilter["after"], start.Format(time.RFC3339))
+	}
+	if capturedFilter["before"] != end.Format(time.RFC3339) {
+		t.Errorf("before = %v, want %v", capturedFilter["before"], end.Format(time.RFC3339))
+	}
+}
+
+func TestListEventsEmpty(t *testing.T) {
+	cl := dialTest(t, func(w http.ResponseWriter, body map[string]any) {
+		// Only the query call should be made; get should NOT fire when ids is empty.
+		if methodName(body) != "CalendarEvent/query" {
+			http.Error(w, "unexpected method after empty query: "+methodName(body), http.StatusBadRequest)
+			return
+		}
+		respond(w, "CalendarEvent/query", map[string]any{
+			"accountId": "acc1",
+			"ids":       []string{},
+		})
+	})
+	events, err := cl.ListEvents(context.Background(), "cal1", calendar.Range{})
+	if err != nil {
+		t.Fatalf("ListEvents empty: %v", err)
+	}
+	if events != nil {
+		t.Errorf("expected nil, got %v", events)
+	}
 }
