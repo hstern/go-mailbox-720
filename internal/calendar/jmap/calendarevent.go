@@ -19,11 +19,18 @@ type jmapCalendar struct {
 	ID          gojmap.ID `json:"id"`
 	Name        string    `json:"name"`
 	Description string    `json:"description"`
+	// ShareWith is the per-principal sharing-rights map (JMAP Calendars), populated
+	// only when "shareWith" is requested (the sharing path, sharing.go); nil on the
+	// read paths that do not ask for it.
+	ShareWith map[gojmap.ID]*calendarRights `json:"shareWith,omitempty"`
 }
 
 type calendarGet struct {
 	Account gojmap.ID   `json:"accountId"`
 	IDs     []gojmap.ID `json:"ids,omitempty"`
+	// Properties narrows the fetched fields; empty fetches all. The sharing path
+	// sets it to fetch shareWith.
+	Properties []string `json:"properties,omitempty"`
 }
 
 func (m *calendarGet) Name() string           { return "Calendar/get" }
