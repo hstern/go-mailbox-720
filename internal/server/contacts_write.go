@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/hstern/go-jscontact"
 	ht "github.com/ogen-go/ogen/http"
 
 	"github.com/hstern/go-mailbox-720/internal/contacts"
@@ -106,18 +107,17 @@ func (h Handler) MeDeleteContacts(ctx context.Context, params api.MeDeleteContac
 // graphToContact maps the inbound Graph contact onto the neutral
 // contacts.Contact — the inverse of toGraphContact. Read-only and
 // server-assigned fields (ID, UID) are ignored: the backend stamps the created
-// contact with its own opaque ID/UID.
+// contact with its own opaque ID/UID. The flat Graph DTO is projected onto the
+// rich jscontact.Card via the Card builders (SetName/SetOrganization/…).
 func graphToContact(gc *api.MicrosoftGraphContact) contacts.Contact {
-	return contacts.Contact{
-		DisplayName:  gc.DisplayName.Or(""),
-		GivenName:    gc.GivenName.Or(""),
-		Surname:      gc.Surname.Or(""),
-		Organization: gc.CompanyName.Or(""),
-		Title:        gc.JobTitle.Or(""),
-		Note:         gc.PersonalNotes.Or(""),
-		Emails:       graphToEmails(gc.EmailAddresses),
-		Phones:       graphToPhones(gc),
-	}
+	var c contacts.Contact
+	c.SetName(gc.DisplayName.Or(""), gc.GivenName.Or(""), gc.Surname.Or(""))
+	c.SetOrganization(gc.CompanyName.Or(""))
+	c.SetTitle(gc.JobTitle.Or(""))
+	c.SetNote(gc.PersonalNotes.Or(""))
+	c.SetEmails(graphToEmails(gc.EmailAddresses))
+	c.SetPhones(graphToPhones(gc))
+	return c
 }
 
 // mergeContactPatch overlays the fields present in the inbound Graph PATCH body
@@ -126,48 +126,94 @@ func graphToContact(gc *api.MicrosoftGraphContact) contacts.Contact {
 // scalar OptNil fields via .Get() (a set field overlays, even when its value is
 // empty), the EmailAddresses collection via a non-empty slice, and the phones
 // per-kind (see mergePhones). The contact's identity (ID, UID, and the rest of
-// the current record) is preserved so UpdateContact rewrites in place.
+// the current record's embedded Card) is preserved: the merge mutates the
+// projected fields of a copy of current via the Card setters, so UpdateContact
+// rewrites in place.
+//
+// The projected fields (DisplayName/Organization/…) are read-only methods, not
+// addressable struct fields, so each overlay routes through the corresponding
+// Card setter. Name is reconciled as a unit (SetName takes display+given+surname
+// together) from current's values plus any present patch fields.
 func mergeContactPatch(current contacts.Contact, gc *api.MicrosoftGraphContact) contacts.Contact {
 	merged := current
+
+	// Name: overlay only the present components onto current's, then rebuild the
+	// Card Name as a unit (SetName clears+rewrites display/given/surname).
+	display, given, surname := current.DisplayName(), current.GivenName(), current.Surname()
+	nameTouched := false
 	if v, ok := gc.DisplayName.Get(); ok {
-		merged.DisplayName = v
+		display, nameTouched = v, true
 	}
 	if v, ok := gc.GivenName.Get(); ok {
-		merged.GivenName = v
+		given, nameTouched = v, true
 	}
 	if v, ok := gc.Surname.Get(); ok {
-		merged.Surname = v
+		surname, nameTouched = v, true
 	}
+	if nameTouched {
+		merged.SetName(display, given, surname)
+	}
+
 	if v, ok := gc.CompanyName.Get(); ok {
-		merged.Organization = v
+		setOrClearOrganization(&merged, v)
 	}
 	if v, ok := gc.JobTitle.Get(); ok {
-		merged.Title = v
+		setOrClearTitle(&merged, v)
 	}
 	if v, ok := gc.PersonalNotes.Get(); ok {
-		merged.Note = v
+		setOrClearNote(&merged, v)
 	}
 	if len(gc.EmailAddresses) > 0 {
-		merged.Emails = graphToEmails(gc.EmailAddresses)
+		merged.SetEmails(graphToEmails(gc.EmailAddresses))
 	}
 	if len(gc.BusinessPhones) > 0 || len(gc.HomePhones) > 0 || gc.MobilePhone.Set {
-		merged.Phones = mergePhones(current.Phones, gc)
+		merged.SetPhones(mergePhones(current.PhoneList(), gc))
 	}
 	return merged
+}
+
+// setOrClearOrganization overlays a present Graph companyName: a non-empty value
+// sets the single organization, an empty value clears it (SetOrganization is a
+// no-op on empty, so the clear is explicit here to honour a present-but-empty
+// PATCH field).
+func setOrClearOrganization(c *contacts.Contact, name string) {
+	if name == "" {
+		c.Organizations = nil
+		return
+	}
+	c.SetOrganization(name)
+}
+
+// setOrClearTitle mirrors setOrClearOrganization for the single job title.
+func setOrClearTitle(c *contacts.Contact, name string) {
+	if name == "" {
+		c.Titles = nil
+		return
+	}
+	c.SetTitle(name)
+}
+
+// setOrClearNote mirrors setOrClearOrganization for the single note.
+func setOrClearNote(c *contacts.Contact, note string) {
+	if note == "" {
+		c.Notes = nil
+		return
+	}
+	c.SetNote(note)
 }
 
 // mergePhones overlays the inbound Graph phone fields onto the current phones
 // per-kind. Microsoft Graph exposes phones as three separate properties
 // (businessPhones/homePhones/mobilePhone) that this server collapses into one
-// neutral []Phone, so a partial PATCH must replace only the kinds it carries:
+// neutral phone list, so a partial PATCH must replace only the kinds it carries:
 // patching just mobilePhone must not drop the existing work/home numbers. A
 // present-but-empty mobilePhone clears the mobile number; absent kinds (and any
 // non-standard phone types) are carried over from current.
-func mergePhones(current []contacts.Phone, gc *api.MicrosoftGraphContact) []contacts.Phone {
-	work, home, cell := []contacts.Phone(nil), []contacts.Phone(nil), []contacts.Phone(nil)
-	var other []contacts.Phone
+func mergePhones(current []jscontact.Phone, gc *api.MicrosoftGraphContact) []jscontact.Phone {
+	work, home, cell := []jscontact.Phone(nil), []jscontact.Phone(nil), []jscontact.Phone(nil)
+	var other []jscontact.Phone
 	for _, p := range current {
-		switch p.Type {
+		switch contacts.PhoneType(p) {
 		case "work":
 			work = append(work, p)
 		case "home":
@@ -189,11 +235,11 @@ func mergePhones(current []contacts.Phone, gc *api.MicrosoftGraphContact) []cont
 		if strings.TrimSpace(v) == "" {
 			cell = nil // explicit clear of the mobile number
 		} else {
-			cell = []contacts.Phone{{Number: v, Type: "cell"}}
+			cell = []jscontact.Phone{contacts.NewPhone(v, "cell")}
 		}
 	}
 
-	out := make([]contacts.Phone, 0, len(work)+len(home)+len(cell)+len(other))
+	out := make([]jscontact.Phone, 0, len(work)+len(home)+len(cell)+len(other))
 	out = append(out, work...)
 	out = append(out, home...)
 	out = append(out, cell...)
@@ -205,52 +251,49 @@ func mergePhones(current []contacts.Phone, gc *api.MicrosoftGraphContact) []cont
 }
 
 // numbersOfType maps a Graph phone-number list onto neutral phones of the given
-// vCard TYPE, skipping blank entries.
-func numbersOfType(nums []api.NilString, typ string) []contacts.Phone {
-	var out []contacts.Phone
+// JSContact type, skipping blank entries.
+func numbersOfType(nums []api.NilString, typ string) []jscontact.Phone {
+	var out []jscontact.Phone
 	for _, p := range nums {
 		if v, ok := p.Get(); ok && strings.TrimSpace(v) != "" {
-			out = append(out, contacts.Phone{Number: v, Type: typ})
+			out = append(out, contacts.NewPhone(v, typ))
 		}
 	}
 	return out
 }
 
-// graphToEmails maps Graph emailAddress objects onto neutral contacts.EmailAddress
-// values — the inverse of toGraphEmailAddresses (the Graph name carries the vCard
-// TYPE label).
-func graphToEmails(emails []api.MicrosoftGraphEmailAddress) []contacts.EmailAddress {
+// graphToEmails maps Graph emailAddress objects onto neutral jscontact email
+// values — the inverse of toGraphEmailAddresses (the Graph name carries the
+// JSContact type label).
+func graphToEmails(emails []api.MicrosoftGraphEmailAddress) []jscontact.EmailAddress {
 	if len(emails) == 0 {
 		return nil
 	}
-	out := make([]contacts.EmailAddress, 0, len(emails))
+	out := make([]jscontact.EmailAddress, 0, len(emails))
 	for _, e := range emails {
-		out = append(out, contacts.EmailAddress{
-			Address: e.Address.Or(""),
-			Type:    e.Name.Or(""),
-		})
+		out = append(out, contacts.NewEmail(e.Address.Or(""), e.Name.Or("")))
 	}
 	return out
 }
 
 // graphToPhones gathers the Graph contact's type-specific phone fields back into
-// neutral contacts.Phone values — the inverse of addPhones. The destination field
-// dictates the vCard TYPE: mobilePhone -> "cell", homePhones -> "home",
-// businessPhones -> "work".
-func graphToPhones(gc *api.MicrosoftGraphContact) []contacts.Phone {
-	var out []contacts.Phone
+// neutral jscontact phone values — the inverse of addPhones. The destination
+// field dictates the JSContact type: mobilePhone -> "cell", homePhones ->
+// "home", businessPhones -> "work".
+func graphToPhones(gc *api.MicrosoftGraphContact) []jscontact.Phone {
+	var out []jscontact.Phone
 	for _, p := range gc.BusinessPhones {
 		if v, ok := p.Get(); ok && strings.TrimSpace(v) != "" {
-			out = append(out, contacts.Phone{Number: v, Type: "work"})
+			out = append(out, contacts.NewPhone(v, "work"))
 		}
 	}
 	for _, p := range gc.HomePhones {
 		if v, ok := p.Get(); ok && strings.TrimSpace(v) != "" {
-			out = append(out, contacts.Phone{Number: v, Type: "home"})
+			out = append(out, contacts.NewPhone(v, "home"))
 		}
 	}
 	if v, ok := gc.MobilePhone.Get(); ok && strings.TrimSpace(v) != "" {
-		out = append(out, contacts.Phone{Number: v, Type: "cell"})
+		out = append(out, contacts.NewPhone(v, "cell"))
 	}
 	return out
 }

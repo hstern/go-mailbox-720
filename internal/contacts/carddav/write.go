@@ -9,6 +9,8 @@ import (
 	"strings"
 
 	"github.com/emersion/go-vcard"
+	"github.com/hstern/go-jscontact"
+	jsvcard "github.com/hstern/go-jscontact/vcard"
 
 	"github.com/hstern/go-mailbox-720/internal/contacts"
 )
@@ -77,7 +79,10 @@ func (cl *Client) DeleteContact(ctx context.Context, id string) error {
 
 // putContact encodes c as a vCard and PUTs it at objectPath.
 func (cl *Client) putContact(ctx context.Context, objectPath string, c contacts.Contact) error {
-	card := contactToCard(c)
+	card, err := contactToCard(c)
+	if err != nil {
+		return err
+	}
 	if _, err := cl.c.PutAddressObject(ctx, objectPath, card); err != nil {
 		return fmt.Errorf("put address object: %w", err)
 	}
@@ -85,49 +90,65 @@ func (cl *Client) putContact(ctx context.Context, objectPath string, c contacts.
 }
 
 // contactToCard builds a version-4 vCard from a neutral Contact, the inverse of
-// mapContact. It is the write-path counterpart used by CreateContact and
-// UpdateContact. It always emits the FN and UID properties (FN is required by
-// RFC 6350 §6.2.1, falling back to the assembled name when DisplayName is
-// empty), and a structured N from the given/family-name components; EMAIL, TEL,
-// ORG, TITLE, and NOTE are emitted only when present. ToV4 normalises the card
-// to vCard 4.0 (setting VERSION) so go-webdav's PUT carries a conformant body.
-func contactToCard(c contacts.Contact) vcard.Card {
-	card := make(vcard.Card)
+// contactFromObject. It is the write-path counterpart used by CreateContact and
+// UpdateContact. The JSContact→vCard field mapping (N, ORG, TITLE, EMAIL, TEL,
+// NOTE, TYPE params, …) is delegated to the go-jscontact/vcard bridge
+// (RFC 9555); this only guarantees the RFC 6350 §6.2.1 FN by filling the card's
+// Name.Full from the Graph-shaped DisplayName fallback when it is empty, then
+// sanitises every emitted property value and parameter (the bridge and go-vcard
+// neither escape nor strip control characters, so an unsanitised CR/LF or
+// structural char could forge a property/parameter line). ToVCard sets
+// VERSION:4.0 so go-webdav's PUT carries a conformant body.
+func contactToCard(c contacts.Contact) (vcard.Card, error) {
+	ensureFormattedName(&c)
+	card, err := jsvcard.ToVCard(&c.Card)
+	if err != nil {
+		return nil, fmt.Errorf("carddav: convert contact to vcard: %w", err)
+	}
+	sanitizeCard(card)
+	return card, nil
+}
 
-	card.SetName(&vcard.Name{
-		FamilyName: sanitizeValue(c.Surname),
-		GivenName:  sanitizeValue(c.GivenName),
-	})
+// ensureFormattedName guarantees the contact carries a name with a non-empty
+// Full so the bridge emits the RFC 6350-required FN. When Name.Full is empty it
+// is filled from the Graph-shaped DisplayName fallback (assembled given+surname,
+// else organization), mirroring the old hand-mapped formattedName.
+func ensureFormattedName(c *contacts.Contact) {
+	if c.Name != nil && c.Name.Full != "" {
+		return
+	}
+	full := c.DisplayName()
+	if full == "" {
+		full = c.Organization()
+	}
+	if full == "" {
+		return
+	}
+	if c.Name == nil {
+		c.Name = &jscontact.Name{}
+	}
+	c.Name.Full = full
+}
 
-	card.SetValue(vcard.FieldFormattedName, sanitizeValue(formattedName(c)))
-	card.SetValue(vcard.FieldUID, sanitizeValue(c.UID))
-
-	for _, e := range c.Emails {
-		f := &vcard.Field{Value: sanitizeValue(e.Address)}
-		if e.Type != "" {
-			f.Params = vcard.Params{vcard.ParamType: []string{sanitizeParam(e.Type)}}
+// sanitizeCard strips injection-unsafe characters from every value and parameter
+// of an encoded card. The go-jscontact/vcard bridge passes JSContact values
+// through to go-vcard verbatim, and go-vcard's encoder escapes "\", "\n" and ","
+// in values but neither escapes nor quotes parameter values — so a value or TYPE
+// containing CR/LF (or a structural char in a parameter) could forge a property
+// or parameter line on the wire. This keeps the encoded card single-line-per-
+// property, the same guarantee the old hand-mapped contactToCard provided.
+func sanitizeCard(card vcard.Card) {
+	for _, fields := range card {
+		for _, f := range fields {
+			f.Value = sanitizeValue(f.Value)
+			for name, vals := range f.Params {
+				for i, v := range vals {
+					vals[i] = sanitizeParam(v)
+				}
+				f.Params[name] = vals
+			}
 		}
-		card.Add(vcard.FieldEmail, f)
 	}
-	for _, p := range c.Phones {
-		f := &vcard.Field{Value: sanitizeValue(p.Number)}
-		if p.Type != "" {
-			f.Params = vcard.Params{vcard.ParamType: []string{sanitizeParam(p.Type)}}
-		}
-		card.Add(vcard.FieldTelephone, f)
-	}
-	if c.Organization != "" {
-		card.SetValue(vcard.FieldOrganization, sanitizeValue(c.Organization))
-	}
-	if c.Title != "" {
-		card.SetValue(vcard.FieldTitle, sanitizeValue(c.Title))
-	}
-	if c.Note != "" {
-		card.SetValue(vcard.FieldNote, sanitizeValue(c.Note))
-	}
-
-	vcard.ToV4(card)
-	return card
 }
 
 // sanitizeValue strips control characters from a vCard property value. go-vcard's
@@ -155,26 +176,6 @@ func sanitizeParam(s string) string {
 		}
 		return r
 	}, s)
-}
-
-// formattedName chooses the value for the required FN property: the explicit
-// DisplayName when set, otherwise the given and family names joined, otherwise
-// the organization. RFC 6350 requires at least one FN, so a non-empty value is
-// always produced for a contact carrying any identifying field.
-func formattedName(c contacts.Contact) string {
-	if c.DisplayName != "" {
-		return c.DisplayName
-	}
-	switch {
-	case c.GivenName != "" && c.Surname != "":
-		return c.GivenName + " " + c.Surname
-	case c.GivenName != "":
-		return c.GivenName
-	case c.Surname != "":
-		return c.Surname
-	default:
-		return c.Organization
-	}
 }
 
 // contactObjectName returns the ".vcf" object filename for a UID, rejecting a

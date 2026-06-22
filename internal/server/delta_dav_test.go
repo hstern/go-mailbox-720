@@ -91,6 +91,14 @@ func TestEventsDeltaHandlerNotImplemented(t *testing.T) {
 	}
 }
 
+// deltaTestContact builds a contacts.Contact with the given display name through
+// the JSContact builder (the projected fields are read-only methods now).
+func deltaTestContact(display string) contacts.Contact {
+	var c contacts.Contact
+	c.SetName(display, "", "")
+	return c
+}
+
 type deltaContactsBackend struct {
 	fakeContactsBackend
 	changed []contacts.Contact
@@ -111,7 +119,7 @@ func (p deltaContactsProvider) Contacts(_ context.Context) (contacts.Backend, er
 func TestContactsDeltaHandlerEmitsTombstones(t *testing.T) {
 	backend := &deltaContactsBackend{
 		fakeContactsBackend: fakeContactsBackend{books: []contacts.AddressBook{{ID: "book-1", Name: "Contacts"}}},
-		changed:             []contacts.Contact{{DisplayName: "Bob"}},
+		changed:             []contacts.Contact{deltaTestContact("Bob")},
 		removed:             []string{"contact-gone"},
 		next:                "synctok",
 	}

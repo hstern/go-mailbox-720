@@ -2,76 +2,33 @@ package jmap
 
 import (
 	"sort"
-	"strings"
 
 	"github.com/hstern/go-mailbox-720/internal/contacts"
 )
 
-// contactFromCard maps a JMAP ContactCard (a JSContact Card plus its JMAP id) onto
-// the neutral contact, scoped to addressBookID. The neutral model is a small subset;
-// JSContact's keyed maps (emails, phones, …) are flattened in sorted-key order so
-// the result is deterministic.
+// contactFromCard wraps a JMAP ContactCard (a JSContact Card plus its JMAP id) as
+// the neutral contact, scoped to addressBookID. Since contacts.Contact embeds the
+// full jscontact.Card, the adapter carries the rich Card through unflattened — the
+// single-valued, Graph-shaped projection (DisplayName, EmailList, …) is the
+// server's concern, not the adapter's.
 func contactFromCard(cc *contactCard, addressBookID string) contacts.Contact {
-	card := &cc.Card
-	c := contacts.Contact{
+	return contacts.Contact{
 		ID:            string(cc.ID),
 		AddressBookID: addressBookID,
-		UID:           card.UID,
+		Card:          cc.Card,
 	}
-
-	if card.Name != nil {
-		c.DisplayName = card.Name.Full
-		for _, comp := range card.Name.Components {
-			switch comp.Kind {
-			case "given":
-				c.GivenName = comp.Value
-			case "surname":
-				c.Surname = comp.Value
-			}
-		}
-		if c.DisplayName == "" {
-			c.DisplayName = strings.TrimSpace(c.GivenName + " " + c.Surname)
-		}
-	}
-
-	if k := firstKey(card.Organizations); k != "" {
-		c.Organization = card.Organizations[k].Name
-	}
-	if k := firstKey(card.Titles); k != "" {
-		c.Title = card.Titles[k].Name
-	}
-	if k := firstKey(card.Notes); k != "" {
-		c.Note = card.Notes[k].Note
-	}
-
-	for _, k := range sortedKeys(card.Emails) {
-		if e := card.Emails[k]; e.Address != "" {
-			c.Emails = append(c.Emails, contacts.EmailAddress{Address: e.Address})
-		}
-	}
-	for _, k := range sortedKeys(card.Phones) {
-		if p := card.Phones[k]; p.Number != "" {
-			c.Phones = append(c.Phones, contacts.Phone{Number: p.Number})
-		}
-	}
-	return c
 }
 
-// firstKey returns the lowest-sorted key of m, or "" when m is empty — a stable
-// choice for the neutral model's single-valued fields (organization, title, note).
-func firstKey[V any](m map[string]V) string {
-	ks := sortedKeys(m)
-	if len(ks) == 0 {
-		return ""
-	}
-	return ks[0]
-}
-
-func sortedKeys[V any](m map[string]V) []string {
+// firstAddressBookID returns the lowest-sorted key of the JMAP addressBookIds set,
+// or "" when empty — a stable choice when resolving a card's owning book.
+func firstAddressBookID(m map[string]bool) string {
 	ks := make([]string, 0, len(m))
 	for k := range m {
 		ks = append(ks, k)
 	}
 	sort.Strings(ks)
-	return ks
+	if len(ks) == 0 {
+		return ""
+	}
+	return ks[0]
 }

@@ -35,54 +35,75 @@ NOTE:Met at the Go conference.
 END:VCARD
 `
 
+// mapCard runs a vCard through the read-path bridge (the same path
+// contactFromObject uses) and returns the neutral Contact, so the mapping tests
+// can assert the Graph-shaped projections.
+func mapCard(t *testing.T, s string) contacts.Contact {
+	t.Helper()
+	c, ok := contactFromObject("ab", "/p.vcf", decodeCard(t, s))
+	if !ok {
+		t.Fatal("contactFromObject returned ok=false")
+	}
+	return c
+}
+
 func TestMapContactFull(t *testing.T) {
-	c := mapContact(decodeCard(t, fullCard))
+	c := mapCard(t, fullCard)
 
 	if c.UID != "urn:uuid:4fbe8971-0bc3-424c-9c26-36c3e1eff6b1" {
 		t.Errorf("UID = %q", c.UID)
 	}
-	if c.DisplayName != "Alice Gopher" {
-		t.Errorf("DisplayName = %q, want %q", c.DisplayName, "Alice Gopher")
+	if c.DisplayName() != "Alice Gopher" {
+		t.Errorf("DisplayName = %q, want %q", c.DisplayName(), "Alice Gopher")
 	}
-	if c.GivenName != "Alice" {
-		t.Errorf("GivenName = %q, want %q", c.GivenName, "Alice")
+	if c.GivenName() != "Alice" {
+		t.Errorf("GivenName = %q, want %q", c.GivenName(), "Alice")
 	}
-	if c.Surname != "Gopher" {
-		t.Errorf("Surname = %q, want %q", c.Surname, "Gopher")
+	if c.Surname() != "Gopher" {
+		t.Errorf("Surname = %q, want %q", c.Surname(), "Gopher")
 	}
-	if c.Organization != "Example Corp" {
-		t.Errorf("Organization = %q, want %q (first ORG component only)", c.Organization, "Example Corp")
+	if c.Organization() != "Example Corp" {
+		t.Errorf("Organization = %q, want %q (first ORG component only)", c.Organization(), "Example Corp")
 	}
-	if c.Title != "Principal Engineer" {
-		t.Errorf("Title = %q", c.Title)
+	if c.Title() != "Principal Engineer" {
+		t.Errorf("Title = %q", c.Title())
 	}
-	if c.Note != "Met at the Go conference." {
-		t.Errorf("Note = %q", c.Note)
+	if c.Note() != "Met at the Go conference." {
+		t.Errorf("Note = %q", c.Note())
 	}
 
-	wantEmails := []contacts.EmailAddress{
-		{Address: "alice@example.com", Type: "work"},
-		{Address: "alice@home.example", Type: "home"},
+	// The go-jscontact/vcard bridge (RFC 9555) maps EMAIL/TEL TYPE params to
+	// JSContact contexts/features: TYPE=work→context "work", TYPE=home→context
+	// "private" (RFC 9553's private context is the JSContact spelling of vCard
+	// "home"), TYPE=cell→feature "mobile". The contacts helpers map the labels
+	// back to the vCard/Graph spelling, so EmailType/PhoneType report "work",
+	// "home", and "cell" respectively — the private↔home translation is internal.
+	type tl struct{ addr, typ string }
+	wantEmails := []tl{
+		{"alice@example.com", "work"},
+		{"alice@home.example", "home"},
 	}
-	if len(c.Emails) != len(wantEmails) {
-		t.Fatalf("got %d emails, want %d", len(c.Emails), len(wantEmails))
+	emails := c.EmailList()
+	if len(emails) != len(wantEmails) {
+		t.Fatalf("got %d emails, want %d", len(emails), len(wantEmails))
 	}
 	for i, want := range wantEmails {
-		if c.Emails[i] != want {
-			t.Errorf("Emails[%d] = %+v, want %+v", i, c.Emails[i], want)
+		if emails[i].Address != want.addr || contacts.EmailType(emails[i]) != want.typ {
+			t.Errorf("Emails[%d] = {%q, %q}, want %+v", i, emails[i].Address, contacts.EmailType(emails[i]), want)
 		}
 	}
 
-	wantPhones := []contacts.Phone{
-		{Number: "+1-555-0100", Type: "cell"},
-		{Number: "+1-555-0199", Type: "work"},
+	wantPhones := []tl{
+		{"+1-555-0100", "cell"},
+		{"+1-555-0199", "work"},
 	}
-	if len(c.Phones) != len(wantPhones) {
-		t.Fatalf("got %d phones, want %d", len(c.Phones), len(wantPhones))
+	phones := c.PhoneList()
+	if len(phones) != len(wantPhones) {
+		t.Fatalf("got %d phones, want %d", len(phones), len(wantPhones))
 	}
 	for i, want := range wantPhones {
-		if c.Phones[i] != want {
-			t.Errorf("Phones[%d] = %+v, want %+v", i, c.Phones[i], want)
+		if phones[i].Number != want.addr || contacts.PhoneType(phones[i]) != want.typ {
+			t.Errorf("Phones[%d] = {%q, %q}, want %+v", i, phones[i].Number, contacts.PhoneType(phones[i]), want)
 		}
 	}
 }
@@ -96,23 +117,23 @@ END:VCARD
 `
 
 func TestMapContactMinimal(t *testing.T) {
-	c := mapContact(decodeCard(t, minimalCard))
+	c := mapCard(t, minimalCard)
 
-	if c.DisplayName != "Just A Name" {
-		t.Errorf("DisplayName = %q, want %q", c.DisplayName, "Just A Name")
+	if c.DisplayName() != "Just A Name" {
+		t.Errorf("DisplayName = %q, want %q", c.DisplayName(), "Just A Name")
 	}
-	if c.GivenName != "" || c.Surname != "" {
-		t.Errorf("name components = %q/%q, want empty (no N property)", c.GivenName, c.Surname)
+	if c.GivenName() != "" || c.Surname() != "" {
+		t.Errorf("name components = %q/%q, want empty (no N property)", c.GivenName(), c.Surname())
 	}
-	if c.UID != "" || c.Organization != "" || c.Title != "" || c.Note != "" {
+	if c.UID != "" || c.Organization() != "" || c.Title() != "" || c.Note() != "" {
 		t.Errorf("expected empty optional fields, got UID=%q Org=%q Title=%q Note=%q",
-			c.UID, c.Organization, c.Title, c.Note)
+			c.UID, c.Organization(), c.Title(), c.Note())
 	}
-	if len(c.Emails) != 0 {
-		t.Errorf("Emails = %+v, want none", c.Emails)
+	if len(c.EmailList()) != 0 {
+		t.Errorf("Emails = %+v, want none", c.EmailList())
 	}
-	if len(c.Phones) != 0 {
-		t.Errorf("Phones = %+v, want none", c.Phones)
+	if len(c.PhoneList()) != 0 {
+		t.Errorf("Phones = %+v, want none", c.PhoneList())
 	}
 }
 
@@ -126,29 +147,30 @@ END:VCARD
 `
 
 func TestMapContactUntypedEmailAndPhone(t *testing.T) {
-	c := mapContact(decodeCard(t, untypedCard))
+	c := mapCard(t, untypedCard)
 
-	if len(c.Emails) != 1 || c.Emails[0] != (contacts.EmailAddress{Address: "plain@example.com"}) {
-		t.Errorf("Emails = %+v, want one untyped address", c.Emails)
+	emails := c.EmailList()
+	if len(emails) != 1 || emails[0].Address != "plain@example.com" || contacts.EmailType(emails[0]) != "" {
+		t.Errorf("Emails = %+v, want one untyped address", emails)
 	}
-	if len(c.Phones) != 1 || c.Phones[0] != (contacts.Phone{Number: "+1-555-0000"}) {
-		t.Errorf("Phones = %+v, want one untyped number", c.Phones)
+	phones := c.PhoneList()
+	if len(phones) != 1 || phones[0].Number != "+1-555-0000" || contacts.PhoneType(phones[0]) != "" {
+		t.Errorf("Phones = %+v, want one untyped number", phones)
 	}
 }
 
-func TestOrgName(t *testing.T) {
-	tests := []struct {
-		in, want string
-	}{
-		{"Example Corp;Engineering;Backend", "Example Corp"},
-		{"Solo Org", "Solo Org"},
-		{"", ""},
-		{";unit-only", ""},
-	}
-	for _, tt := range tests {
-		if got := orgName(tt.in); got != tt.want {
-			t.Errorf("orgName(%q) = %q, want %q", tt.in, got, tt.want)
-		}
+// TestMapContactFirstOrgComponentOnly checks that a structured ORG value
+// (organization name plus organizational units, ";"-separated) projects to just
+// the organization name through the bridge's Organization mapping.
+func TestMapContactFirstOrgComponentOnly(t *testing.T) {
+	const card = `BEGIN:VCARD
+VERSION:4.0
+FN:Org Test
+ORG:Example Corp;Engineering;Backend
+END:VCARD
+`
+	if got := mapCard(t, card).Organization(); got != "Example Corp" {
+		t.Errorf("Organization = %q, want %q (first ORG component only)", got, "Example Corp")
 	}
 }
 
