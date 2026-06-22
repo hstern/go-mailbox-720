@@ -2,6 +2,7 @@ package caldav
 
 import (
 	"bytes"
+	"net/http"
 	"sort"
 	"strings"
 	"testing"
@@ -12,6 +13,35 @@ import (
 
 	"github.com/hstern/go-mailbox-720/internal/calendar"
 )
+
+// recordingHTTPClient is a webdav.HTTPClient that records the Authorization
+// header of the last request and returns an empty 207 Multi-Status.
+type recordingHTTPClient struct{ auth string }
+
+func (r *recordingHTTPClient) Do(req *http.Request) (*http.Response, error) {
+	r.auth = req.Header.Get("Authorization")
+	return &http.Response{StatusCode: http.StatusMultiStatus, Body: http.NoBody, Header: make(http.Header)}, nil
+}
+
+// Dial with Options.BearerToken authenticates with Authorization: Bearer, not
+// Basic — the per-identity path (MB720-44).
+func TestDialBearerAuth(t *testing.T) {
+	rec := &recordingHTTPClient{}
+	cl, err := Dial("http://dav.example/", "ignored-user", "ignored-pass",
+		&Options{HTTPClient: rec, BearerToken: "tok-9"})
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	// Issue a request through the adapter's wrapped client (cl.http carries the
+	// auth wrapper Dial installed).
+	req, _ := http.NewRequest("PROPFIND", "http://dav.example/", nil)
+	if _, err := cl.http.Do(req); err != nil {
+		t.Fatalf("Do: %v", err)
+	}
+	if rec.auth != "Bearer tok-9" {
+		t.Errorf("Authorization = %q, want %q (Bearer, not Basic)", rec.auth, "Bearer tok-9")
+	}
+}
 
 // decodeCalendar parses a VCALENDAR fixture. iCalendar requires CRLF line
 // endings, so the fixtures are written with \n and normalized here.
