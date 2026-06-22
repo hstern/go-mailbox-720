@@ -6,11 +6,12 @@ import (
 	"encoding/hex"
 	"fmt"
 	"path"
-	"strconv"
 	"strings"
 	"time"
 
 	"github.com/emersion/go-ical"
+	"github.com/hstern/go-jscalendar"
+	jsical "github.com/hstern/go-jscalendar/ical"
 
 	"github.com/hstern/go-mailbox-720/internal/calendar"
 )
@@ -104,7 +105,8 @@ var _ calendar.InstanceWriter = (*Client)(nil)
 // object resource that holds the whole series (master + overrides share one UID),
 // since CalDAV addresses a series by that one resource rather than per instance.
 func (cl *Client) WriteInstanceOverride(ctx context.Context, masterID string, override calendar.Event) (calendar.Event, error) {
-	if override.RecurrenceID.IsZero() {
+	rid := recurrenceIDTime(override)
+	if rid.IsZero() {
 		return calendar.Event{}, fmt.Errorf("caldav: WriteInstanceOverride requires a RecurrenceID")
 	}
 	// Decode the series-master (or instance) id to the object path; both forms
@@ -128,7 +130,6 @@ func (cl *Client) WriteInstanceOverride(ctx context.Context, masterID string, ov
 	overrideEvent := overrideVEVENT(override)
 
 	// Replace any existing override for this RECURRENCE-ID; otherwise append.
-	rid := override.RecurrenceID.UTC()
 	children := cal.Children[:0]
 	for _, child := range cal.Children {
 		if child.Name == ical.CompEvent {
@@ -169,101 +170,145 @@ func seriesUID(cal *ical.Calendar) string {
 // VEVENT, since eventToICal already emits the RECURRENCE-ID for an event with a
 // non-zero RecurrenceID.
 func overrideVEVENT(e calendar.Event) *ical.Event {
-	e.Recurrence = nil // an override is one occurrence, never a nested series
+	e.RecurrenceRules = nil // an override is one occurrence, never a nested series
 	cal := eventToICal(e)
 	events := cal.Events()
 	return &events[0]
 }
 
 // eventToICal builds a VCALENDAR holding a single VEVENT from a neutral Event,
-// the inverse of mapEvent. It is the write-path counterpart used by CreateEvent
-// and UpdateEvent: a calendar object resource stored in a collection carries no
-// METHOD property (that is reserved for iTIP scheduling objects), and go-ical's
-// encoder emits the RFC 5545-required CRLF line endings.
+// the inverse of mapEvent. It routes the embedded jscalendar.Event through the
+// go-jscalendar/ical bridge — the single iCal↔JSCalendar mapping — and then layers
+// on the three CalDAV-relevant bits the bridge does not carry: each attendee's
+// PARTSTAT, the override RECURRENCE-ID, and the master's EXDATE exceptions. A
+// calendar object resource stored in a collection carries no METHOD property (that
+// is reserved for iTIP scheduling objects), and go-ical's encoder emits the
+// RFC 5545-required CRLF line endings.
 func eventToICal(e calendar.Event) *ical.Calendar {
-	cal := ical.NewCalendar()
-	cal.Props.SetText(ical.PropVersion, "2.0")
+	// Sanitize participant display names before the bridge writes them as CN
+	// parameters: go-ical (and the bridge) do not escape parameter values, so an
+	// unescaped CR/LF in a name could inject forged property lines.
+	src := sanitizeParticipantNames(e.Event)
+
+	cal, err := jsical.ToICal(&src)
+	if err != nil || len(cal.Events()) == 0 {
+		// Degrade to a minimal valid object rather than panic on a malformed event;
+		// callers PUT the result, and an empty VEVENT is still a valid resource.
+		cal = ical.NewCalendar()
+		cal.Props.SetText(ical.PropVersion, "2.0")
+		ev := ical.NewEvent()
+		ev.Props.SetText(ical.PropUID, e.UID)
+		ev.Props.SetDateTime(ical.PropDateTimeStamp, time.Now().UTC())
+		cal.Children = append(cal.Children, ev.Component)
+	}
+	// Stamp the adapter's own PRODID over the bridge's, preserving the prior
+	// identity of objects this adapter writes.
 	cal.Props.SetText(ical.PropProductID, productID)
 
-	ev := ical.NewEvent()
-	ev.Props.SetText(ical.PropUID, e.UID)
-	ev.Props.SetDateTime(ical.PropDateTimeStamp, time.Now().UTC())
-	if e.Sequence > 0 {
-		// A bare integer property — SetText would tag it VALUE=TEXT, contradicting
-		// SEQUENCE's INTEGER type and tripping up strict CalDAV clients.
-		seq := ical.NewProp(ical.PropSequence)
-		seq.Value = strconv.Itoa(e.Sequence)
-		ev.Props.Set(seq)
-	}
-	if !e.Start.IsZero() {
-		ev.Props.SetDateTime(ical.PropDateTimeStart, e.Start.UTC())
-	}
-	if !e.End.IsZero() {
-		ev.Props.SetDateTime(ical.PropDateTimeEnd, e.End.UTC())
-	}
-	if e.Subject != "" {
-		ev.Props.SetText(ical.PropSummary, e.Subject)
-	}
-	if e.Location != "" {
-		ev.Props.SetText(ical.PropLocation, e.Location)
-	}
-	if e.Body.Content != "" {
-		ev.Props.SetText(ical.PropDescription, e.Body.Content)
-	}
-	// A series master carries its recurrence rule (RRULE) and EXDATE exceptions.
-	if e.Recurrence != nil && strings.TrimSpace(e.Recurrence.RRULE) != "" {
-		rrule := ical.NewProp(ical.PropRecurrenceRule)
-		rrule.SetValueType(ical.ValueRecurrence)
-		rrule.Value = strings.TrimSpace(e.Recurrence.RRULE)
-		ev.Props.Set(rrule)
-		for _, ex := range e.Recurrence.ExceptionDates {
-			exdate := ical.NewProp(ical.PropExceptionDates)
-			exdate.SetDateTime(ex.UTC())
-			ev.Props.Add(exdate)
-		}
-	}
-	// An override (exception) instance carries a RECURRENCE-ID naming the
-	// occurrence it replaces.
-	if !e.RecurrenceID.IsZero() {
-		rid := ical.NewProp(ical.PropRecurrenceID)
-		rid.SetDateTime(e.RecurrenceID.UTC())
-		ev.Props.Set(rid)
-	}
-	if org := buildAddress(ical.PropOrganizer, e.Organizer); org != nil {
-		ev.Props.Set(org)
-	}
-	for _, a := range e.Attendees {
-		att := buildAddress(ical.PropAttendee, calendar.Address{Name: a.Name, Email: a.Email})
-		if att == nil {
-			continue
-		}
-		if ps := statusToPartStat[a.Status]; ps != "" {
-			att.Params.Set(ical.ParamParticipationStatus, ps)
-		}
-		if a.ScheduleStatus != "" {
-			att.Params.Set(paramScheduleStatus, a.ScheduleStatus)
-		}
-		ev.Props.Add(att)
+	events := cal.Events()
+	ev := &events[0]
+
+	// PARTSTAT: the bridge writes ORGANIZER/ATTENDEE but drops participationStatus.
+	// Re-apply each attendee's PARTSTAT by matching the CAL-ADDRESS.
+	applyPartStat(ev, e)
+
+	// EXDATE: the bridge does not emit per-date recurrence exceptions, so a master's
+	// EXDATEs are derived from the recurrence-override map entries marked excluded.
+	for _, ex := range excludedDates(e) {
+		exdate := ical.NewProp(ical.PropExceptionDates)
+		exdate.SetDateTime(ex.UTC())
+		ev.Props.Add(exdate)
 	}
 
-	cal.Children = append(cal.Children, ev.Component)
+	// RECURRENCE-ID: the bridge does not emit the override pointer, so an override
+	// instance (non-nil envelope RecurrenceID) carries it explicitly.
+	if rid := recurrenceIDTime(e); !rid.IsZero() {
+		ridProp := ical.NewProp(ical.PropRecurrenceID)
+		ridProp.SetDateTime(rid.UTC())
+		ev.Props.Set(ridProp)
+	}
+
 	return cal
 }
 
-// buildAddress constructs a CAL-ADDRESS property (ORGANIZER or ATTENDEE) from a
-// neutral Address, encoding the email as a "mailto:" URI and the name as a CN
-// parameter. It is the inverse of calAddress. Returns nil when the address has
-// no email.
-func buildAddress(name string, addr calendar.Address) *ical.Prop {
-	if addr.Email == "" {
-		return nil
+// sanitizeParticipantNames returns a shallow copy of the event whose participants'
+// display names are stripped of characters unsafe in an iCalendar parameter value
+// (the bridge does not escape CN parameters).
+func sanitizeParticipantNames(e jscalendar.Event) jscalendar.Event {
+	if len(e.Participants) == 0 {
+		return e
 	}
-	prop := ical.NewProp(name)
-	prop.Value = "mailto:" + addr.Email
-	if addr.Name != "" {
-		prop.Params.Set(ical.ParamCommonName, sanitizeParam(addr.Name))
+	parts := make(map[jscalendar.Id]jscalendar.Participant, len(e.Participants))
+	for id, p := range e.Participants {
+		p.Name = sanitizeParam(p.Name)
+		parts[id] = p
 	}
-	return prop
+	e.Participants = parts
+	return e
+}
+
+// applyPartStat sets the PARTSTAT and RFC 6638 SCHEDULE-STATUS parameters on each
+// ATTENDEE property the bridge emitted, looking up the matching attendee
+// participant by scheduling address. SCHEDULE-STATUS carries the client-side
+// scheduling delivery outcome the server records onto the participant.
+func applyPartStat(ev *ical.Event, e calendar.Event) {
+	type attendeeAttrs struct{ partStat, schedStatus string }
+	byAddr := make(map[string]attendeeAttrs)
+	for _, p := range e.Attendees() {
+		a := attendeeAttrs{partStat: jsCalToPartStat[p.ParticipationStatus]}
+		if len(p.ScheduleStatus) > 0 {
+			a.schedStatus = p.ScheduleStatus[0]
+		}
+		if a.partStat == "" && a.schedStatus == "" {
+			continue
+		}
+		addr := p.SendTo["imip"]
+		if addr == "" && p.Email != "" {
+			addr = "mailto:" + p.Email
+		}
+		byAddr[normalizeCalAddress(addr)] = a
+	}
+	if len(byAddr) == 0 {
+		return
+	}
+	for i := range ev.Props[ical.PropAttendee] {
+		att := &ev.Props[ical.PropAttendee][i]
+		a, ok := byAddr[normalizeCalAddress(att.Value)]
+		if !ok {
+			continue
+		}
+		if a.partStat != "" {
+			att.Params.Set(ical.ParamParticipationStatus, a.partStat)
+		}
+		if a.schedStatus != "" {
+			att.Params.Set(paramScheduleStatus, a.schedStatus)
+		}
+	}
+}
+
+// excludedDates returns the LocalDateTime keys of the event's recurrence-override
+// entries that are whole-occurrence exclusions (RFC 8984 §4.3.5 "excluded":true) —
+// the JSCalendar equivalent of EXDATE — as UTC instants. Returns nil when the
+// event carries no overrides.
+func excludedDates(e calendar.Event) []time.Time {
+	var out []time.Time
+	for key, patch := range e.RecurrenceOverrides {
+		raw, ok := patch["excluded"]
+		if !ok || strings.TrimSpace(string(raw)) != "true" {
+			continue
+		}
+		if ldt, err := jscalendar.ParseLocalDateTime(key); err == nil {
+			loc := time.UTC
+			if e.TimeZone != "" {
+				if l, lerr := time.LoadLocation(string(e.TimeZone)); lerr == nil {
+					loc = l
+				}
+			}
+			out = append(out, time.Date(ldt.Year, time.Month(ldt.Month), ldt.Day,
+				ldt.Hour, ldt.Minute, ldt.Second, 0, loc).UTC())
+		}
+	}
+	return out
 }
 
 // eventObjectName returns the ".ics" object filename for a UID, rejecting a

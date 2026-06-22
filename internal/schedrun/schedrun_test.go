@@ -106,8 +106,8 @@ func TestRunCreatesTentativeEventForRequestOnly(t *testing.T) {
 
 	select {
 	case e := <-created:
-		if e.Subject != "Sync" {
-			t.Errorf("subject = %q, want Sync", e.Subject)
+		if e.Title != "Sync" {
+			t.Errorf("title = %q, want Sync", e.Title)
 		}
 		if e.Status != itip.StatusTentative {
 			t.Errorf("status = %q, want %q", e.Status, itip.StatusTentative)

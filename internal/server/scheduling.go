@@ -155,16 +155,18 @@ func serverSchedulesEvents(ctx context.Context, b calendar.Backend) (bool, error
 // setAttendeeStatus sets the participation status of the attendee whose email
 // matches (case-insensitively), reporting whether one was found.
 func setAttendeeStatus(event *calendar.Event, email, status string) bool {
-	for i := range event.Attendees {
-		if strings.EqualFold(event.Attendees[i].Email, email) {
-			event.Attendees[i].Status = status
-			return true
+	found := false
+	eachAttendee(event, func(a *jscalParticipant) {
+		if strings.EqualFold(calendar.ParticipantEmail(*a), email) {
+			a.ParticipationStatus = status
+			found = true
 		}
-	}
-	return false
+	})
+	return found
 }
 
-// partStatToNeutral maps a scheduling PARTSTAT to the neutral attendee status.
+// partStatToNeutral maps a scheduling PARTSTAT to the JSCalendar
+// participationStatus stored on the event's participant.
 func partStatToNeutral(p scheduling.PartStat) string {
 	switch p {
 	case scheduling.PartStatAccepted:
@@ -172,8 +174,8 @@ func partStatToNeutral(p scheduling.PartStat) string {
 	case scheduling.PartStatDeclined:
 		return "declined"
 	case scheduling.PartStatTentative:
-		return "tentativelyAccepted"
+		return "tentative"
 	default:
-		return "notResponded"
+		return "needs-action"
 	}
 }

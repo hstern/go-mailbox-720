@@ -655,7 +655,7 @@ func startScheduler(ctx context.Context, provider server.MailProvider, calProvid
 				log.Println("scheduling:", err)
 				return
 			}
-			log.Printf("scheduling: tentative event created for %q", e.Subject)
+			log.Printf("scheduling: tentative event created for %q", e.Title)
 		}
 		if err := schedrun.Run(ctx, watcher, syncer, rawer, writer, calendarID, report); err != nil {
 			log.Println("scheduling: trigger stopped:", err)

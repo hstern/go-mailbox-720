@@ -12,6 +12,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/hstern/go-jscalendar"
+
 	"github.com/hstern/go-mailbox-720/internal/calendar"
 	"github.com/hstern/go-mailbox-720/internal/server"
 	"github.com/hstern/go-mailbox-720/internal/smtp"
@@ -74,13 +76,12 @@ func TestStalwartNativeSchedulingGating(t *testing.T) {
 	calID := cals[0].ID
 
 	start := time.Date(2026, 9, 1, 10, 0, 0, 0, time.UTC)
-	created, err := cl.CreateEvent(ctx, calID, calendar.Event{
-		Subject:   "Planning",
-		Start:     start,
-		End:       start.Add(time.Hour),
-		Organizer: calendar.Address{Name: "Alice", Email: "alice@example.com"},
-		Attendees: []calendar.Attendee{{Email: login, Status: "notResponded"}},
-	})
+	ev := calendar.Event{Event: jscalendar.Event{Title: "Planning"}}
+	ev.SetUTCTimes(start, start.Add(time.Hour))
+	org := calendar.NewParticipant("Alice", "alice@example.com", "", "owner")
+	att := calendar.NewParticipant("", login, "needs-action", "attendee")
+	ev.SetOrganizerAttendees(&org, []jscalendar.Participant{att})
+	created, err := cl.CreateEvent(ctx, calID, ev)
 	if err != nil {
 		t.Fatalf("CreateEvent: %v", err)
 	}
@@ -115,12 +116,12 @@ func TestStalwartNativeSchedulingGating(t *testing.T) {
 		t.Fatalf("GetEvent after accept: %v", err)
 	}
 	var status string
-	for _, a := range got.Attendees {
-		if a.Email == login {
-			status = a.Status
+	for _, a := range got.Attendees() {
+		if calendar.ParticipantEmail(a) == login {
+			status = a.ParticipationStatus
 		}
 	}
 	if status != "accepted" {
-		t.Errorf("attendee status after accept = %q, want accepted (attendees: %+v)", status, got.Attendees)
+		t.Errorf("attendee status after accept = %q, want accepted (attendees: %+v)", status, got.Attendees())
 	}
 }

@@ -115,8 +115,8 @@ func TestListEvents(t *testing.T) {
 	if events[0].ID != "e1" {
 		t.Errorf("ID = %q, want e1", events[0].ID)
 	}
-	if events[0].Subject != "M" {
-		t.Errorf("Subject = %q, want M", events[0].Subject)
+	if events[0].Title != "M" {
+		t.Errorf("Title = %q, want M", events[0].Title)
 	}
 
 	// Assert the query carried the calendarID filter and time bounds.
@@ -183,8 +183,8 @@ func TestGetEvent(t *testing.T) {
 	if event.ID != "e1" {
 		t.Errorf("ID = %q, want e1", event.ID)
 	}
-	if event.Subject != "Event One" {
-		t.Errorf("Subject = %q, want Event One", event.Subject)
+	if event.Title != "Event One" {
+		t.Errorf("Title = %q, want Event One", event.Title)
 	}
 }
 
@@ -250,8 +250,8 @@ func TestFindEventByUIDFound(t *testing.T) {
 	if event.ID != "e1" {
 		t.Errorf("ID = %q, want e1", event.ID)
 	}
-	if event.Subject != "Event by UID" {
-		t.Errorf("Subject = %q, want Event by UID", event.Subject)
+	if event.Title != "Event by UID" {
+		t.Errorf("Title = %q, want Event by UID", event.Title)
 	}
 
 	// Assert the query carried the uid and calendarID filter.

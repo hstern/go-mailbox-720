@@ -14,41 +14,9 @@ import (
 	"context"
 	"errors"
 	"time"
+
+	"github.com/hstern/go-jscalendar"
 )
-
-// Address is a parsed calendar-user address (display name + email). It mirrors
-// mail.Address; CalDAV carries these as CAL-ADDRESS values (a "mailto:" URI plus
-// an optional CN parameter for the display name).
-type Address struct {
-	Name  string
-	Email string
-}
-
-// Attendee is an event participant: a calendar-user address plus their
-// participation status. Status is backend-neutral, mirroring Graph's
-// responseStatus.response (which the CalDAV adapter maps to/from the iCalendar
-// PARTSTAT): one of "" (unset), "accepted", "declined", "tentativelyAccepted",
-// or "notResponded".
-type Attendee struct {
-	Name   string
-	Email  string
-	Status string
-	// ScheduleStatus is the RFC 6638 SCHEDULE-STATUS for this attendee: an iTIP
-	// REQUEST-STATUS code (e.g. "1.1" sent, "5.1" undeliverable) recording the
-	// delivery outcome of the last scheduling message the server sent them. Empty
-	// when no scheduling message has been sent (or a native server tracks it
-	// out-of-band). The CalDAV adapter carries it as the ATTENDEE SCHEDULE-STATUS
-	// parameter; Graph has no equivalent field, so it does not surface in /me/events.
-	ScheduleStatus string
-}
-
-// Body is an event description in a single representation. Calendars almost
-// always carry plain text (the iCalendar DESCRIPTION property), so ContentType
-// is "text" in the common case.
-type Body struct {
-	ContentType string // "text" or "html"
-	Content     string
-}
 
 // Calendar is a calendar collection in Graph/JMAP object shape.
 type Calendar struct {
@@ -57,72 +25,107 @@ type Calendar struct {
 	Description string
 }
 
-// Event is a calendar event in Graph/JMAP object shape. List operations populate
-// the cheap envelope-level fields; richer fields (Body, Attendees) are also
-// available because CalDAV returns whole VEVENTs rather than a cheap envelope.
+// Event is a calendar event in the standardized JSCalendar (RFC 8984) object
+// shape. It embeds [jscalendar.Event] — the neutral pivot model the whole
+// calendar subsystem speaks — and adds the opaque, backend-derived routing IDs
+// that are ours, not JSCalendar's: the store/Graph IDs a client round-trips and
+// the series linkage. The CalDAV adapter maps iCal↔[jscalendar.Event] via the
+// go-jscalendar/ical bridge; the JMAP adapter carries it natively; the server
+// maps it to/from the Microsoft Graph event DTO.
+//
+// The embedded fields carry the event content: UID, Title, Start (+TimeZone,
+// Duration), Status, Sequence, Created, Description, Participants, Locations,
+// RecurrenceRules, RecurrenceOverrides, RecurrenceID, and the rest of RFC 8984.
+// Recurrence and time zones are modelled structurally and losslessly here,
+// unlike the bespoke RRULE-string pivot this type replaced (MB720-49/26).
 type Event struct {
-	ID         string
+	// ID is the opaque, stable store/Graph identifier (derived from the backend
+	// resource, e.g. a CalDAV href). Distinct from the embedded JSCalendar UID.
+	ID string
+	// CalendarID is the opaque ID of the calendar collection the event lives in.
 	CalendarID string
-	UID        string // the iCalendar UID, stable across the event's lifetime
-	Subject    string
-	Start      time.Time
-	End        time.Time
-	IsAllDay   bool
-	Location   string
-	Organizer  Address
-	Attendees  []Attendee
-	Body       Body
-	Status     string // mapped from the iCalendar STATUS (e.g. "confirmed")
-	// Sequence is the iCalendar SEQUENCE (RFC 5545 §3.8.7.4): the event's revision
-	// number, bumped by the organizer on each significant change so iTIP recipients
-	// can tell a re-sent REQUEST/CANCEL supersedes an earlier one. 0 for a new event.
-	Sequence  int
-	CreatedAt time.Time
-
-	// Recurrence describes the repeat rule of a recurring series, carried on the
-	// series master VEVENT (the iCalendar RRULE plus its EXDATE exceptions). Nil on
-	// a non-recurring event and on an individual occurrence/override; the master
-	// owns the pattern. It maps to Graph's event.recurrence (patternedRecurrence).
-	Recurrence *RecurrencePattern
-
-	// RecurrenceID marks an event that addresses a single instance of a recurring
-	// series rather than the whole series: it is the original start instant of the
-	// occurrence the event stands for (the iCalendar RECURRENCE-ID). Zero on a
-	// non-recurring event and on the series master. An occurrence surfaced by
-	// expansion and an override (exception) VEVENT both carry it; IsOverride
-	// distinguishes them.
-	RecurrenceID time.Time
-
-	// IsOverride reports whether this instance is an exception VEVENT explicitly
-	// stored by the organizer (an override of the pattern, e.g. a moved or
-	// retitled occurrence) rather than a plain occurrence synthesized from the
-	// master's RRULE. It is meaningful only when RecurrenceID is non-zero. Maps to
-	// Graph's event.type ("exception" vs "occurrence").
+	// SeriesMasterID is the opaque ID of the series master for an instance
+	// (occurrence or override). Empty on the master itself and on non-recurring
+	// events. It backs Graph's event.seriesMasterId.
+	SeriesMasterID string
+	// IsOverride reports whether this instance is an exception explicitly stored
+	// by the organizer (a moved or retitled occurrence) rather than a plain
+	// occurrence synthesized from the master's rules. Meaningful only when the
+	// embedded RecurrenceID is set. Maps to Graph's event.type ("exception" vs
+	// "occurrence").
 	IsOverride bool
 
-	// SeriesMasterID is the opaque ID of the series master event for an instance
-	// (occurrence or override). Empty on the master itself and on non-recurring
-	// events. It backs Graph's event.seriesMasterId so a client can navigate from
-	// an instance back to the series.
-	SeriesMasterID string
+	jscalendar.Event
 }
 
-// RecurrencePattern is the backend-neutral recurrence rule of a series: the
-// iCalendar RRULE together with its EXDATE exception instants. It is modelled
-// around the iCalendar RRULE rather than Graph's split pattern/range so the
-// CalDAV adapter can round-trip it losslessly; the Graph layer derives the
-// patternedRecurrence shape (recurrencePattern + recurrenceRange) from it.
-type RecurrencePattern struct {
-	// RRULE is the iCalendar recurrence rule value (RFC 5545 §3.3.10), e.g.
-	// "FREQ=WEEKLY;BYDAY=MO,WE;COUNT=10" — the RRULE property value with the
-	// "RRULE:" name stripped. It is the canonical form; the adapter writes it back
-	// verbatim and the Graph layer parses it for patternedRecurrence.
-	RRULE string
+// StartTime resolves the embedded JSCalendar Start + TimeZone to a UTC instant,
+// the form the server's range filtering and recurrence expansion compare
+// against. A floating Start (no TimeZone) is interpreted as UTC wall-clock. The
+// zero time is returned when Start is unset.
+func (e Event) StartTime() time.Time {
+	return localToUTC(e.Start, e.TimeZone)
+}
 
-	// ExceptionDates are the EXDATE instants (RFC 5545 §3.8.5.1): occurrences the
-	// rule would generate but that have been removed from the series. Carried in
-	// UTC.
-	ExceptionDates []time.Time
+// EndTime resolves the event's end instant from Start plus the embedded
+// JSCalendar Duration (default zero-length). The Duration is applied to the
+// wall-clock start in the event's own time zone so that nominal calendar units
+// (days, weeks) stay wall-clock-anchored across DST transitions, per iCalendar
+// DURATION semantics; the result is returned as a UTC instant. Zero when Start
+// is unset.
+func (e Event) EndTime() time.Time {
+	local := localTime(e.Start, e.TimeZone)
+	if local.IsZero() {
+		return time.Time{}
+	}
+	return addDuration(local, e.Duration).UTC()
+}
+
+// localTime renders a JSCalendar LocalDateTime as a time.Time in its own time
+// zone (UTC fallback for floating or unrecognized zones), without converting to
+// UTC — the form to add nominal durations against. Zero when ldt is nil.
+func localTime(ldt *jscalendar.LocalDateTime, tz jscalendar.TimeZoneId) time.Time {
+	if ldt == nil {
+		return time.Time{}
+	}
+	loc := time.UTC
+	if tz != "" {
+		if l, err := time.LoadLocation(string(tz)); err == nil {
+			loc = l
+		}
+	}
+	return time.Date(ldt.Year, time.Month(ldt.Month), ldt.Day,
+		ldt.Hour, ldt.Minute, ldt.Second, 0, loc)
+}
+
+// localToUTC converts a JSCalendar LocalDateTime in the given time zone to a UTC
+// instant. When tz is empty the time is treated as floating (UTC wall-clock).
+func localToUTC(ldt *jscalendar.LocalDateTime, tz jscalendar.TimeZoneId) time.Time {
+	return localTime(ldt, tz).UTC()
+}
+
+// addDuration adds a JSCalendar Duration to a time.Time, matching iCalendar
+// DURATION semantics: nominal calendar units (years, months, weeks, days) via
+// AddDate — which preserves wall-clock time across DST when t carries a
+// DST-observing location — and exact sub-day units via Add. Each uint64 sub-day
+// component is clamped to guard against an adversarial wire value overflowing
+// time.Duration (int64 ns).
+func addDuration(t time.Time, d *jscalendar.Duration) time.Time {
+	if d == nil {
+		return t
+	}
+	const maxSubDayUnit = uint64(1<<31 - 1)
+	clamp := func(v uint64) time.Duration {
+		if v > maxSubDayUnit {
+			v = maxSubDayUnit
+		}
+		return time.Duration(v)
+	}
+	t = t.AddDate(int(d.Years), int(d.Months), int(d.Days+d.Weeks*7))
+	t = t.Add(clamp(d.Hours)*time.Hour +
+		clamp(d.Minutes)*time.Minute +
+		clamp(d.Seconds)*time.Second +
+		time.Duration(d.Nanos))
+	return t
 }
 
 // Range bounds an event listing by start/end instant. A zero Start or End means

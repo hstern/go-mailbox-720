@@ -6,6 +6,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/hstern/go-jscalendar"
+
 	"github.com/hstern/go-mailbox-720/internal/calendar"
 	"github.com/hstern/go-mailbox-720/internal/graph/api"
 	"github.com/hstern/go-mailbox-720/internal/scheduling"
@@ -52,14 +54,36 @@ func newWritableCalendarBackend() *writableCalendarBackend {
 // seededEvent is the current event the writable backend's GetEvent returns, used
 // by the PATCH (read-modify-write) tests. Its fields stand in for an existing
 // stored record so a partial patch can be checked for leaving them intact.
-var seededEvent = calendar.Event{
-	ID:        "evt-1",
-	UID:       "uid-1",
-	Subject:   "Old Subject",
-	Location:  "Old Room",
-	Start:     time.Date(2026, 6, 20, 9, 0, 0, 0, time.UTC),
-	End:       time.Date(2026, 6, 20, 10, 0, 0, 0, time.UTC),
-	Attendees: []calendar.Attendee{{Name: "Bob", Email: "bob@example.com"}},
+var seededEvent = makeSeededEvent()
+
+// seededStart/seededEnd are the seeded event's UTC instants, used by the PATCH
+// tests that assert an untouched time round-trips unchanged.
+var (
+	seededStart = time.Date(2026, 6, 20, 9, 0, 0, 0, time.UTC)
+	seededEnd   = time.Date(2026, 6, 20, 10, 0, 0, 0, time.UTC)
+)
+
+func makeSeededEvent() calendar.Event {
+	e := calendar.Event{ID: "evt-1"}
+	e.UID = "uid-1"
+	e.Title = "Old Subject"
+	e.SetUTCTimes(seededStart, seededEnd)
+	setEventLocation(&e, "Old Room")
+	e.SetOrganizerAttendees(nil, []jscalendar.Participant{
+		calendar.NewParticipant("Bob", "bob@example.com", "", "attendee"),
+	})
+	return e
+}
+
+// attendeeByEmail returns the attendee participant with the given email and whether
+// one was found — the test-side accessor for the map-keyed roster.
+func attendeeByEmail(e calendar.Event, email string) (jscalendar.Participant, bool) {
+	for _, a := range e.Attendees() {
+		if calendar.ParticipantEmail(a) == email {
+			return a, true
+		}
+	}
+	return jscalendar.Participant{}, false
 }
 
 // newWritableCalendarBackendSeeded returns a writable backend whose GetEvent
@@ -104,19 +128,19 @@ func TestMeCreateEventsMapsBodyAndCallsWriter(t *testing.T) {
 	if backend.createdCalID != "cal-primary" {
 		t.Errorf("create calendar id = %q, want cal-primary", backend.createdCalID)
 	}
-	if got := backend.createdEvent.Subject; got != "Planning" {
+	if got := backend.createdEvent.Title; got != "Planning" {
 		t.Errorf("mapped subject = %q, want Planning", got)
 	}
-	if got := backend.createdEvent.Location; got != "Room 7" {
+	if got := eventLocation(backend.createdEvent); got != "Room 7" {
 		t.Errorf("mapped location = %q, want Room 7", got)
 	}
-	if got := len(backend.createdEvent.Attendees); got != 1 {
+	if got := len(backend.createdEvent.Attendees()); got != 1 {
 		t.Fatalf("attendee count = %d, want 1", got)
 	}
-	if got := backend.createdEvent.Attendees[0].Email; got != "bob@example.com" {
-		t.Errorf("attendee email = %q, want bob@example.com", got)
+	if _, ok := attendeeByEmail(backend.createdEvent, "bob@example.com"); !ok {
+		t.Errorf("attendee bob@example.com not mapped, attendees = %+v", backend.createdEvent.Attendees())
 	}
-	if backend.createdEvent.Start.IsZero() {
+	if backend.createdEvent.StartTime().IsZero() {
 		t.Error("mapped start is zero, want parsed instant")
 	}
 	if got := ok.Response.ID.Or(""); got != "evt-new" {
@@ -227,7 +251,7 @@ func TestMeCreateEventsResolvesWindowsZone(t *testing.T) {
 		t.Fatal("CreateEvent was not called (zone should resolve)")
 	}
 	want := time.Date(2026, 6, 20, 16, 0, 0, 0, time.UTC)
-	if got := backend.createdEvent.Start; !got.Equal(want) {
+	if got := backend.createdEvent.StartTime(); !got.Equal(want) {
 		t.Errorf("mapped start = %v, want %v (09:00 Pacific = 16:00 UTC in June/PDT)", got, want)
 	}
 }
@@ -249,7 +273,7 @@ func TestMeCreateEventsHonorsRFC3339Offset(t *testing.T) {
 		t.Fatalf("MeCreateEvents: %v", err)
 	}
 	want := time.Date(2026, 6, 20, 17, 0, 0, 0, time.UTC) // 09:00 -08:00 == 17:00Z
-	if got := backend.createdEvent.Start; !got.Equal(want) {
+	if got := backend.createdEvent.StartTime(); !got.Equal(want) {
 		t.Errorf("mapped start = %v, want %v", got, want)
 	}
 }
@@ -276,26 +300,65 @@ func TestMeUpdateEventsPartialMergeLeavesAbsentFields(t *testing.T) {
 	}
 
 	got := backend.updatedEvent
-	if got.Subject != "New Subject" {
-		t.Errorf("merged subject = %q, want New Subject", got.Subject)
+	if got.Title != "New Subject" {
+		t.Errorf("merged subject = %q, want New Subject", got.Title)
 	}
-	if got.Location != "Old Room" {
-		t.Errorf("merged location = %q, want Old Room (unchanged)", got.Location)
+	if loc := eventLocation(got); loc != "Old Room" {
+		t.Errorf("merged location = %q, want Old Room (unchanged)", loc)
 	}
-	if !got.Start.Equal(seededEvent.Start) {
-		t.Errorf("merged start = %v, want %v (unchanged)", got.Start, seededEvent.Start)
+	if !got.StartTime().Equal(seededStart) {
+		t.Errorf("merged start = %v, want %v (unchanged)", got.StartTime(), seededStart)
 	}
-	if !got.End.Equal(seededEvent.End) {
-		t.Errorf("merged end = %v, want %v (unchanged)", got.End, seededEvent.End)
+	if !got.EndTime().Equal(seededEnd) {
+		t.Errorf("merged end = %v, want %v (unchanged)", got.EndTime(), seededEnd)
 	}
 	if got.ID != "evt-1" || got.UID != "uid-1" {
 		t.Errorf("merged identity = (%q,%q), want (evt-1,uid-1) preserved", got.ID, got.UID)
 	}
-	if n := len(got.Attendees); n != 1 || got.Attendees[0].Email != "bob@example.com" {
-		t.Errorf("merged attendees = %+v, want the original one (unchanged)", got.Attendees)
+	if n := len(got.Attendees()); n != 1 {
+		t.Errorf("merged attendees = %+v, want the original one (unchanged)", got.Attendees())
+	} else if _, ok := attendeeByEmail(got, "bob@example.com"); !ok {
+		t.Errorf("merged attendees = %+v, want bob@example.com (unchanged)", got.Attendees())
 	}
 	if !backend.closed {
 		t.Error("backend not closed")
+	}
+}
+
+// TestMeUpdateEventsPreservesNamedTimeZoneOnEndOnlyPatch is the MB720-49 fidelity
+// guard for PATCH: editing only the end time of an event stored in a real named
+// zone must not silently relabel it to UTC. The event start stays in its zone; the
+// duration extends.
+func TestMeUpdateEventsPreservesNamedTimeZoneOnEndOnlyPatch(t *testing.T) {
+	ev := calendar.Event{ID: "evt-1"}
+	ev.UID = "uid-1"
+	ev.Title = "Berlin sync"
+	ev.Start = &jscalendar.LocalDateTime{Year: 2026, Month: 6, Day: 20, Hour: 9}
+	ev.TimeZone = "Europe/Berlin"
+	ev.Duration = &jscalendar.Duration{Hours: 1}
+	backend := backendWithEvent(ev)
+	h := Handler{calendar: writableCalendarProvider{backend: backend}}
+
+	// Patch only the end to 11:00 Berlin time (the dateTime names the same zone).
+	req := &api.MicrosoftGraphEvent{
+		End: api.NewOptMicrosoftGraphDateTimeTimeZone(api.MicrosoftGraphDateTimeTimeZone{
+			DateTime: api.NewOptString("2026-06-20T11:00:00.0000000"),
+			TimeZone: api.NewOptNilString("Europe/Berlin"),
+		}),
+	}
+	if _, err := h.MeUpdateEvents(context.Background(), req, api.MeUpdateEventsParams{EventID: "evt-1"}); err != nil {
+		t.Fatalf("MeUpdateEvents: %v", err)
+	}
+	got := backend.updatedEvent
+	if got.TimeZone != "Europe/Berlin" {
+		t.Errorf("merged TimeZone = %q, want Europe/Berlin (preserved, not collapsed to UTC)", got.TimeZone)
+	}
+	if got.Start == nil || got.Start.Hour != 9 {
+		t.Errorf("merged Start = %+v, want 09:00 wall-clock in Europe/Berlin (unchanged)", got.Start)
+	}
+	// 09:00 -> 11:00 Berlin is a two-hour event.
+	if got.Duration == nil || got.Duration.Hours != 2 {
+		t.Errorf("merged Duration = %+v, want 2h", got.Duration)
 	}
 }
 
@@ -408,14 +471,14 @@ func TestMeCreateEventsEmailsInvitationOnDumbBackend(t *testing.T) {
 	if inv.Method != scheduling.MethodRequest {
 		t.Errorf("sent method = %q, want REQUEST", inv.Method)
 	}
-	if backend.updatedEvent.Organizer.Email != "me@example.com" {
-		t.Errorf("persisted organizer = %q, want me@example.com", backend.updatedEvent.Organizer.Email)
+	if org, ok := backend.updatedEvent.Organizer(); !ok || calendar.ParticipantEmail(org) != "me@example.com" {
+		t.Errorf("persisted organizer = %+v, want me@example.com", org)
 	}
-	if n := len(backend.updatedEvent.Attendees); n != 1 {
+	if n := len(backend.updatedEvent.Attendees()); n != 1 {
 		t.Fatalf("persisted attendees = %d, want 1", n)
 	}
-	if got := backend.updatedEvent.Attendees[0].ScheduleStatus; got != "1.1" {
-		t.Errorf("SCHEDULE-STATUS = %q, want 1.1 (sent)", got)
+	if bob, ok := attendeeByEmail(backend.updatedEvent, "bob@example.com"); !ok || scheduleStatusValue(bob) != "1.1" {
+		t.Errorf("SCHEDULE-STATUS = %q, want 1.1 (sent)", scheduleStatusValue(bob))
 	}
 }
 
@@ -461,11 +524,11 @@ func TestMeCreateEventsSendFailureRecordsNoDelivery(t *testing.T) {
 	if ok, isOK := res.(*api.MicrosoftGraphEventStatusCode); !isOK || ok.StatusCode != 201 {
 		t.Fatalf("response = %T, want 201 despite the send failure", res)
 	}
-	if n := len(backend.updatedEvent.Attendees); n != 1 {
+	if n := len(backend.updatedEvent.Attendees()); n != 1 {
 		t.Fatalf("persisted attendees = %d, want 1", n)
 	}
-	if got := backend.updatedEvent.Attendees[0].ScheduleStatus; got != "5.1" {
-		t.Errorf("SCHEDULE-STATUS = %q, want 5.1 (undeliverable)", got)
+	if bob, ok := attendeeByEmail(backend.updatedEvent, "bob@example.com"); !ok || scheduleStatusValue(bob) != "5.1" {
+		t.Errorf("SCHEDULE-STATUS = %q, want 5.1 (undeliverable)", scheduleStatusValue(bob))
 	}
 }
 
@@ -641,10 +704,8 @@ func TestMeUpdateEventsSignificantChangeReinvites(t *testing.T) {
 	if backend.updatedEvent.Sequence != 1 {
 		t.Errorf("persisted SEQUENCE = %d, want 1", backend.updatedEvent.Sequence)
 	}
-	for _, a := range backend.updatedEvent.Attendees {
-		if a.Email == "bob@example.com" && a.ScheduleStatus != "1.1" {
-			t.Errorf("Bob SCHEDULE-STATUS = %q, want 1.1", a.ScheduleStatus)
-		}
+	if bob, ok := attendeeByEmail(backend.updatedEvent, "bob@example.com"); ok && scheduleStatusValue(bob) != "1.1" {
+		t.Errorf("Bob SCHEDULE-STATUS = %q, want 1.1", scheduleStatusValue(bob))
 	}
 }
 
@@ -723,8 +784,7 @@ func attendeeReq(emails ...string) []api.MicrosoftGraphAttendee {
 // A significant (start) change resets the recipients' PARTSTAT to notResponded —
 // a significant change requires them to respond afresh.
 func TestMeUpdateEventsSignificantChangeResetsPartStat(t *testing.T) {
-	ev := seededEvent
-	ev.Attendees = []calendar.Attendee{{Email: "bob@example.com", Status: "accepted"}}
+	ev := seededEventWithAttendees(calendar.NewParticipant("", "bob@example.com", "accepted", "attendee"))
 	backend := backendWithEvent(ev)
 	h := Handler{
 		calendar:   writableCalendarProvider{backend: backend},
@@ -737,18 +797,28 @@ func TestMeUpdateEventsSignificantChangeResetsPartStat(t *testing.T) {
 	if _, err := h.MeUpdateEvents(context.Background(), req, api.MeUpdateEventsParams{EventID: "evt-1"}); err != nil {
 		t.Fatalf("MeUpdateEvents: %v", err)
 	}
-	for _, a := range backend.updatedEvent.Attendees {
-		if a.Email == "bob@example.com" && a.Status != "notResponded" {
-			t.Errorf("Bob status after significant change = %q, want notResponded (reset)", a.Status)
-		}
+	// A significant change re-solicits responses: the JSCalendar participationStatus
+	// is reset to "needs-action".
+	if bob, ok := attendeeByEmail(backend.updatedEvent, "bob@example.com"); ok && bob.ParticipationStatus != "needs-action" {
+		t.Errorf("Bob status after significant change = %q, want needs-action (reset)", bob.ParticipationStatus)
 	}
+}
+
+// seededEventWithAttendees clones the seeded event with the given attendee roster,
+// building a fresh Participants map so tests do not alias the shared seededEvent.
+func seededEventWithAttendees(attendees ...jscalendar.Participant) calendar.Event {
+	ev := makeSeededEvent()
+	ev.SetOrganizerAttendees(nil, attendees)
+	return ev
 }
 
 // Removing an attendee via PATCH sends them a METHOD:CANCEL and bumps SEQUENCE,
 // without re-inviting the attendees who remain.
 func TestMeUpdateEventsAttendeeRemovedCancels(t *testing.T) {
-	ev := seededEvent
-	ev.Attendees = []calendar.Attendee{{Email: "bob@example.com"}, {Email: "carol@example.com"}}
+	ev := seededEventWithAttendees(
+		calendar.NewParticipant("", "bob@example.com", "", "attendee"),
+		calendar.NewParticipant("", "carol@example.com", "", "attendee"),
+	)
 	backend := backendWithEvent(ev)
 	sender := &fakeSender{}
 	h := Handler{
@@ -779,8 +849,7 @@ func TestMeUpdateEventsAttendeeRemovedCancels(t *testing.T) {
 // Adding an attendee re-sends a REQUEST (bumping SEQUENCE) but does NOT reset the
 // existing attendees' responses — an add is not a significant change.
 func TestMeUpdateEventsAttendeeAddedReinvitesWithoutReset(t *testing.T) {
-	ev := seededEvent
-	ev.Attendees = []calendar.Attendee{{Email: "bob@example.com", Status: "accepted"}}
+	ev := seededEventWithAttendees(calendar.NewParticipant("", "bob@example.com", "accepted", "attendee"))
 	backend := backendWithEvent(ev)
 	sender := &fakeSender{}
 	h := Handler{
@@ -802,10 +871,8 @@ func TestMeUpdateEventsAttendeeAddedReinvitesWithoutReset(t *testing.T) {
 	if backend.updatedEvent.Sequence != 1 {
 		t.Errorf("SEQUENCE = %d, want 1 (bumped)", backend.updatedEvent.Sequence)
 	}
-	for _, a := range backend.updatedEvent.Attendees {
-		if a.Email == "bob@example.com" && a.Status != "accepted" {
-			t.Errorf("Bob status after an attendee-add = %q, want accepted (not reset)", a.Status)
-		}
+	if bob, ok := attendeeByEmail(backend.updatedEvent, "bob@example.com"); ok && bob.ParticipationStatus != "accepted" {
+		t.Errorf("Bob status after an attendee-add = %q, want accepted (not reset)", bob.ParticipationStatus)
 	}
 }
 
@@ -813,16 +880,20 @@ func TestMeUpdateEventsAttendeeAddedReinvitesWithoutReset(t *testing.T) {
 // preserve that attendee's stored SCHEDULE-STATUS (which has no Graph field, so the
 // patch can never carry it) — guarding the mergeAttendees fix.
 func TestMergeAttendeesPreservesScheduleStatusWithExplicitStatus(t *testing.T) {
-	current := []calendar.Attendee{{Email: "bob@example.com", Status: "notResponded", ScheduleStatus: "1.1"}}
-	patched := []calendar.Attendee{{Email: "bob@example.com", Status: "accepted"}} // explicit response, no ScheduleStatus
+	current := []jscalendar.Participant{func() jscalendar.Participant {
+		p := calendar.NewParticipant("", "bob@example.com", "needs-action", "attendee")
+		p.ScheduleStatus = []string{"1.1"}
+		return p
+	}()}
+	patched := []jscalendar.Participant{calendar.NewParticipant("", "bob@example.com", "accepted", "attendee")} // explicit response, no ScheduleStatus
 	got := mergeAttendees(current, patched)
 	if len(got) != 1 {
 		t.Fatalf("merged attendees = %d, want 1", len(got))
 	}
-	if got[0].Status != "accepted" {
-		t.Errorf("Status = %q, want accepted (the patch's explicit value)", got[0].Status)
+	if got[0].ParticipationStatus != "accepted" {
+		t.Errorf("ParticipationStatus = %q, want accepted (the patch's explicit value)", got[0].ParticipationStatus)
 	}
-	if got[0].ScheduleStatus != "1.1" {
-		t.Errorf("ScheduleStatus = %q, want 1.1 (carried forward despite explicit Status)", got[0].ScheduleStatus)
+	if scheduleStatusValue(got[0]) != "1.1" {
+		t.Errorf("ScheduleStatus = %q, want 1.1 (carried forward despite explicit Status)", scheduleStatusValue(got[0]))
 	}
 }

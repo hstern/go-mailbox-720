@@ -21,6 +21,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/hstern/go-jscalendar"
+
 	"github.com/hstern/go-mailbox-720/internal/calendar"
 )
 
@@ -140,22 +142,22 @@ func TestRadicaleIntegration(t *testing.T) {
 		t.Fatalf("got %d events, want 1: %+v", len(events), events)
 	}
 	ev := events[0]
-	if ev.Subject != eventSummary {
-		t.Errorf("Subject = %q, want %q", ev.Subject, eventSummary)
+	if ev.Title != eventSummary {
+		t.Errorf("Title = %q, want %q", ev.Title, eventSummary)
 	}
-	if !ev.Start.Equal(seedEventStart) {
-		t.Errorf("Start = %v, want %v", ev.Start, seedEventStart)
+	if !ev.StartTime().Equal(seedEventStart) {
+		t.Errorf("Start = %v, want %v", ev.StartTime(), seedEventStart)
 	}
 
 	got, err := cl.GetEvent(ctx, ev.ID)
 	if err != nil {
 		t.Fatalf("GetEvent: %v", err)
 	}
-	if got.Subject != eventSummary {
-		t.Errorf("GetEvent Subject = %q, want %q", got.Subject, eventSummary)
+	if got.Title != eventSummary {
+		t.Errorf("GetEvent Title = %q, want %q", got.Title, eventSummary)
 	}
-	if !got.Start.Equal(seedEventStart) {
-		t.Errorf("GetEvent Start = %v, want %v", got.Start, seedEventStart)
+	if !got.StartTime().Equal(seedEventStart) {
+		t.Errorf("GetEvent Start = %v, want %v", got.StartTime(), seedEventStart)
 	}
 
 	// Radicale is a storage-only CalDAV server (no RFC 6638 auto-scheduling), so
@@ -210,14 +212,15 @@ func TestRadicaleWrite(t *testing.T) {
 
 	const createdSubject = "Sprint Review"
 	createStart := time.Date(2026, 7, 1, 14, 0, 0, 0, time.UTC)
-	created, err := w.CreateEvent(ctx, work.ID, calendar.Event{
-		Subject:   createdSubject,
-		Start:     createStart,
-		End:       createStart.Add(time.Hour),
-		Location:  "Room 7",
-		Organizer: calendar.Address{Name: "Alice", Email: "alice@example.com"},
-		Attendees: []calendar.Attendee{{Email: "bob@example.com", Status: "accepted"}},
-	})
+	newEvent := calendar.Event{Event: jscalendar.Event{
+		Title:     createdSubject,
+		Locations: map[jscalendar.Id]jscalendar.Location{"1": {Type: "Location", Name: "Room 7"}},
+	}}
+	newEvent.SetUTCTimes(createStart, createStart.Add(time.Hour))
+	newOrg := calendar.NewParticipant("Alice", "alice@example.com", "", "owner")
+	newAtt := calendar.NewParticipant("", "bob@example.com", "accepted", "attendee")
+	newEvent.SetOrganizerAttendees(&newOrg, []jscalendar.Participant{newAtt})
+	created, err := w.CreateEvent(ctx, work.ID, newEvent)
 	if err != nil {
 		t.Fatalf("CreateEvent: %v", err)
 	}
@@ -245,24 +248,28 @@ func TestRadicaleWrite(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetEvent after create: %v", err)
 	}
-	if got.Subject != createdSubject {
-		t.Errorf("GetEvent Subject = %q, want %q", got.Subject, createdSubject)
+	if got.Title != createdSubject {
+		t.Errorf("GetEvent Title = %q, want %q", got.Title, createdSubject)
 	}
-	if !got.Start.Equal(createStart) {
-		t.Errorf("GetEvent Start = %v, want %v", got.Start, createStart)
+	if !got.StartTime().Equal(createStart) {
+		t.Errorf("GetEvent Start = %v, want %v", got.StartTime(), createStart)
 	}
 	// The attendee PARTSTAT round-trips: written as PARTSTAT=ACCEPTED, read back as
-	// the neutral "accepted" status.
-	if len(got.Attendees) != 1 || got.Attendees[0].Email != "bob@example.com" || got.Attendees[0].Status != "accepted" {
-		t.Errorf("GetEvent Attendees = %+v, want one bob@example.com with status accepted", got.Attendees)
+	// the JSCalendar "accepted" participationStatus.
+	gotAtts := got.Attendees()
+	if len(gotAtts) != 1 || calendar.ParticipantEmail(gotAtts[0]) != "bob@example.com" || gotAtts[0].ParticipationStatus != "accepted" {
+		t.Errorf("GetEvent Attendees = %+v, want one bob@example.com with status accepted", gotAtts)
 	}
 
-	// UpdateEvent changes the subject; the UID and ID are preserved so a re-read
-	// reflects the new subject at the same resource.
+	// UpdateEvent changes the title; the UID and ID are preserved so a re-read
+	// reflects the new title at the same resource.
 	const updatedSubject = "Sprint Review (rescheduled)"
 	updated := got
-	updated.Subject = updatedSubject
-	updated.Attendees[0].Status = "declined" // flip the attendee PARTSTAT too
+	updated.Title = updatedSubject
+	// Flip the attendee PARTSTAT too, rebuilding the participant set.
+	updatedAtt := calendar.NewParticipant(gotAtts[0].Name, "bob@example.com", "declined", "attendee")
+	updatedOrg, _ := updated.Organizer()
+	updated.SetOrganizerAttendees(&updatedOrg, []jscalendar.Participant{updatedAtt})
 	if _, err := w.UpdateEvent(ctx, updated); err != nil {
 		t.Fatalf("UpdateEvent: %v", err)
 	}
@@ -270,11 +277,12 @@ func TestRadicaleWrite(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetEvent after update: %v", err)
 	}
-	if reread.Subject != updatedSubject {
-		t.Errorf("after update Subject = %q, want %q", reread.Subject, updatedSubject)
+	if reread.Title != updatedSubject {
+		t.Errorf("after update Title = %q, want %q", reread.Title, updatedSubject)
 	}
-	if len(reread.Attendees) != 1 || reread.Attendees[0].Status != "declined" {
-		t.Errorf("after update attendee = %+v, want status declined", reread.Attendees)
+	rereadAtts := reread.Attendees()
+	if len(rereadAtts) != 1 || rereadAtts[0].ParticipationStatus != "declined" {
+		t.Errorf("after update attendee = %+v, want status declined", rereadAtts)
 	}
 
 	// DeleteEvent removes the resource; neither GetEvent nor ListEvents should
@@ -353,11 +361,9 @@ func TestRadicaleDelta(t *testing.T) {
 	}
 	const deltaSubject = "Planning"
 	deltaStart := time.Date(2026, 8, 1, 10, 0, 0, 0, time.UTC)
-	if _, err := w.CreateEvent(ctx, work.ID, calendar.Event{
-		Subject: deltaSubject,
-		Start:   deltaStart,
-		End:     deltaStart.Add(time.Hour),
-	}); err != nil {
+	deltaEvent := calendar.Event{Event: jscalendar.Event{Title: deltaSubject}}
+	deltaEvent.SetUTCTimes(deltaStart, deltaStart.Add(time.Hour))
+	if _, err := w.CreateEvent(ctx, work.ID, deltaEvent); err != nil {
 		t.Fatalf("CreateEvent: %v", err)
 	}
 
@@ -405,7 +411,7 @@ func TestRadicaleDelta(t *testing.T) {
 // findSubject returns the first event with the given subject, or nil.
 func findSubject(events []calendar.Event, subject string) *calendar.Event {
 	for i := range events {
-		if events[i].Subject == subject {
+		if events[i].Title == subject {
 			return &events[i]
 		}
 	}
@@ -559,11 +565,9 @@ func TestRadicaleFindEventByUID(t *testing.T) {
 	}
 
 	start := time.Date(2026, 8, 3, 9, 0, 0, 0, time.UTC)
-	created, err := cl.CreateEvent(ctx, work.ID, calendar.Event{
-		Subject: "Locate me",
-		Start:   start,
-		End:     start.Add(time.Hour),
-	})
+	locateEvent := calendar.Event{Event: jscalendar.Event{Title: "Locate me"}}
+	locateEvent.SetUTCTimes(start, start.Add(time.Hour))
+	created, err := cl.CreateEvent(ctx, work.ID, locateEvent)
 	if err != nil {
 		t.Fatalf("CreateEvent: %v", err)
 	}
@@ -578,8 +582,8 @@ func TestRadicaleFindEventByUID(t *testing.T) {
 	if got.ID != created.ID {
 		t.Errorf("found event ID = %q, want %q", got.ID, created.ID)
 	}
-	if got.Subject != "Locate me" {
-		t.Errorf("found event Subject = %q, want %q", got.Subject, "Locate me")
+	if got.Title != "Locate me" {
+		t.Errorf("found event Title = %q, want %q", got.Title, "Locate me")
 	}
 
 	if _, found, err := cl.FindEventByUID(ctx, work.ID, "no-such-uid@example.com"); err != nil || found {

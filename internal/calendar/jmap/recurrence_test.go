@@ -102,8 +102,8 @@ func TestListInstances(t *testing.T) {
 		if inst.SeriesMasterID != "e1" {
 			t.Errorf("instance %q: SeriesMasterID = %q, want e1", inst.ID, inst.SeriesMasterID)
 		}
-		if inst.RecurrenceID.IsZero() {
-			t.Errorf("instance %q: RecurrenceID is zero", inst.ID)
+		if inst.RecurrenceID == nil {
+			t.Errorf("instance %q: RecurrenceID is nil", inst.ID)
 		}
 	}
 

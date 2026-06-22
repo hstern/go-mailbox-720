@@ -34,6 +34,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/hstern/go-jscalendar"
 	"github.com/hstern/go-mailbox-720/internal/calendar"
 	"github.com/hstern/go-mailbox-720/internal/scheduling"
 	"github.com/hstern/go-mailbox-720/internal/smtp"
@@ -58,23 +59,23 @@ const StatusTentative = "tentative"
 //
 // Field mapping (scheduling.Invite -> calendar.Event):
 //
-//   - Summary    -> Subject
-//   - Start      -> Start
-//   - End        -> End
+//   - Summary    -> Title
+//   - Start/End  -> Start/TimeZone/Duration (via SetUTCTimes; the invite's UTC
+//     instants become an "Etc/UTC" wall-clock JSCalendar time)
 //   - UID        -> UID        (the stable correlation key across the invite's life)
-//   - Organizer  -> Organizer  (scheduling.Address -> calendar.Address)
-//   - Attendees  -> Attendees  (each Attendee.Address -> calendar.Address; the
-//     per-attendee PARTSTAT is dropped — the neutral Event carries only the
-//     roster of addresses, not their individual participation status)
-//   - RecurrenceID -> RecurrenceID (parsed from the iCalendar RECURRENCE-ID value
-//     to the occurrence's original-start instant; zero for a master REQUEST). When
-//     set, IsOverride is marked true: the invite addresses a single overridden
-//     occurrence of a series, not the whole series.
+//   - Sequence   -> Sequence   (int -> uint; a negative wire SEQUENCE clamps to 0)
+//   - Organizer  -> the "owner"-role JSCalendar Participant
+//   - Attendees  -> the "attendee"-role JSCalendar Participants, each carrying its
+//     PARTSTAT mapped to the JSCalendar participationStatus vocabulary
+//   - RecurrenceID -> RecurrenceID (+RecurrenceIDTimeZone "Etc/UTC"), parsed from
+//     the iCalendar RECURRENCE-ID value to the occurrence's original-start instant;
+//     nil for a master REQUEST. When set, IsOverride is marked true: the invite
+//     addresses a single overridden occurrence of a series, not the whole series.
 //   - (constant) -> Status = StatusTentative ("tentative")
 //
-// The remaining [calendar.Event] fields (ID, CalendarID, Location, Body,
-// IsAllDay, CreatedAt) are left zero: ID/CalendarID are assigned by the store on
-// create, and the others are not modelled on an [scheduling.Invite]. Status is
+// The remaining [calendar.Event] fields (ID, CalendarID, Locations, Description,
+// ShowWithoutTime, Created) are left zero: ID/CalendarID are assigned by the store
+// on create, and the others are not modelled on an [scheduling.Invite]. Status is
 // always set to the tentative marker because an inbound REQUEST is a proposal the
 // user has not yet answered.
 func EventFromInvite(inv *scheduling.Invite) calendar.Event {
@@ -82,28 +83,30 @@ func EventFromInvite(inv *scheduling.Invite) calendar.Event {
 		return calendar.Event{}
 	}
 
-	attendees := make([]calendar.Attendee, 0, len(inv.Attendees))
+	attendees := make([]jscalendar.Participant, 0, len(inv.Attendees))
 	for _, a := range inv.Attendees {
-		ca := toCalendarAddress(a.Address)
-		attendees = append(attendees, calendar.Attendee{
-			Name:   ca.Name,
-			Email:  ca.Email,
-			Status: partStatToNeutral(a.PartStat),
-		})
+		attendees = append(attendees, calendar.NewParticipant(
+			a.Name, a.Email, partStatToJSCal(a.PartStat), "attendee"))
 	}
 
-	ev := calendar.Event{
-		UID:       inv.UID,
-		Subject:   inv.Summary,
-		Start:     inv.Start,
-		End:       inv.End,
-		Sequence:  inv.Sequence,
-		Organizer: toCalendarAddress(inv.Organizer),
-		Attendees: attendees,
-		Status:    StatusTentative,
+	var ev calendar.Event
+	ev.UID = inv.UID
+	ev.Title = inv.Summary
+	ev.Sequence = sequenceToUint(inv.Sequence)
+	ev.Status = StatusTentative
+	ev.SetUTCTimes(inv.Start, inv.End)
+
+	var organizer *jscalendar.Participant
+	if inv.Organizer.Email != "" || inv.Organizer.Name != "" {
+		o := calendar.NewParticipant(inv.Organizer.Name, inv.Organizer.Email, "", "owner")
+		organizer = &o
 	}
+	ev.SetOrganizerAttendees(organizer, attendees)
+
 	if rid, ok := parseRecurrenceID(inv.RecurrenceID); ok {
-		ev.RecurrenceID = rid
+		ldt := localDateTimeUTC(rid)
+		ev.RecurrenceID = &ldt
+		ev.RecurrenceIDTimeZone = "Etc/UTC"
 		ev.IsOverride = true
 	}
 	return ev
@@ -120,48 +123,53 @@ func EventFromInvite(inv *scheduling.Invite) calendar.Event {
 // Field mapping (calendar.Event -> scheduling.Invite):
 //
 //   - UID        -> UID        (the correlation key the REPLY echoes)
-//   - Subject    -> Summary
-//   - Start      -> Start      (RFC 5546 §3.2.3 requires DTSTART in a REPLY)
-//   - End        -> End
-//   - Organizer  -> Organizer  (calendar.Address -> scheduling.Address; the
-//     address the REPLY is sent to)
-//   - Attendees  -> Attendees  (each calendar.Address -> scheduling.Attendee with
-//     an empty PARTSTAT; per-attendee participation status is not stored on the
-//     neutral Event, so it cannot be reconstructed here)
+//   - Title      -> Summary
+//   - StartTime  -> Start      (RFC 5546 §3.2.3 requires DTSTART in a REPLY)
+//   - EndTime    -> End
+//   - Organizer  -> Organizer  (the "owner"-role Participant -> scheduling.Address;
+//     the address the REPLY is sent to)
+//   - Attendees  -> Attendees  (each "attendee"-role Participant -> scheduling.Attendee,
+//     its JSCalendar participationStatus mapped back to the iCalendar PARTSTAT)
 //
 // Method is set to [scheduling.MethodRequest] because the returned Invite stands
 // in for the original request the user is replying to.
 //
-// The event's SEQUENCE is carried through, so a re-issued REQUEST/CANCEL or a REPLY
-// addresses the event at its true revision.
+// The event's SEQUENCE is carried through (uint -> int), so a re-issued
+// REQUEST/CANCEL or a REPLY addresses the event at its true revision.
 //
 // RECURRENCE-ID: when the event addresses a single overridden instance of a
-// recurring series (ev.RecurrenceID is non-zero — e.g. an occurrence surfaced by
+// recurring series (ev.RecurrenceID is non-nil — e.g. an occurrence surfaced by
 // the InstanceReader), the Invite is stamped with that RECURRENCE-ID via
 // [scheduling.Invite.SetRecurrenceID], so the REPLY/REQUEST/CANCEL it backs targets
-// the one occurrence rather than the master series. A zero RecurrenceID leaves the
+// the one occurrence rather than the master series. A nil RecurrenceID leaves the
 // invite addressing the master.
 func InviteFromEvent(ev calendar.Event) *scheduling.Invite {
-	attendees := make([]scheduling.Attendee, 0, len(ev.Attendees))
-	for _, a := range ev.Attendees {
+	evAttendees := ev.Attendees()
+	attendees := make([]scheduling.Attendee, 0, len(evAttendees))
+	for _, a := range evAttendees {
 		attendees = append(attendees, scheduling.Attendee{
-			Address:  scheduling.Address{Name: a.Name, Email: a.Email},
-			PartStat: neutralToPartStat(a.Status),
+			Address:  scheduling.Address{Name: a.Name, Email: calendar.ParticipantEmail(a)},
+			PartStat: jsCalToPartStat(a.ParticipationStatus),
 		})
+	}
+
+	var organizer scheduling.Address
+	if org, ok := ev.Organizer(); ok {
+		organizer = scheduling.Address{Name: org.Name, Email: calendar.ParticipantEmail(org)}
 	}
 
 	inv := &scheduling.Invite{
 		Method:    scheduling.MethodRequest,
 		UID:       ev.UID,
-		Summary:   ev.Subject,
-		Start:     ev.Start,
-		End:       ev.End,
-		Sequence:  ev.Sequence,
-		Organizer: toSchedulingAddress(ev.Organizer),
+		Summary:   ev.Title,
+		Start:     ev.StartTime(),
+		End:       ev.EndTime(),
+		Sequence:  int(ev.Sequence),
+		Organizer: organizer,
 		Attendees: attendees,
 	}
-	if !ev.RecurrenceID.IsZero() {
-		inv.SetRecurrenceID(ev.RecurrenceID)
+	if ev.RecurrenceID != nil {
+		inv.SetRecurrenceID(recurrenceIDToTime(ev.RecurrenceID, ev.RecurrenceIDTimeZone))
 	}
 	return inv
 }
@@ -230,7 +238,7 @@ func ProcessRequest(ctx context.Context, w calendar.Writer, calendarID string, r
 	// Single-instance REQUEST: an override for one occurrence of an existing series.
 	// Locate the master by UID and record the override against it, leaving the
 	// series rule and the other occurrences intact.
-	if !event.RecurrenceID.IsZero() {
+	if event.RecurrenceID != nil {
 		f, hasFinder := w.(calendar.Finder)
 		iw, hasInstanceWriter := w.(calendar.InstanceWriter)
 		if hasFinder && hasInstanceWriter {
@@ -259,7 +267,7 @@ func ProcessRequest(ctx context.Context, w calendar.Writer, calendarID string, r
 			return calendar.Event{}, fmt.Errorf("itip: find event by uid: %w", err)
 		}
 		if found {
-			if inv.Sequence <= existing.Sequence {
+			if sequenceToUint(inv.Sequence) <= existing.Sequence {
 				return existing, nil
 			}
 			event.ID = existing.ID
@@ -433,50 +441,75 @@ func Cancel(ctx context.Context, sender smtp.Sender, organizer scheduling.Addres
 	return nil
 }
 
-// toCalendarAddress maps a scheduling.Address onto the calendar port's Address.
-// The two types are structurally identical (display name + email) but live in
-// separate packages, so the bridge is explicit.
-func toCalendarAddress(a scheduling.Address) calendar.Address {
-	return calendar.Address{Name: a.Name, Email: a.Email}
+// sequenceToUint maps an iCalendar SEQUENCE (a signed int on the scheduling
+// Invite) onto the JSCalendar Sequence (uint), clamping a negative value to 0.
+// RFC 5545 SEQUENCE is a non-negative integer, so a negative value is a
+// malformed wire input and 0 is the safe revision floor.
+func sequenceToUint(seq int) uint {
+	if seq < 0 {
+		return 0
+	}
+	return uint(seq)
 }
 
-// toSchedulingAddress maps a calendar.Address onto the scheduling engine's
-// Address — the reverse of toCalendarAddress. The two types are structurally
-// identical (display name + email) but live in separate packages, so the bridge
-// is explicit.
-func toSchedulingAddress(a calendar.Address) scheduling.Address {
-	return scheduling.Address{Name: a.Name, Email: a.Email}
-}
-
-// partStatToNeutral maps an iCalendar PARTSTAT to the neutral
-// calendar.Attendee.Status (Graph responseStatus shape); neutralToPartStat is the
-// inverse. An unmapped value yields the zero value.
-func partStatToNeutral(p scheduling.PartStat) string {
+// partStatToJSCal maps an iCalendar PARTSTAT to the JSCalendar
+// participationStatus vocabulary; jsCalToPartStat is the inverse. An unmapped
+// value yields "".
+func partStatToJSCal(p scheduling.PartStat) string {
 	switch p {
 	case scheduling.PartStatAccepted:
 		return "accepted"
 	case scheduling.PartStatDeclined:
 		return "declined"
 	case scheduling.PartStatTentative:
-		return "tentativelyAccepted"
+		return "tentative"
 	case scheduling.PartStatNeedsAction:
-		return "notResponded"
+		return "needs-action"
 	default:
 		return ""
 	}
 }
 
-func neutralToPartStat(s string) scheduling.PartStat {
+func jsCalToPartStat(s string) scheduling.PartStat {
 	switch s {
 	case "accepted":
 		return scheduling.PartStatAccepted
 	case "declined":
 		return scheduling.PartStatDeclined
-	case "tentativelyAccepted":
+	case "tentative":
 		return scheduling.PartStatTentative
-	case "notResponded":
+	case "needs-action":
 		return scheduling.PartStatNeedsAction
 	default:
 		return ""
 	}
+}
+
+// localDateTimeUTC builds a JSCalendar LocalDateTime from a UTC instant: the
+// wall-clock fields of t.UTC(), paired with a "Etc/UTC" RecurrenceIDTimeZone by
+// the caller. It mirrors the construction the frozen SetUTCTimes uses for Start.
+func localDateTimeUTC(t time.Time) jscalendar.LocalDateTime {
+	t = t.UTC()
+	return jscalendar.LocalDateTime{
+		Year: t.Year(), Month: int(t.Month()), Day: t.Day(),
+		Hour: t.Hour(), Minute: t.Minute(), Second: t.Second(),
+	}
+}
+
+// recurrenceIDToTime resolves a JSCalendar RecurrenceID LocalDateTime + its time
+// zone back to a UTC instant — the inverse of localDateTimeUTC for the scheduling
+// engine's time.Time-based SetRecurrenceID. An empty or unrecognized zone is
+// treated as UTC.
+func recurrenceIDToTime(ldt *jscalendar.LocalDateTime, tz jscalendar.TimeZoneId) time.Time {
+	if ldt == nil {
+		return time.Time{}
+	}
+	loc := time.UTC
+	if tz != "" {
+		if l, err := time.LoadLocation(string(tz)); err == nil {
+			loc = l
+		}
+	}
+	return time.Date(ldt.Year, time.Month(ldt.Month), ldt.Day,
+		ldt.Hour, ldt.Minute, ldt.Second, 0, loc).UTC()
 }
