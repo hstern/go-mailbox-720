@@ -405,6 +405,12 @@ func run(addr string, authCfg auth.Config, revSink receiver.Sink, ssfReceiverPat
 		log.Println("auth: DISABLED (no -auth-issuer configured) — all requests allowed")
 	}
 
+	// Decompress gzip-encoded request bodies before anything reads them. The
+	// official msgraph-sdk-go compresses request bodies by default, so this is
+	// required for $batch and every write to interoperate with real Graph
+	// clients. Outermost so it covers the auth path, public endpoints, and mux.
+	handler = server.DecompressRequests(handler)
+
 	srv := &http.Server{
 		Addr:              addr,
 		Handler:           handler,
