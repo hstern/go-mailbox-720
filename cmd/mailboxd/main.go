@@ -345,7 +345,9 @@ func (p staticSchedulingProvider) Sender(_ context.Context) (smtp.Sender, error)
 	return smtp.Dial(p.addr, p.username, p.password, &smtp.Options{TLS: p.tls, StartTLS: p.startTLS})
 }
 
-func (p staticSchedulingProvider) MailboxAddress(_ context.Context) (string, error) { return p.mailbox, nil }
+func (p staticSchedulingProvider) MailboxAddress(_ context.Context) (string, error) {
+	return p.mailbox, nil
+}
 
 func run(addr string, authCfg auth.Config, revSink receiver.Sink, ssfReceiverPath string, provider server.MailProvider, calProvider server.CalendarProvider, contactsProvider server.ContactsProvider, schedProvider server.SchedulingProvider, enableScheduling bool) error {
 	h, err := server.New(provider, calProvider, contactsProvider, schedProvider)
