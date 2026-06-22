@@ -228,7 +228,14 @@ func (a *Authenticator) Middleware(next http.Handler) http.Handler {
 			grapherr.Write(w, http.StatusUnauthorized)
 			return
 		}
-		next.ServeHTTP(w, r.WithContext(withMailbox(r.Context(), mailbox)))
+		// Retain the validated raw bearer token alongside the identity, so a
+		// per-identity backend provider can exchange it (RFC 8693) for a
+		// backend-audience token preserving the user's sub (MB720-41). Stored only
+		// here, after validation + scope + revocation all pass, so an unauthorized
+		// token never reaches a provider. Never logged.
+		ctx := withMailbox(r.Context(), mailbox)
+		ctx = withRawToken(ctx, raw)
+		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
 
@@ -515,4 +522,21 @@ func withMailbox(ctx context.Context, id subjectid.SubjectIdentifier) context.Co
 func Mailbox(ctx context.Context) (subjectid.SubjectIdentifier, bool) {
 	id, ok := ctx.Value(ctxKey{}).(subjectid.SubjectIdentifier)
 	return id, ok
+}
+
+type rawTokenKey struct{}
+
+func withRawToken(ctx context.Context, raw string) context.Context {
+	return context.WithValue(ctx, rawTokenKey{}, raw)
+}
+
+// RawToken returns the validated raw bearer token the middleware stored on an
+// authenticated request, and whether one was present. It is the subject token a
+// per-identity provider exchanges (RFC 8693) for a backend-audience token
+// (MB720-41). Treat it as a secret: never log it. It is set only after the token
+// passed validation, scope, and revocation, so a value here is always one a
+// trusted issuer vouched for.
+func RawToken(ctx context.Context) (string, bool) {
+	raw, ok := ctx.Value(rawTokenKey{}).(string)
+	return raw, ok
 }

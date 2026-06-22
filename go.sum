@@ -58,6 +58,8 @@ github.com/hstern/go-jscontact v0.1.0 h1:hpBU64CRfhChuilMAi46q9NtJKHm8CIG63LgW7o
 github.com/hstern/go-jscontact v0.1.0/go.mod h1:gZ3k5MbT+wFpHT4aXrqmB1WIWYAd8hXoPO8LQ5Zt0Jk=
 github.com/hstern/go-managesieve v0.2.0 h1:Uwif0FdjffpCJkC9GalTB2hwFVNHhxuagRbnvhWk7Lc=
 github.com/hstern/go-managesieve v0.2.0/go.mod h1:H7vjmLjBVUgwIGmzTYzgW0qzLSVHJApN8CuAJ/c9uOw=
+github.com/hstern/go-oauth-client-authn v0.1.0 h1:zqD/lAhZjSrAYj57VRi7/c3ce0v9nR8gUl23884fpWg=
+github.com/hstern/go-oauth-client-authn v0.1.0/go.mod h1:8zsGLngFkLve7c0tpmyrPyjWw4eTkAmPM9H5lml4wW0=
 github.com/hstern/go-protected-resource-metadata v0.1.0 h1:fdS80jxsA+ppRHlUoTuhgosaLPjLfWxLW4YFDNHwUSE=
 github.com/hstern/go-protected-resource-metadata v0.1.0/go.mod h1:thlCq+8qE2UrDhr5qTGRON+8bI+x1xIsA1zwPU53i7s=
 github.com/hstern/go-risc v0.2.0 h1:m6MQZ2n4QU4pErrxC590oEDXkzRssEWNJtfJP5mGJNo=
@@ -70,6 +72,8 @@ github.com/hstern/go-ssf v0.1.0 h1:edBo5u8ugGz3RwY5eQ1c5q53a7naQKg1fYNItfUMrvk=
 github.com/hstern/go-ssf v0.1.0/go.mod h1:6x8ZfADmRQUov8n9ls5qzQ0Sa54Q4/6JDpwH11MHZs4=
 github.com/hstern/go-subjectid v0.2.0 h1:kakUgtYVbUjIIVLaJcwWnQ9QKFwIw+AQxCZKOGLiOWU=
 github.com/hstern/go-subjectid v0.2.0/go.mod h1:KS0TexS0PZQe7CnntjRRzcufxLdMji1DMVpxiBqCvRM=
+github.com/hstern/go-token-exchange v0.1.1 h1:9Xrt4nts0DGGM7xpw8hlaomIFFbnJdgZOTAGI3kefsk=
+github.com/hstern/go-token-exchange v0.1.1/go.mod h1:LunRGsoUYqkUAp4phB1yTZzxY/JJCHIxxAgPSxpNeEs=
 github.com/hstern/go-token-introspection v0.1.0 h1:Q4CkhEtYRoMkBb0S+lytvn94+BoTj81hwgM3/5/jCOg=
 github.com/hstern/go-token-introspection v0.1.0/go.mod h1:JS0m/iCfUqyU/R85fKfRgdQ+H0fICFVSCQ4u55xAahU=
 github.com/kr/pretty v0.3.1 h1:flRD4NNwYAUpkphVc1HcthR4KEIFJ65n8Mw5qdRn3LE=
