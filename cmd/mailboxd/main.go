@@ -29,6 +29,7 @@ import (
 
 	clientauthn "github.com/hstern/go-oauth-client-authn"
 	"github.com/hstern/go-ssf/receiver"
+	subjectid "github.com/hstern/go-subjectid"
 
 	"github.com/hstern/go-mailbox-720/internal/auth"
 	"github.com/hstern/go-mailbox-720/internal/batch"
@@ -66,6 +67,7 @@ func main() {
 	imapAddr := flag.String("mail-imap-addr", "", "IMAP server address host:port for the mail backend (empty: mail operations return 501; password from MAILBOXD_IMAP_PASSWORD)")
 	imapUser := flag.String("mail-imap-username", "", "IMAP username for the mail backend")
 	imapTLS := flag.Bool("mail-imap-tls", true, "use implicit TLS for the IMAP connection")
+	mailIMAPAudience := flag.String("mail-imap-audience", "", "RFC 8693 audience to request for the IMAP mail backend (MB720-43). When set together with -tokenexchange-endpoint, IMAP authenticates per-identity via SASL OAUTHBEARER (the OAUTHBEARER username is the authenticated subject) instead of -mail-imap-username/MAILBOXD_IMAP_PASSWORD")
 	sieveAddr := flag.String("mail-managesieve-addr", "", "ManageSieve server host:port (RFC 5804) for inbox rules on the IMAP tier (empty: mail-filter operations return 501; SASL PLAIN reuses the IMAP username and MAILBOXD_IMAP_PASSWORD)")
 	sieveTLS := flag.Bool("mail-managesieve-starttls", true, "use STARTTLS on the ManageSieve connection (RFC 5804 §2.2); disabling it sends the SASL PLAIN credentials in the clear — for local servers only")
 	jmapSession := flag.String("mail-jmap-session-url", "", "JMAP session resource URL for the mail backend (empty: use IMAP, or return 501 if neither set; access token from MAILBOXD_JMAP_TOKEN). Takes precedence over the IMAP flags when set")
@@ -85,6 +87,7 @@ func main() {
 	smtpTLS := flag.Bool("smtp-tls", false, "use implicit TLS (SMTPS, port 465) for SMTP")
 	smtpStartTLS := flag.Bool("smtp-starttls", true, "use STARTTLS (submission, port 587) for SMTP; ignored when -smtp-tls is set")
 	mailboxEmail := flag.String("mailbox-email", "", "the mailbox owner's email, used as the responding attendee when accepting/declining meetings")
+	smtpAudience := flag.String("smtp-audience", "", "RFC 8693 audience to request for the SMTP submission backend (MB720-43). When set together with -tokenexchange-endpoint, SMTP authenticates per-identity via SASL OAUTHBEARER and the responding attendee is the authenticated subject, instead of -smtp-username/MAILBOXD_SMTP_PASSWORD/-mailbox-email")
 	flag.Parse()
 
 	// The revocation store is the receiver's sink AND the middleware's revocation
@@ -127,8 +130,8 @@ func main() {
 	// A per-identity audience without an exchange endpoint is a misconfiguration:
 	// the backend would silently fall back to the shared static token, serving every
 	// authenticated user from one account. Fail loudly rather than leak across tenants.
-	if exchanger == nil && (*mailJMAPAudience != "" || *contactsJMAPAudience != "") {
-		log.Fatalln("mailboxd: -mail-jmap-audience/-contacts-jmap-audience require -tokenexchange-endpoint (per-identity backends need the token exchange)")
+	if exchanger == nil && (*mailJMAPAudience != "" || *contactsJMAPAudience != "" || *mailIMAPAudience != "" || *smtpAudience != "") {
+		log.Fatalln("mailboxd: the -*-audience flags require -tokenexchange-endpoint (per-identity backends need the token exchange)")
 	}
 
 	// JMAP and IMAP are alternative mail backends behind the same port; JMAP wins
@@ -137,10 +140,12 @@ func main() {
 	switch {
 	case *jmapSession != "" && exchanger != nil && *mailJMAPAudience != "":
 		// Per-identity (MB720-42): exchange each user's token for a JMAP-mail-
-		// audience token and dial as that user. sessionURL is captured for the dial.
+		// audience token and dial as that user (caching — JMAP Close is a no-op).
 		sessionURL := *jmapSession
-		provider = jmapMailIdentityProvider{newPerIdentityBackend(exchanger, *mailJMAPAudience,
-			func(token string) (mail.Backend, error) { return mailjmap.Dial(sessionURL, token, nil) })}
+		provider = mailIdentityProvider{proto: "JMAP", p: newPerIdentityBackend(exchanger, *mailJMAPAudience,
+			func(_ subjectid.IssSubID, token string) (mail.Backend, error) {
+				return mailjmap.Dial(sessionURL, token, nil)
+			})}
 	case *jmapSession != "":
 		provider = staticJMAPProvider{
 			sessionURL: *jmapSession,
@@ -148,6 +153,15 @@ func main() {
 			// appear in the process table.
 			token: os.Getenv("MAILBOXD_JMAP_TOKEN"),
 		}
+	case *imapAddr != "" && exchanger != nil && *mailIMAPAudience != "":
+		// Per-identity (MB720-43): SASL OAUTHBEARER with the exchanged token; the
+		// OAUTHBEARER authzid is the principal's subject. No caching — IMAP Close
+		// drops the connection, so dial per request (the adapter's existing posture).
+		addr, tls := *imapAddr, *imapTLS
+		provider = mailIdentityProvider{proto: "IMAP", p: newPerIdentityDialer(exchanger, *mailIMAPAudience,
+			func(id subjectid.IssSubID, token string) (mail.Backend, error) {
+				return imap.Dial(addr, id.Sub, "", &imap.Options{TLS: tls, BearerToken: token})
+			})}
 	case *imapAddr != "":
 		provider = staticIMAPProvider{
 			addr:      *imapAddr,
@@ -190,7 +204,9 @@ func main() {
 		// Per-identity (MB720-42), mirroring the JMAP mail backend.
 		sessionURL := *contactsJMAP
 		contactsProvider = jmapContactsIdentityProvider{newPerIdentityBackend(exchanger, *contactsJMAPAudience,
-			func(token string) (contacts.Backend, error) { return jmapcontacts.Dial(sessionURL, token, nil) })}
+			func(_ subjectid.IssSubID, token string) (contacts.Backend, error) {
+				return jmapcontacts.Dial(sessionURL, token, nil)
+			})}
 	case *contactsJMAP != "":
 		contactsProvider = staticJMAPContactsProvider{
 			sessionURL: *contactsJMAP,
@@ -206,7 +222,17 @@ func main() {
 		}
 	}
 	var schedProvider server.SchedulingProvider
-	if *smtpAddr != "" {
+	switch {
+	case *smtpAddr != "" && exchanger != nil && *smtpAudience != "":
+		// Per-identity (MB720-43): SASL OAUTHBEARER with the exchanged token; the
+		// OAUTHBEARER username and the responding-attendee address are the principal's
+		// subject. No caching — SMTP Close drops the connection (dial per request).
+		addr, tls, startTLS := *smtpAddr, *smtpTLS, *smtpStartTLS
+		schedProvider = schedulingIdentityProvider{newPerIdentityDialer(exchanger, *smtpAudience,
+			func(id subjectid.IssSubID, token string) (smtp.Sender, error) {
+				return smtp.Dial(addr, id.Sub, "", &smtp.Options{TLS: tls, StartTLS: startTLS, BearerToken: token})
+			})}
+	case *smtpAddr != "":
 		schedProvider = staticSchedulingProvider{
 			addr:     *smtpAddr,
 			username: *smtpUser,
@@ -308,8 +334,8 @@ func (p staticJMAPContactsProvider) Contacts(_ context.Context) (contacts.Backen
 }
 
 // staticSchedulingProvider answers meeting accept/decline by emailing the
-// organizer from one configured SMTP account and mailbox address. A per-identity
-// provider (mapping the token's identity to credentials) is future work.
+// organizer from one configured SMTP account and mailbox address. The
+// per-identity counterpart is schedulingIdentityProvider (MB720-43).
 type staticSchedulingProvider struct {
 	addr, username, password, mailbox string
 	tls, startTLS                     bool
@@ -319,16 +345,16 @@ func (p staticSchedulingProvider) Sender(_ context.Context) (smtp.Sender, error)
 	return smtp.Dial(p.addr, p.username, p.password, &smtp.Options{TLS: p.tls, StartTLS: p.startTLS})
 }
 
-func (p staticSchedulingProvider) MailboxAddress() string { return p.mailbox }
+func (p staticSchedulingProvider) MailboxAddress(_ context.Context) (string, error) { return p.mailbox, nil }
 
 func run(addr string, authCfg auth.Config, revSink receiver.Sink, ssfReceiverPath string, provider server.MailProvider, calProvider server.CalendarProvider, contactsProvider server.ContactsProvider, schedProvider server.SchedulingProvider, enableScheduling bool) error {
 	h, err := server.New(provider, calProvider, contactsProvider, schedProvider)
 	if err != nil {
 		return err
 	}
-	switch provider.(type) {
-	case jmapMailIdentityProvider:
-		log.Println("mail: JMAP backend enabled (per-identity token exchange)")
+	switch pv := provider.(type) {
+	case mailIdentityProvider:
+		log.Printf("mail: %s backend enabled (per-identity token exchange)", pv.proto)
 	case staticJMAPProvider:
 		log.Println("mail: JMAP backend enabled")
 	case staticIMAPProvider:

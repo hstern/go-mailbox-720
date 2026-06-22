@@ -12,6 +12,7 @@ import (
 	goimap "github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/imapserver"
 	"github.com/emersion/go-imap/v2/imapserver/imapmemserver"
+	"github.com/emersion/go-sasl"
 
 	"github.com/hstern/go-mailbox-720/internal/mail"
 	"github.com/hstern/go-mailbox-720/internal/odata"
@@ -58,6 +59,109 @@ func newMemoryIMAP(t *testing.T) string {
 	go func() { _ = srv.Serve(ln) }()
 	t.Cleanup(func() { _ = srv.Close(); _ = ln.Close() })
 	return ln.Addr().String()
+}
+
+// oauthSession wraps a memserver session to add SASL OAUTHBEARER: it validates
+// the bearer token, then binds the memserver user via Login so the authenticated
+// session can serve the rest of the commands.
+type oauthSession struct {
+	imapserver.Session
+	token string
+}
+
+func (s *oauthSession) AuthenticateMechanisms() []string { return []string{sasl.OAuthBearer} }
+
+func (s *oauthSession) Authenticate(mech string) (sasl.Server, error) {
+	if mech != sasl.OAuthBearer {
+		return nil, imapserver.ErrAuthFailed
+	}
+	return sasl.NewOAuthBearerServer(func(opts sasl.OAuthBearerOptions) *sasl.OAuthBearerError {
+		if opts.Token != s.token {
+			return &sasl.OAuthBearerError{Status: "invalid_token"}
+		}
+		if err := s.Login(testUser, testPass); err != nil {
+			return &sasl.OAuthBearerError{Status: "invalid_token"}
+		}
+		return nil
+	}), nil
+}
+
+// newMemoryIMAPOAuth starts an in-process IMAP server (one user, one INBOX
+// message) that authenticates with SASL OAUTHBEARER requiring the given token.
+func newMemoryIMAPOAuth(t *testing.T, token string) string {
+	t.Helper()
+	memServer := imapmemserver.New()
+	user := imapmemserver.NewUser(testUser, testPass)
+	if err := user.Create("INBOX", nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := user.Append("INBOX", strings.NewReader(testRawMessage), &goimap.AppendOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	memServer.AddUser(user)
+
+	srv := imapserver.New(&imapserver.Options{
+		NewSession: func(*imapserver.Conn) (imapserver.Session, *imapserver.GreetingData, error) {
+			return &oauthSession{Session: memServer.NewSession(), token: token}, nil, nil
+		},
+		InsecureAuth: true,
+	})
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() { _ = srv.Serve(ln) }()
+	t.Cleanup(func() { _ = srv.Close(); _ = ln.Close() })
+	return ln.Addr().String()
+}
+
+func TestDialOAuthBearer(t *testing.T) {
+	addr := newMemoryIMAPOAuth(t, "good-token")
+
+	t.Run("valid token", func(t *testing.T) {
+		cl, err := Dial(addr, testUser, "", &Options{TLS: false, BearerToken: "good-token"})
+		if err != nil {
+			t.Fatalf("Dial with OAUTHBEARER: %v", err)
+		}
+		defer func() { _ = cl.Close() }()
+		// A command in the authenticated state proves the SASL exchange bound the user.
+		folders, err := cl.ListMailFolders(context.Background())
+		if err != nil {
+			t.Fatalf("ListMailFolders after OAUTHBEARER: %v", err)
+		}
+		if len(folders) == 0 {
+			t.Error("no folders after OAUTHBEARER login")
+		}
+	})
+
+	t.Run("wrong token", func(t *testing.T) {
+		cl, err := Dial(addr, testUser, "", &Options{TLS: false, BearerToken: "bad-token"})
+		if err == nil {
+			_ = cl.Close()
+			t.Fatal("Dial with a bad token: want auth error, got nil")
+		}
+		if !strings.Contains(err.Error(), "imap: oauthbearer:") {
+			t.Errorf("Dial error = %v, want it to wrap %q", err, "imap: oauthbearer:")
+		}
+	})
+}
+
+func TestSplitAddr(t *testing.T) {
+	tests := []struct {
+		addr     string
+		wantHost string
+		wantPort int
+	}{
+		{"mail.example.com:993", "mail.example.com", 993},
+		{"127.0.0.1:143", "127.0.0.1", 143},
+		{"no-port", "no-port", 0},
+	}
+	for _, tc := range tests {
+		host, port := splitAddr(tc.addr)
+		if host != tc.wantHost || port != tc.wantPort {
+			t.Errorf("splitAddr(%q) = (%q, %d), want (%q, %d)", tc.addr, host, port, tc.wantHost, tc.wantPort)
+		}
+	}
 }
 
 func dialTest(t *testing.T) *Client {

@@ -31,6 +31,9 @@ type recordingBackend struct {
 	// transaction that was not preceded by a matching AUTH.
 	requireUser string
 	requirePass string
+	// requireToken, when non-empty, makes the server advertise and require SASL
+	// OAUTHBEARER with this exact token instead of PLAIN.
+	requireToken string
 }
 
 func (b *recordingBackend) NewSession(_ *gosmtp.Conn) (gosmtp.Session, error) {
@@ -67,12 +70,27 @@ var (
 // (go-sasl ships only a PLAIN server implementation, so LOGIN cannot be
 // exercised server-side here.)
 func (s *recordingSession) AuthMechanisms() []string {
+	if s.be.requireToken != "" {
+		return []string{sasl.OAuthBearer}
+	}
 	return []string{sasl.Plain}
 }
 
 // Auth returns a server-side SASL handler that validates the credentials
-// against the backend's required user/pass.
+// against the backend's required user/pass (PLAIN) or token (OAUTHBEARER).
 func (s *recordingSession) Auth(mech string) (sasl.Server, error) {
+	if s.be.requireToken != "" {
+		if mech != sasl.OAuthBearer {
+			return nil, &gosmtp.SMTPError{Code: 504, Message: "unsupported auth mechanism"}
+		}
+		return sasl.NewOAuthBearerServer(func(opts sasl.OAuthBearerOptions) *sasl.OAuthBearerError {
+			if opts.Token != s.be.requireToken {
+				return &sasl.OAuthBearerError{Status: "invalid_token"}
+			}
+			s.authenticated = true
+			return nil
+		}), nil
+	}
 	if mech != sasl.Plain {
 		return nil, &gosmtp.SMTPError{Code: 504, Message: "unsupported auth mechanism"}
 	}
@@ -231,6 +249,47 @@ func TestSendWithAuth(t *testing.T) {
 			}
 			got := be.recorded()
 			if len(got) != 1 || got[0].from != from {
+				t.Fatalf("recorded %#v, want one message from %q", got, from)
+			}
+		})
+	}
+}
+
+func TestSendWithOAuthBearer(t *testing.T) {
+	tests := []struct {
+		name    string
+		token   string
+		wantErr bool
+	}{
+		{name: "valid token", token: "good-token"},
+		{name: "wrong token", token: "bad-token", wantErr: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			be := &recordingBackend{requireToken: "good-token"}
+			addr := startServer(t, be)
+
+			cl, err := Dial(addr, "alice@example.com", "", &Options{BearerToken: tc.token})
+			if tc.wantErr {
+				if err == nil {
+					_ = cl.Close()
+					t.Fatal("Dial: want auth error, got nil")
+				}
+				if !strings.Contains(err.Error(), "smtp: oauthbearer:") {
+					t.Errorf("Dial error = %v, want it to wrap %q", err, "smtp: oauthbearer:")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Dial: %v", err)
+			}
+			defer func() { _ = cl.Close() }()
+
+			from, to := "alice@example.com", []string{"bob@example.com"}
+			if err := cl.Send(context.Background(), from, to, []byte(sampleMessage)); err != nil {
+				t.Fatalf("Send: %v", err)
+			}
+			if got := be.recorded(); len(got) != 1 || got[0].from != from {
 				t.Fatalf("recorded %#v, want one message from %q", got, from)
 			}
 		})

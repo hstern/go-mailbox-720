@@ -9,6 +9,7 @@ import (
 
 	subjectid "github.com/hstern/go-subjectid"
 
+	"github.com/hstern/go-mailbox-720/internal/smtp"
 	"github.com/hstern/go-mailbox-720/internal/tokenexchange"
 )
 
@@ -54,7 +55,7 @@ type dialRecorder struct {
 	err    error
 }
 
-func (d *dialRecorder) dial(token string) (*fakeBackend, error) {
+func (d *dialRecorder) dial(_ subjectid.IssSubID, token string) (*fakeBackend, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.calls++
@@ -272,6 +273,79 @@ func TestPerIdentityNoLifetimeNotCached(t *testing.T) {
 	if dr.callCount() != 2 {
 		t.Errorf("dial called %d times, want 2 (uncacheable token re-dialed)", dr.callCount())
 	}
+}
+
+func TestPerIdentityDialerNeverCaches(t *testing.T) {
+	base := time.Date(2026, 6, 21, 12, 0, 0, 0, time.UTC)
+	now := base
+	// A long-lived token that the caching variant would reuse; the dialer must not.
+	ex := &fakeExchanger{tok: tokenexchange.Token{AccessToken: "exchanged", ExpiresAt: base.Add(time.Hour)}}
+	dr := &dialRecorder{}
+	p := newPerIdentityDialer[*fakeBackend](ex, "backend-aud", dr.dial)
+	configure(p, testID("alice"), true, testRaw, true, func() time.Time { return now })
+
+	if _, err := p.get(context.Background()); err != nil {
+		t.Fatalf("first get: %v", err)
+	}
+	now = base.Add(time.Minute) // well within the hour
+	if _, err := p.get(context.Background()); err != nil {
+		t.Fatalf("second get: %v", err)
+	}
+	if dr.callCount() != 2 {
+		t.Errorf("dial called %d times, want 2 (no-cache dialer must dial every request)", dr.callCount())
+	}
+}
+
+func TestPerIdentityDialReceivesIdentity(t *testing.T) {
+	var gotID subjectid.IssSubID
+	dial := func(id subjectid.IssSubID, _ string) (*fakeBackend, error) {
+		gotID = id
+		return &fakeBackend{}, nil
+	}
+	ex := &fakeExchanger{tok: tokenexchange.Token{AccessToken: "exchanged"}}
+	p := newPerIdentityDialer[*fakeBackend](ex, "backend-aud", dial)
+	configure(p, testID("alice"), true, testRaw, true, nil)
+
+	if _, err := p.get(context.Background()); err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if gotID != testID("alice") {
+		t.Errorf("dial received id %+v, want %+v", gotID, testID("alice"))
+	}
+}
+
+func TestSchedulingIdentityMailboxAddress(t *testing.T) {
+	p := newPerIdentityDialer[smtp.Sender](&fakeExchanger{}, "backend-aud", nil)
+	s := schedulingIdentityProvider{p: p}
+
+	t.Run("authenticated", func(t *testing.T) {
+		p.mailbox = func(context.Context) (subjectid.SubjectIdentifier, bool) {
+			return subjectid.IssSubID{Iss: testIss, Sub: "alice@example.com"}, true
+		}
+		addr, err := s.MailboxAddress(context.Background())
+		if err != nil {
+			t.Fatalf("MailboxAddress: %v", err)
+		}
+		if addr != "alice@example.com" {
+			t.Errorf("MailboxAddress = %q, want the subject %q", addr, "alice@example.com")
+		}
+	})
+
+	t.Run("unauthenticated", func(t *testing.T) {
+		p.mailbox = func(context.Context) (subjectid.SubjectIdentifier, bool) { return nil, false }
+		if _, err := s.MailboxAddress(context.Background()); err == nil {
+			t.Error("want error for an unauthenticated request")
+		}
+	})
+
+	t.Run("non-iss_sub identity", func(t *testing.T) {
+		p.mailbox = func(context.Context) (subjectid.SubjectIdentifier, bool) {
+			return subjectid.EmailID{Email: "alice@example.com"}, true
+		}
+		if _, err := s.MailboxAddress(context.Background()); err == nil {
+			t.Error("want error for a non-iss_sub identity")
+		}
+	})
 }
 
 func TestPerIdentityConcurrent(t *testing.T) {

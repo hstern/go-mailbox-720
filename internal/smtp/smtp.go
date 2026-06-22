@@ -11,13 +11,17 @@
 //
 // Connection security follows Options: implicit TLS (smtps, port 465),
 // STARTTLS upgrade from plaintext (submission, port 587), or plaintext (local
-// servers and tests only). When a username is supplied, Dial authenticates with
-// SASL PLAIN, falling back to LOGIN when the server advertises only LOGIN.
+// servers and tests only). Authentication follows Options too: a bearer token
+// selects SASL OAUTHBEARER (RFC 7628, the per-identity path); otherwise, when a
+// username is supplied, Dial authenticates with SASL PLAIN, falling back to LOGIN
+// when the server advertises only LOGIN.
 package smtp
 
 import (
 	"context"
 	"fmt"
+	"net"
+	"strconv"
 
 	"github.com/emersion/go-sasl"
 	gosmtp "github.com/emersion/go-smtp"
@@ -44,6 +48,12 @@ type Options struct {
 	// StartTLS dials plaintext and then issues STARTTLS to upgrade to TLS
 	// (submission, typically port 587).
 	StartTLS bool
+	// BearerToken, when non-empty, authenticates with SASL OAUTHBEARER (RFC 7628)
+	// using this token instead of SASL PLAIN/LOGIN — the per-identity path
+	// (MB720-43), where the token is an exchanged backend-audience access token. The
+	// Dial username becomes the OAUTHBEARER authorization identity and the Dial
+	// password is ignored.
+	BearerToken string
 }
 
 // Client is an SMTP-backed Sender over a single connection to a submission
@@ -76,7 +86,12 @@ func Dial(addr, username, password string, o *Options) (*Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("smtp: dial %s: %w", addr, err)
 	}
-	if username != "" {
+	if o.BearerToken != "" {
+		if err := authenticateBearer(c, addr, username, o.BearerToken); err != nil {
+			_ = c.Close()
+			return nil, err
+		}
+	} else if username != "" {
 		if err := authenticate(c, username, password); err != nil {
 			_ = c.Close()
 			return nil, err
@@ -94,6 +109,23 @@ func authenticate(c *gosmtp.Client, username, password string) error {
 	}
 	if err := c.Auth(auth); err != nil {
 		return fmt.Errorf("smtp: auth: %w", err)
+	}
+	return nil
+}
+
+// authenticateBearer logs in with SASL OAUTHBEARER (RFC 7628): username is the
+// authorization identity, token the exchanged backend-audience access token.
+func authenticateBearer(c *gosmtp.Client, addr, username, token string) error {
+	host, portStr, err := net.SplitHostPort(addr)
+	if err != nil {
+		host, portStr = addr, ""
+	}
+	port, _ := strconv.Atoi(portStr)
+	auth := sasl.NewOAuthBearerClient(&sasl.OAuthBearerOptions{
+		Username: username, Token: token, Host: host, Port: port,
+	})
+	if err := c.Auth(auth); err != nil {
+		return fmt.Errorf("smtp: oauthbearer: %w", err)
 	}
 	return nil
 }
