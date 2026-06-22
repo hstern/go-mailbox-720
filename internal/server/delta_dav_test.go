@@ -11,6 +11,14 @@ import (
 	"github.com/hstern/go-mailbox-720/internal/contacts"
 )
 
+// deltaEvent builds a minimal changed event carrying just a title — enough for the
+// delta handler to map it to a Graph event alongside the tombstone.
+func deltaEvent(title string) calendar.Event {
+	var e calendar.Event
+	e.Title = title
+	return e
+}
+
 type deltaCalendarBackend struct {
 	fakeCalendarBackend
 	changed []calendar.Event
@@ -38,7 +46,7 @@ type deltaResponse struct {
 func TestEventsDeltaHandlerEmitsTombstones(t *testing.T) {
 	backend := &deltaCalendarBackend{
 		fakeCalendarBackend: fakeCalendarBackend{calendars: []calendar.Calendar{{ID: "cal-1", Name: "Calendar"}}},
-		changed:             []calendar.Event{{Subject: "Standup"}},
+		changed:             []calendar.Event{deltaEvent("Standup")},
 		removed:             []string{"evt-gone"},
 		next:                "synctok",
 	}

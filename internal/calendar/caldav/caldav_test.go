@@ -2,11 +2,13 @@ package caldav
 
 import (
 	"bytes"
+	"sort"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/emersion/go-ical"
+	"github.com/hstern/go-jscalendar"
 
 	"github.com/hstern/go-mailbox-720/internal/calendar"
 )
@@ -50,51 +52,73 @@ func TestMapEventTimed(t *testing.T) {
 	}
 	e := mapEvent(&events[0])
 
-	if e.Subject != "Quarterly Planning" {
-		t.Errorf("Subject = %q, want %q", e.Subject, "Quarterly Planning")
+	if e.Title != "Quarterly Planning" {
+		t.Errorf("Title = %q, want %q", e.Title, "Quarterly Planning")
 	}
 	if e.UID != "event-123@example.com" {
 		t.Errorf("UID = %q, want %q", e.UID, "event-123@example.com")
 	}
-	if e.Location != "Conference Room B" {
-		t.Errorf("Location = %q, want %q", e.Location, "Conference Room B")
+	if loc := eventLocation(e); loc != "Conference Room B" {
+		t.Errorf("Location = %q, want %q", loc, "Conference Room B")
 	}
 	if e.Status != "confirmed" {
 		t.Errorf("Status = %q, want %q", e.Status, "confirmed")
 	}
-	if e.Body.ContentType != "text" || e.Body.Content != "Discuss roadmap and OKRs." {
-		t.Errorf("Body = %+v, want text/%q", e.Body, "Discuss roadmap and OKRs.")
+	if e.Description != "Discuss roadmap and OKRs." {
+		t.Errorf("Description = %q, want %q", e.Description, "Discuss roadmap and OKRs.")
 	}
-	if e.IsAllDay {
-		t.Error("IsAllDay = true, want false for a timed event")
+	if e.ShowWithoutTime {
+		t.Error("ShowWithoutTime = true, want false for a timed event")
 	}
 
 	wantStart := time.Date(2026, 6, 19, 13, 0, 0, 0, time.UTC)
-	if !e.Start.Equal(wantStart) {
-		t.Errorf("Start = %v, want %v", e.Start, wantStart)
+	if !e.StartTime().Equal(wantStart) {
+		t.Errorf("Start = %v, want %v", e.StartTime(), wantStart)
 	}
 	wantEnd := time.Date(2026, 6, 19, 14, 30, 0, 0, time.UTC)
-	if !e.End.Equal(wantEnd) {
-		t.Errorf("End = %v, want %v", e.End, wantEnd)
+	if !e.EndTime().Equal(wantEnd) {
+		t.Errorf("End = %v, want %v", e.EndTime(), wantEnd)
 	}
 	wantCreated := time.Date(2026, 6, 1, 9, 0, 0, 0, time.UTC)
-	if !e.CreatedAt.Equal(wantCreated) {
-		t.Errorf("CreatedAt = %v, want %v", e.CreatedAt, wantCreated)
+	if e.Created == nil || !e.Created.Time().Equal(wantCreated) {
+		t.Errorf("Created = %v, want %v", e.Created, wantCreated)
 	}
 
-	wantOrg := calendar.Address{Name: "Alice Smith", Email: "alice@example.com"}
-	if e.Organizer != wantOrg {
-		t.Errorf("Organizer = %+v, want %+v", e.Organizer, wantOrg)
+	org, ok := e.Organizer()
+	if !ok {
+		t.Fatal("Organizer() found = false, want the ORGANIZER participant")
 	}
-	if len(e.Attendees) != 2 {
-		t.Fatalf("got %d attendees, want 2", len(e.Attendees))
+	if org.Name != "Alice Smith" || calendar.ParticipantEmail(org) != "alice@example.com" {
+		t.Errorf("Organizer = name=%q email=%q, want Alice Smith/alice@example.com", org.Name, calendar.ParticipantEmail(org))
 	}
-	if got := e.Attendees[0]; got != (calendar.Attendee{Name: "Bob Jones", Email: "bob@example.com"}) {
-		t.Errorf("Attendees[0] = %+v", got)
+	atts := e.Attendees()
+	if len(atts) != 2 {
+		t.Fatalf("got %d attendees, want 2", len(atts))
 	}
-	if got := e.Attendees[1]; got != (calendar.Attendee{Name: "", Email: "carol@example.com"}) {
-		t.Errorf("Attendees[1] = %+v", got)
+	if atts[0].Name != "Bob Jones" || calendar.ParticipantEmail(atts[0]) != "bob@example.com" {
+		t.Errorf("Attendees[0] = name=%q email=%q", atts[0].Name, calendar.ParticipantEmail(atts[0]))
 	}
+	if atts[1].Name != "" || calendar.ParticipantEmail(atts[1]) != "carol@example.com" {
+		t.Errorf("Attendees[1] = name=%q email=%q", atts[1].Name, calendar.ParticipantEmail(atts[1]))
+	}
+}
+
+// eventLocation returns the first location's name from the JSCalendar Locations
+// map, the read-side counterpart of iCalendar's single LOCATION property.
+func eventLocation(e calendar.Event) string {
+	for _, k := range sortedLocationKeys(e) {
+		return e.Locations[k].Name
+	}
+	return ""
+}
+
+func sortedLocationKeys(e calendar.Event) []jscalendar.Id {
+	keys := make([]jscalendar.Id, 0, len(e.Locations))
+	for k := range e.Locations {
+		keys = append(keys, k)
+	}
+	sort.Slice(keys, func(i, j int) bool { return keys[i] < keys[j] })
+	return keys
 }
 
 const allDayEvent = `BEGIN:VCALENDAR
@@ -117,25 +141,25 @@ func TestMapEventAllDay(t *testing.T) {
 	}
 	e := mapEvent(&events[0])
 
-	if !e.IsAllDay {
-		t.Error("IsAllDay = false, want true for a VALUE=DATE event")
+	if !e.ShowWithoutTime {
+		t.Error("ShowWithoutTime = false, want true for a VALUE=DATE event")
 	}
-	if e.Subject != "Company Holiday" {
-		t.Errorf("Subject = %q", e.Subject)
+	if e.Title != "Company Holiday" {
+		t.Errorf("Title = %q", e.Title)
 	}
 	wantStart := time.Date(2026, 6, 20, 0, 0, 0, 0, time.UTC)
-	if !e.Start.Equal(wantStart) {
-		t.Errorf("Start = %v, want %v", e.Start, wantStart)
+	if !e.StartTime().Equal(wantStart) {
+		t.Errorf("Start = %v, want %v", e.StartTime(), wantStart)
 	}
 	// Absent optional fields map to zero values, not errors.
-	if e.Location != "" || e.Status != "" || e.Body.Content != "" {
-		t.Errorf("expected empty optional fields, got Location=%q Status=%q Body=%q", e.Location, e.Status, e.Body.Content)
+	if eventLocation(e) != "" || e.Status != "" || e.Description != "" {
+		t.Errorf("expected empty optional fields, got Location=%q Status=%q Description=%q", eventLocation(e), e.Status, e.Description)
 	}
-	if e.Organizer != (calendar.Address{Name: "", Email: ""}) {
-		t.Errorf("Organizer = %+v, want zero", e.Organizer)
+	if _, ok := e.Organizer(); ok {
+		t.Error("Organizer() found = true, want none")
 	}
-	if len(e.Attendees) != 0 {
-		t.Errorf("Attendees = %+v, want none", e.Attendees)
+	if len(e.Attendees()) != 0 {
+		t.Errorf("Attendees = %+v, want none", e.Attendees())
 	}
 }
 
@@ -166,21 +190,23 @@ func TestEventFromObjectNilCalendar(t *testing.T) {
 // through the read-path mapEvent must recover the event's fields, and the
 // encoded form must carry the required structural properties.
 func TestEventToICalRoundTrip(t *testing.T) {
-	want := calendar.Event{
-		UID:       "event-123@example.com",
-		Subject:   "Quarterly Planning",
-		Location:  "Conference Room B",
-		Sequence:  3,
-		Start:     time.Date(2026, 6, 19, 13, 0, 0, 0, time.UTC),
-		End:       time.Date(2026, 6, 19, 14, 30, 0, 0, time.UTC),
-		Organizer: calendar.Address{Name: "Alice Smith", Email: "alice@example.com"},
-		Attendees: []calendar.Attendee{
-			// Status (PARTSTAT) and ScheduleStatus (SCHEDULE-STATUS) both round-trip.
-			{Name: "Bob Jones", Email: "bob@example.com", Status: "accepted", ScheduleStatus: "1.1"},
-			{Email: "carol@example.com"},
-		},
-		Body: calendar.Body{ContentType: "text", Content: "Discuss roadmap and OKRs."},
-	}
+	want := calendar.Event{Event: jscalendar.Event{
+		UID:         "event-123@example.com",
+		Title:       "Quarterly Planning",
+		Sequence:    3,
+		Description: "Discuss roadmap and OKRs.",
+		Locations:   map[jscalendar.Id]jscalendar.Location{"1": {Type: "Location", Name: "Conference Room B"}},
+	}}
+	want.SetUTCTimes(
+		time.Date(2026, 6, 19, 13, 0, 0, 0, time.UTC),
+		time.Date(2026, 6, 19, 14, 30, 0, 0, time.UTC),
+	)
+	org := calendar.NewParticipant("Alice Smith", "alice@example.com", "", "owner")
+	// Attendee PARTSTAT round-trips (written as PARTSTAT=ACCEPTED, read back as the
+	// JSCalendar "accepted" participationStatus).
+	bob := calendar.NewParticipant("Bob Jones", "bob@example.com", "accepted", "attendee")
+	carol := calendar.NewParticipant("", "carol@example.com", "", "attendee")
+	want.SetOrganizerAttendees(&org, []jscalendar.Participant{bob, carol})
 
 	cal := eventToICal(want)
 
@@ -208,44 +234,82 @@ func TestEventToICalRoundTrip(t *testing.T) {
 	}
 	got := mapEvent(&events[0])
 
-	if got.Subject != want.Subject {
-		t.Errorf("Subject = %q, want %q", got.Subject, want.Subject)
+	if got.Title != want.Title {
+		t.Errorf("Title = %q, want %q", got.Title, want.Title)
 	}
 	if got.UID != want.UID {
 		t.Errorf("UID = %q, want %q", got.UID, want.UID)
 	}
-	if got.Location != want.Location {
-		t.Errorf("Location = %q, want %q", got.Location, want.Location)
+	if eventLocation(got) != "Conference Room B" {
+		t.Errorf("Location = %q, want %q", eventLocation(got), "Conference Room B")
 	}
 	if got.Sequence != want.Sequence {
 		t.Errorf("Sequence = %d, want %d", got.Sequence, want.Sequence)
 	}
-	if !got.Start.Equal(want.Start) {
-		t.Errorf("Start = %v, want %v", got.Start, want.Start)
+	if !got.StartTime().Equal(want.StartTime()) {
+		t.Errorf("Start = %v, want %v", got.StartTime(), want.StartTime())
 	}
-	if !got.End.Equal(want.End) {
-		t.Errorf("End = %v, want %v", got.End, want.End)
+	if !got.EndTime().Equal(want.EndTime()) {
+		t.Errorf("End = %v, want %v", got.EndTime(), want.EndTime())
 	}
-	if got.Body.Content != want.Body.Content {
-		t.Errorf("Body = %q, want %q", got.Body.Content, want.Body.Content)
+	if got.Description != want.Description {
+		t.Errorf("Description = %q, want %q", got.Description, want.Description)
 	}
-	if got.Organizer != want.Organizer {
-		t.Errorf("Organizer = %+v, want %+v", got.Organizer, want.Organizer)
+	gotOrg, ok := got.Organizer()
+	if !ok || gotOrg.Name != "Alice Smith" || calendar.ParticipantEmail(gotOrg) != "alice@example.com" {
+		t.Errorf("Organizer = %+v (ok=%v)", gotOrg, ok)
 	}
-	if len(got.Attendees) != len(want.Attendees) {
-		t.Fatalf("got %d attendees, want %d", len(got.Attendees), len(want.Attendees))
+	gotAtts := got.Attendees()
+	if len(gotAtts) != 2 {
+		t.Fatalf("got %d attendees, want 2", len(gotAtts))
 	}
-	for i := range want.Attendees {
-		if got.Attendees[i] != want.Attendees[i] {
-			t.Errorf("Attendees[%d] = %+v, want %+v", i, got.Attendees[i], want.Attendees[i])
-		}
+	if gotAtts[0].Name != "Bob Jones" || calendar.ParticipantEmail(gotAtts[0]) != "bob@example.com" || gotAtts[0].ParticipationStatus != "accepted" {
+		t.Errorf("Attendees[0] = name=%q email=%q partStat=%q", gotAtts[0].Name, calendar.ParticipantEmail(gotAtts[0]), gotAtts[0].ParticipationStatus)
+	}
+	if calendar.ParticipantEmail(gotAtts[1]) != "carol@example.com" {
+		t.Errorf("Attendees[1] email = %q, want carol@example.com", calendar.ParticipantEmail(gotAtts[1]))
+	}
+}
+
+// An attendee's RFC 6638 SCHEDULE-STATUS — the client-side scheduling delivery
+// outcome the server records onto the participant — must round-trip through the
+// CalDAV store so a later read recovers it. The go-jscalendar/ical bridge drops
+// it, so the adapter emits/reads the SCHEDULE-STATUS ATTENDEE parameter directly.
+func TestEventToICalScheduleStatusRoundTrip(t *testing.T) {
+	want := calendar.Event{Event: jscalendar.Event{UID: "sched@example.com", Title: "Sync"}}
+	want.SetUTCTimes(time.Date(2026, 6, 20, 9, 0, 0, 0, time.UTC), time.Date(2026, 6, 20, 9, 30, 0, 0, time.UTC))
+	org := calendar.NewParticipant("Alice", "alice@example.com", "", "owner")
+	bob := calendar.NewParticipant("Bob", "bob@example.com", "accepted", "attendee")
+	bob.ScheduleStatus = []string{"1.1"} // RFC 6638 REQUEST-STATUS: message sent
+	want.SetOrganizerAttendees(&org, []jscalendar.Participant{bob})
+
+	cal := eventToICal(want)
+	var buf strings.Builder
+	if err := ical.NewEncoder(&buf).Encode(cal); err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	if !strings.Contains(buf.String(), "SCHEDULE-STATUS=1.1") {
+		t.Errorf("encoded ATTENDEE missing SCHEDULE-STATUS=1.1:\n%s", buf.String())
+	}
+
+	events := cal.Events()
+	if len(events) != 1 {
+		t.Fatalf("got %d events, want 1", len(events))
+	}
+	got := mapEvent(&events[0])
+	gotAtts := got.Attendees()
+	if len(gotAtts) != 1 {
+		t.Fatalf("got %d attendees, want 1", len(gotAtts))
+	}
+	if ss := gotAtts[0].ScheduleStatus; len(ss) != 1 || ss[0] != "1.1" {
+		t.Errorf("ScheduleStatus = %v, want [1.1]", ss)
 	}
 }
 
 // CreateEvent mints a UID when the input event has none; eventToICal must then
 // still emit a UID (CalDAV resources require one).
 func TestEventToICalMintedUID(t *testing.T) {
-	cal := eventToICal(calendar.Event{UID: newUID(), Subject: "No UID supplied"})
+	cal := eventToICal(calendar.Event{Event: jscalendar.Event{UID: newUID(), Title: "No UID supplied"}})
 	events := cal.Events()
 	if len(events) != 1 {
 		t.Fatalf("got %d events, want 1", len(events))
@@ -281,8 +345,8 @@ END:VCALENDAR
 	if !ok {
 		t.Fatal("eventFromObject returned ok=false")
 	}
-	if e.Subject != "Series master" {
-		t.Errorf("Subject = %q, want %q (must pick the master VEVENT, not the override)", e.Subject, "Series master")
+	if e.Title != "Series master" {
+		t.Errorf("Title = %q, want %q (must pick the master VEVENT, not the override)", e.Title, "Series master")
 	}
 }
 
@@ -309,13 +373,13 @@ func TestEventObjectNameRejectsUnsafe(t *testing.T) {
 // display name (set as the CN parameter, which go-ical does not escape) must not
 // inject forged property lines into the encoded object.
 func TestEventToICalSanitizesCN(t *testing.T) {
-	e := calendar.Event{
-		UID:       "uid-1",
-		Subject:   "Meeting",
-		Start:     time.Date(2026, 6, 19, 9, 0, 0, 0, time.UTC),
-		End:       time.Date(2026, 6, 19, 10, 0, 0, 0, time.UTC),
-		Organizer: calendar.Address{Name: "Evil\r\nX-INJECTED:yes\r\nORGANIZER;CN=foo", Email: "evil@example.com"},
-	}
+	e := calendar.Event{Event: jscalendar.Event{UID: "uid-1", Title: "Meeting"}}
+	e.SetUTCTimes(
+		time.Date(2026, 6, 19, 9, 0, 0, 0, time.UTC),
+		time.Date(2026, 6, 19, 10, 0, 0, 0, time.UTC),
+	)
+	org := calendar.NewParticipant("Evil\r\nX-INJECTED:yes\r\nORGANIZER;CN=foo", "evil@example.com", "", "owner")
+	e.SetOrganizerAttendees(&org, nil)
 	var buf bytes.Buffer
 	if err := ical.NewEncoder(&buf).Encode(eventToICal(e)); err != nil {
 		t.Fatalf("encode: %v", err)

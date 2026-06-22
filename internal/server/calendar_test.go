@@ -7,6 +7,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/hstern/go-jscalendar"
+
 	"github.com/hstern/go-mailbox-720/internal/calendar"
 	"github.com/hstern/go-mailbox-720/internal/graph/api"
 )
@@ -56,23 +58,23 @@ func (p fakeCalendarProvider) Calendar(_ context.Context) (calendar.Backend, err
 func newCalendarFixture() *fakeCalendarBackend {
 	start := time.Date(2026, 6, 19, 14, 0, 0, 0, time.UTC)
 	end := start.Add(time.Hour)
+
+	e := calendar.Event{ID: "evt-1"}
+	e.Title = "Standup"
+	e.SetUTCTimes(start, end)
+	setEventLocation(&e, "Room 1")
+	org := calendar.NewParticipant("Alice", "alice@example.com", "", "owner")
+	e.SetOrganizerAttendees(&org, []jscalendar.Participant{
+		calendar.NewParticipant("Bob", "bob@example.com", "", "attendee"),
+	})
+
 	return &fakeCalendarBackend{
 		calendars: []calendar.Calendar{
 			{ID: "cal-primary", Name: "Calendar"},
 			{ID: "cal-work", Name: "Work"},
 		},
 		events: map[string][]calendar.Event{
-			"cal-primary": {
-				{
-					ID:        "evt-1",
-					Subject:   "Standup",
-					Start:     start,
-					End:       end,
-					Location:  "Room 1",
-					Organizer: calendar.Address{Name: "Alice", Email: "alice@example.com"},
-					Attendees: []calendar.Attendee{{Name: "Bob", Email: "bob@example.com"}},
-				},
-			},
+			"cal-primary": {e},
 		},
 	}
 }
@@ -102,6 +104,12 @@ func TestMeListEventsMapsGraphEvents(t *testing.T) {
 	if got := ev.Start.Value.DateTime.Or(""); got != "2026-06-19T14:00:00.0000000" {
 		t.Errorf("start dateTime = %q, want 2026-06-19T14:00:00.0000000", got)
 	}
+	// A UTC-input event reports the canonical UTC zone id "Etc/UTC" (SetUTCTimes
+	// stamps that zone); the tz-preservation change surfaces a real named zone
+	// instead of collapsing it (see TestToGraphEventPreservesNamedTimeZone).
+	if got := ev.Start.Value.TimeZone.Or(""); got != "Etc/UTC" {
+		t.Errorf("start timeZone = %q, want Etc/UTC", got)
+	}
 	if got := ev.End.Value.DateTime.Or(""); got != "2026-06-19T15:00:00.0000000" {
 		t.Errorf("end dateTime = %q, want 2026-06-19T15:00:00.0000000", got)
 	}
@@ -110,6 +118,44 @@ func TestMeListEventsMapsGraphEvents(t *testing.T) {
 	}
 	if !backend.closed {
 		t.Errorf("backend not closed")
+	}
+}
+
+// TestToGraphEventPreservesNamedTimeZone is the point of the JSCalendar pivot
+// (MB720-49): an event carrying a real IANA zone must surface that zone on the
+// Graph dateTimeTimeZone pair rather than collapsing to UTC, while the wall-clock
+// dateTime stays in that zone. A UTC event (above) still reports "UTC" — only the
+// real-zone case changed.
+func TestToGraphEventPreservesNamedTimeZone(t *testing.T) {
+	var e calendar.Event
+	e.ID = "evt-tz"
+	e.Title = "Berlin sync"
+	// 09:00 Europe/Berlin (no UTC collapse): the dateTime stays 09:00 and the zone
+	// name travels in the sibling timeZone field.
+	e.Start = &jscalendar.LocalDateTime{Year: 2026, Month: 6, Day: 19, Hour: 9}
+	e.TimeZone = "Europe/Berlin"
+	e.Duration = &jscalendar.Duration{Hours: 1}
+
+	ge := toGraphEvent(e)
+	start, ok := ge.Start.Get()
+	if !ok {
+		t.Fatal("start not set")
+	}
+	if got := start.DateTime.Or(""); got != "2026-06-19T09:00:00.0000000" {
+		t.Errorf("start dateTime = %q, want 2026-06-19T09:00:00.0000000 (zone-local, not UTC)", got)
+	}
+	if got := start.TimeZone.Or(""); got != "Europe/Berlin" {
+		t.Errorf("start timeZone = %q, want Europe/Berlin (preserved, not UTC)", got)
+	}
+	end, ok := ge.End.Get()
+	if !ok {
+		t.Fatal("end not set")
+	}
+	if got := end.DateTime.Or(""); got != "2026-06-19T10:00:00.0000000" {
+		t.Errorf("end dateTime = %q, want 2026-06-19T10:00:00.0000000 (zone-local)", got)
+	}
+	if got := end.TimeZone.Or(""); got != "Europe/Berlin" {
+		t.Errorf("end timeZone = %q, want Europe/Berlin", got)
 	}
 }
 

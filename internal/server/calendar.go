@@ -4,13 +4,19 @@ import (
 	"context"
 	"fmt"
 	"net/http"
-	"time"
 
 	ht "github.com/ogen-go/ogen/http"
+
+	"github.com/hstern/go-jscalendar"
 
 	"github.com/hstern/go-mailbox-720/internal/calendar"
 	"github.com/hstern/go-mailbox-720/internal/graph/api"
 )
+
+// jscalParticipant aliases the JSCalendar participant the neutral calendar.Event
+// now carries, so the Graph-mapping helpers in this package read without repeating
+// the package-qualified name.
+type jscalParticipant = jscalendar.Participant
 
 // CalendarProvider yields a calendar.Backend for an authenticated request. The
 // static implementation lives in cmd/mailboxd; per-identity providers (mapping
@@ -134,64 +140,90 @@ func (h Handler) MeGetCalendars(ctx context.Context, params api.MeGetCalendarsPa
 	return nil, ht.ErrNotImplemented
 }
 
-// toGraphEvent maps the neutral calendar.Event onto the generated Graph type.
+// toGraphEvent maps the neutral calendar.Event (an embedded jscalendar.Event plus
+// our routing IDs) onto the generated Graph type. Times are emitted via the
+// tz-preserving StartGraph/EndGraph helpers (RFC 8984 named zones survive rather
+// than collapsing to UTC); participants, recurrence, and body come from the
+// JSCalendar accessors in internal/calendar.
 func toGraphEvent(e calendar.Event) api.MicrosoftGraphEvent {
 	ge := api.MicrosoftGraphEvent{
 		ID:        api.NewOptString(e.ID),
-		Subject:   api.NewOptNilString(e.Subject),
-		IsAllDay:  api.NewOptNilBool(e.IsAllDay),
-		Attendees: toGraphAttendees(e.Attendees),
+		Subject:   api.NewOptNilString(e.Title),
+		IsAllDay:  api.NewOptNilBool(e.ShowWithoutTime),
+		Attendees: toGraphAttendees(e.Attendees()),
 	}
-	if !e.Start.IsZero() {
-		ge.Start = api.NewOptMicrosoftGraphDateTimeTimeZone(graphDateTime(e.Start))
+	if dt, zone, ok := e.StartGraph(); ok {
+		ge.Start = api.NewOptMicrosoftGraphDateTimeTimeZone(graphDateTime(dt, zone))
 	}
-	if !e.End.IsZero() {
-		ge.End = api.NewOptMicrosoftGraphDateTimeTimeZone(graphDateTime(e.End))
+	if dt, zone, ok := e.EndGraph(); ok {
+		ge.End = api.NewOptMicrosoftGraphDateTimeTimeZone(graphDateTime(dt, zone))
 	}
-	if !e.CreatedAt.IsZero() {
-		ge.CreatedDateTime = api.NewOptNilDateTime(e.CreatedAt)
+	if e.Created != nil {
+		ge.CreatedDateTime = api.NewOptNilDateTime(e.Created.Time())
 	}
-	if e.Location != "" {
+	if loc := eventLocation(e); loc != "" {
 		ge.Location = api.NewOptMicrosoftGraphLocation(api.MicrosoftGraphLocation{
-			DisplayName: api.NewOptNilString(e.Location),
+			DisplayName: api.NewOptNilString(loc),
 		})
 	}
-	if e.Organizer.Email != "" {
-		ge.Organizer = api.NewOptMicrosoftGraphRecipient(toCalendarRecipient(e.Organizer))
+	if org, ok := e.Organizer(); ok && calendar.ParticipantEmail(org) != "" {
+		ge.Organizer = api.NewOptMicrosoftGraphRecipient(toGraphRecipient(org))
 	}
-	if e.Body.Content != "" {
+	if e.Description != "" {
 		ge.Body = api.NewOptMicrosoftGraphItemBody(api.MicrosoftGraphItemBody{
-			Content:     api.NewOptNilString(e.Body.Content),
-			ContentType: api.NewOptMicrosoftGraphBodyType(graphBodyType(e.Body.ContentType)),
+			Content:     api.NewOptNilString(e.Description),
+			ContentType: api.NewOptMicrosoftGraphBodyType(graphBodyType(neutralBodyKind(e.DescriptionContentType))),
 		})
 	}
-	if pr, ok := graphRecurrence(e.Recurrence, e.Start); ok {
+	if pr, ok := graphRecurrence(e); ok {
 		ge.Recurrence = api.NewOptMicrosoftGraphPatternedRecurrence(pr)
 	}
 	ge.Type = api.NewOptMicrosoftGraphEventType(graphEventType(e))
 	return ge
 }
 
-// graphDateTime maps an instant onto the Graph dateTimeTimeZone shape. CalDAV
-// instants are normalized to UTC by the port, so the time zone is reported as
-// UTC and the date-time is rendered in the Graph format ({date}T{time}).
-func graphDateTime(t time.Time) api.MicrosoftGraphDateTimeTimeZone {
+// graphDateTime wraps a Graph dateTime string + IANA zone name (as produced by
+// Event.StartGraph/EndGraph) in the Graph dateTimeTimeZone shape. Unlike the
+// UTC-only pivot it replaces, the event's named time zone is carried through.
+func graphDateTime(dateTime, timeZone string) api.MicrosoftGraphDateTimeTimeZone {
 	return api.MicrosoftGraphDateTimeTimeZone{
-		DateTime: api.NewOptString(t.UTC().Format("2006-01-02T15:04:05.0000000")),
-		TimeZone: api.NewOptNilString("UTC"),
+		DateTime: api.NewOptString(dateTime),
+		TimeZone: api.NewOptNilString(timeZone),
 	}
 }
 
-func toCalendarRecipient(a calendar.Address) api.MicrosoftGraphRecipient {
+// eventLocation returns the display name of the event's first location, or "" when
+// it has none. The neutral model carries a map of locations keyed by JSCalendar Id;
+// the Graph single-location surface takes the one we build under key "1".
+func eventLocation(e calendar.Event) string {
+	if loc, ok := e.Locations["1"]; ok {
+		return loc.Name
+	}
+	for _, loc := range e.Locations {
+		return loc.Name
+	}
+	return ""
+}
+
+// neutralBodyKind reduces a JSCalendar descriptionContentType media type (e.g.
+// "text/html", "text/plain") to the "html"/"text" token graphBodyType expects.
+func neutralBodyKind(mediaType string) string {
+	if mediaType == "text/html" || mediaType == "html" {
+		return "html"
+	}
+	return "text"
+}
+
+func toGraphRecipient(p jscalParticipant) api.MicrosoftGraphRecipient {
 	return api.MicrosoftGraphRecipient{
 		EmailAddress: api.NewOptMicrosoftGraphEmailAddress(api.MicrosoftGraphEmailAddress{
-			Name:    api.NewOptNilString(a.Name),
-			Address: api.NewOptNilString(a.Email),
+			Name:    api.NewOptNilString(p.Name),
+			Address: api.NewOptNilString(calendar.ParticipantEmail(p)),
 		}),
 	}
 }
 
-func toGraphAttendees(as []calendar.Attendee) []api.MicrosoftGraphAttendee {
+func toGraphAttendees(as []jscalParticipant) []api.MicrosoftGraphAttendee {
 	if len(as) == 0 {
 		return nil
 	}
@@ -200,13 +232,13 @@ func toGraphAttendees(as []calendar.Attendee) []api.MicrosoftGraphAttendee {
 		att := api.MicrosoftGraphAttendee{
 			EmailAddress: api.NewOptMicrosoftGraphEmailAddress(api.MicrosoftGraphEmailAddress{
 				Name:    api.NewOptNilString(a.Name),
-				Address: api.NewOptNilString(a.Email),
+				Address: api.NewOptNilString(calendar.ParticipantEmail(a)),
 			}),
 		}
-		// The neutral status uses the same tokens as Graph's responseStatus.response.
-		if a.Status != "" {
+		// Map the JSCalendar participationStatus onto Graph's responseStatus.response.
+		if a.ParticipationStatus != "" {
 			att.Status = api.NewOptMicrosoftGraphResponseStatus(api.MicrosoftGraphResponseStatus{
-				Response: api.NewOptMicrosoftGraphResponseType(api.MicrosoftGraphResponseType(a.Status)),
+				Response: api.NewOptMicrosoftGraphResponseType(api.MicrosoftGraphResponseType(calendar.PartStatToResponse(a.ParticipationStatus))),
 			})
 		}
 		out = append(out, att)

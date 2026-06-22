@@ -30,11 +30,11 @@ func TestToCalendarEventScalars(t *testing.T) {
 	if got.ID != "e1" || got.CalendarID != "c1" {
 		t.Fatalf("ids: %+v", got)
 	}
-	if got.UID != "uid-1" || got.Subject != "Standup" || got.Status != "confirmed" {
+	if got.UID != "uid-1" || got.Title != "Standup" || got.Status != "confirmed" {
 		t.Fatalf("fields: %+v", got)
 	}
-	if got.Body.Content != "daily" || got.Sequence != 2 {
-		t.Fatalf("body/seq: %+v", got)
+	if got.Description != "daily" || got.Sequence != 2 {
+		t.Fatalf("description/seq: %+v", got)
 	}
 }
 
@@ -53,19 +53,27 @@ func TestToCalendarEventRecurrenceRRULE(t *testing.T) {
 	if err != nil {
 		t.Fatalf("toCalendarEvent: %v", err)
 	}
-	if got.Recurrence == nil || got.Recurrence.RRULE == "" {
-		t.Fatalf("recurrence not mapped: %+v", got.Recurrence)
+	// The structured recurrence rules carry over verbatim on the embedded Event.
+	if len(got.RecurrenceRules) != 1 {
+		t.Fatalf("recurrence not mapped: %+v", got.RecurrenceRules)
 	}
-	// RRULE string should carry the weekly Monday rule.
-	if want := "FREQ=WEEKLY"; !strings.Contains(got.Recurrence.RRULE, want) {
-		t.Fatalf("RRULE %q missing %q", got.Recurrence.RRULE, want)
+	if got.RecurrenceRules[0].Frequency != "weekly" {
+		t.Fatalf("frequency = %q, want weekly", got.RecurrenceRules[0].Frequency)
+	}
+	// And they still render to an RFC 5545 RRULE via the shared helper.
+	rrule, err := calendar.RRULEFromRules(got.Start, got.TimeZone, got.RecurrenceRules)
+	if err != nil {
+		t.Fatalf("RRULEFromRules: %v", err)
+	}
+	if want := "FREQ=WEEKLY"; !strings.Contains(rrule, want) {
+		t.Fatalf("RRULE %q missing %q", rrule, want)
 	}
 }
 
-// TestToCalendarEventStartEndLocationAttendees exercises the previously-untested
-// Start, End (via Duration), IsAllDay, Location, and Attendees fields.
-// It also asserts that two-participant events produce a deterministic Attendees
-// slice regardless of map iteration order.
+// TestToCalendarEventStartEndLocationAttendees exercises Start, End (via
+// Duration), IsAllDay (ShowWithoutTime), Locations, and Participants on the
+// embedded JSCalendar Event. It also asserts that two-participant events produce
+// a deterministic Attendees slice regardless of map iteration order.
 func TestToCalendarEventStartEndLocationAttendees(t *testing.T) {
 	dur := jscalendar.Duration{Hours: 1, Minutes: 30}
 	ev := &jscalendar.Event{
@@ -78,7 +86,7 @@ func TestToCalendarEventStartEndLocationAttendees(t *testing.T) {
 		},
 		Participants: map[jscalendar.Id]jscalendar.Participant{
 			// Two participants with keys that sort "p2" before "p1" — ensures
-			// we are actually sorting, not just getting lucky with map order.
+			// the shared accessors actually sort, not just get lucky with map order.
 			"p2": {Name: "Bob", Email: "bob@example.com", Roles: map[string]bool{"attendee": true}, ParticipationStatus: "accepted"},
 			"p1": {Name: "Alice", Email: "alice@example.com", Roles: map[string]bool{"owner": true, "attendee": true}, ParticipationStatus: "accepted"},
 		},
@@ -91,63 +99,64 @@ func TestToCalendarEventStartEndLocationAttendees(t *testing.T) {
 		t.Fatalf("toCalendarEvent: %v", err)
 	}
 
-	// Start should be 2026-06-15T10:00:00Z (floating, treated as UTC).
+	// StartTime resolves to 2026-06-15T10:00:00Z (floating, treated as UTC).
 	wantStart := time.Date(2026, 6, 15, 10, 0, 0, 0, time.UTC)
-	if !got.Start.Equal(wantStart) {
-		t.Errorf("Start: got %v, want %v", got.Start, wantStart)
+	if !got.StartTime().Equal(wantStart) {
+		t.Errorf("StartTime: got %v, want %v", got.StartTime(), wantStart)
 	}
 
-	// End = Start + 1h30m.
+	// EndTime = Start + 1h30m.
 	wantEnd := wantStart.Add(90 * time.Minute)
-	if !got.End.Equal(wantEnd) {
-		t.Errorf("End: got %v, want %v", got.End, wantEnd)
+	if !got.EndTime().Equal(wantEnd) {
+		t.Errorf("EndTime: got %v, want %v", got.EndTime(), wantEnd)
 	}
 
-	// IsAllDay maps ShowWithoutTime.
-	if !got.IsAllDay {
-		t.Errorf("IsAllDay: got false, want true")
+	// ShowWithoutTime carries the all-day flag.
+	if !got.ShowWithoutTime {
+		t.Errorf("ShowWithoutTime: got false, want true")
 	}
 
 	// Location: the single location's Name.
-	if got.Location != "Room A" {
-		t.Errorf("Location: got %q, want %q", got.Location, "Room A")
+	if got.Locations["loc1"].Name != "Room A" {
+		t.Errorf("Location: got %q, want %q", got.Locations["loc1"].Name, "Room A")
 	}
 
 	// Attendees must be in sorted participant-key order: p1 (Alice) then p2 (Bob).
-	if len(got.Attendees) != 2 {
-		t.Fatalf("Attendees len: got %d, want 2", len(got.Attendees))
+	attendees := got.Attendees()
+	if len(attendees) != 2 {
+		t.Fatalf("Attendees len: got %d, want 2", len(attendees))
 	}
-	if got.Attendees[0].Email != "alice@example.com" {
-		t.Errorf("Attendees[0].Email: got %q, want %q", got.Attendees[0].Email, "alice@example.com")
+	if calendar.ParticipantEmail(attendees[0]) != "alice@example.com" {
+		t.Errorf("Attendees[0] email: got %q, want %q", calendar.ParticipantEmail(attendees[0]), "alice@example.com")
 	}
-	if got.Attendees[1].Email != "bob@example.com" {
-		t.Errorf("Attendees[1].Email: got %q, want %q", got.Attendees[1].Email, "bob@example.com")
+	if calendar.ParticipantEmail(attendees[1]) != "bob@example.com" {
+		t.Errorf("Attendees[1] email: got %q, want %q", calendar.ParticipantEmail(attendees[1]), "bob@example.com")
 	}
-	if got.Attendees[0].Status != "accepted" || got.Attendees[1].Status != "accepted" {
+	if attendees[0].ParticipationStatus != "accepted" || attendees[1].ParticipationStatus != "accepted" {
 		t.Errorf("Attendees statuses: got %v/%v, want accepted/accepted",
-			got.Attendees[0].Status, got.Attendees[1].Status)
+			attendees[0].ParticipationStatus, attendees[1].ParticipationStatus)
 	}
 
 	// Organizer should be the owner participant (Alice, key p1).
-	if got.Organizer.Email != "alice@example.com" {
-		t.Errorf("Organizer.Email: got %q, want %q", got.Organizer.Email, "alice@example.com")
+	org, ok := got.Organizer()
+	if !ok || calendar.ParticipantEmail(org) != "alice@example.com" {
+		t.Errorf("Organizer email: got %q (ok=%v), want %q", calendar.ParticipantEmail(org), ok, "alice@example.com")
 	}
 }
 
-// TestParticipantRoundTrip verifies that a calendar.Event with an Organizer and
-// two Attendees survives fromCalendarEvent → toCalendarEvent with no data loss
-// and no duplication: the organizer must NOT appear in the Attendees slice.
+// TestParticipantRoundTrip verifies that an Event with an Organizer and two
+// Attendees survives fromCalendarEvent → toCalendarEvent with no data loss: the
+// organizer holds the "owner" role and the two attendees hold "attendee".
 func TestParticipantRoundTrip(t *testing.T) {
-	in := calendar.Event{
-		UID:        "uid-rt",
-		CalendarID: "c1",
-		Subject:    "Participant Round-Trip",
-		Organizer:  calendar.Address{Name: "Org Person", Email: "org@example.com"},
-		Attendees: []calendar.Attendee{
-			{Name: "Alice Attendee", Email: "alice@example.com", Status: "accepted"},
-			{Name: "Bob Attendee", Email: "bob@example.com", Status: "declined"},
-		},
+	organizer := calendar.NewParticipant("Org Person", "org@example.com", "", "owner")
+	attendees := []jscalendar.Participant{
+		calendar.NewParticipant("Alice Attendee", "alice@example.com", "accepted", "attendee"),
+		calendar.NewParticipant("Bob Attendee", "bob@example.com", "declined", "attendee"),
 	}
+	in := calendar.Event{CalendarID: "c1"}
+	in.UID = "uid-rt"
+	in.Title = "Participant Round-Trip"
+	in.SetOrganizerAttendees(&organizer, attendees)
 
 	ce, err := fromCalendarEvent(in)
 	if err != nil {
@@ -159,48 +168,46 @@ func TestParticipantRoundTrip(t *testing.T) {
 	}
 
 	// Organizer must be preserved.
-	if got.Organizer.Email != "org@example.com" {
-		t.Errorf("Organizer.Email: got %q, want %q", got.Organizer.Email, "org@example.com")
+	org, ok := got.Organizer()
+	if !ok {
+		t.Fatalf("organizer missing")
 	}
-	if got.Organizer.Name != "Org Person" {
-		t.Errorf("Organizer.Name: got %q, want %q", got.Organizer.Name, "Org Person")
+	if calendar.ParticipantEmail(org) != "org@example.com" {
+		t.Errorf("Organizer email: got %q, want %q", calendar.ParticipantEmail(org), "org@example.com")
 	}
-
-	// Exactly 2 attendees — the organizer must NOT appear in Attendees.
-	if len(got.Attendees) != 2 {
-		t.Fatalf("Attendees len: got %d, want 2 (got: %v)", len(got.Attendees), got.Attendees)
-	}
-	for _, a := range got.Attendees {
-		if a.Email == "org@example.com" {
-			t.Errorf("organizer email %q must not appear in Attendees", "org@example.com")
-		}
+	if org.Name != "Org Person" {
+		t.Errorf("Organizer name: got %q, want %q", org.Name, "Org Person")
 	}
 
-	// Find each attendee by email and check status.
-	byEmail := make(map[string]calendar.Attendee, len(got.Attendees))
-	for _, a := range got.Attendees {
-		byEmail[a.Email] = a
+	// Exactly 2 attendees.
+	gotAttendees := got.Attendees()
+	if len(gotAttendees) != 2 {
+		t.Fatalf("Attendees len: got %d, want 2", len(gotAttendees))
+	}
+
+	byEmail := make(map[string]jscalendar.Participant, len(gotAttendees))
+	for _, a := range gotAttendees {
+		byEmail[calendar.ParticipantEmail(a)] = a
 	}
 	if a, ok := byEmail["alice@example.com"]; !ok {
 		t.Errorf("alice@example.com missing from Attendees")
-	} else if a.Status != "accepted" {
-		t.Errorf("alice status: got %q, want %q", a.Status, "accepted")
+	} else if a.ParticipationStatus != "accepted" {
+		t.Errorf("alice status: got %q, want %q", a.ParticipationStatus, "accepted")
 	}
 	if a, ok := byEmail["bob@example.com"]; !ok {
 		t.Errorf("bob@example.com missing from Attendees")
-	} else if a.Status != "declined" {
-		t.Errorf("bob status: got %q, want %q", a.Status, "declined")
+	} else if a.ParticipationStatus != "declined" {
+		t.Errorf("bob status: got %q, want %q", a.ParticipationStatus, "declined")
 	}
 }
 
 func TestFromCalendarEventRoundTrip(t *testing.T) {
-	in := calendar.Event{
-		UID:        "uid-3",
-		CalendarID: "c1",
-		Subject:    "Review",
-		Status:     "tentative",
-		Body:       calendar.Body{ContentType: "text", Content: "notes"},
-	}
+	in := calendar.Event{CalendarID: "c1"}
+	in.UID = "uid-3"
+	in.Title = "Review"
+	in.Status = "tentative"
+	in.Description = "notes"
+
 	ce, err := fromCalendarEvent(in)
 	if err != nil {
 		t.Fatalf("fromCalendarEvent: %v", err)
@@ -210,5 +217,8 @@ func TestFromCalendarEventRoundTrip(t *testing.T) {
 	}
 	if !ce.CalendarIDs["c1"] {
 		t.Fatalf("calendarIds: %+v", ce.CalendarIDs)
+	}
+	if ce.Description != "notes" {
+		t.Fatalf("description: %q", ce.Description)
 	}
 }

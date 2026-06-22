@@ -4,10 +4,20 @@ import (
 	"context"
 	"net/http"
 	"testing"
-	"time"
+
+	"github.com/hstern/go-jscalendar"
 
 	"github.com/hstern/go-mailbox-720/internal/calendar"
 )
+
+// titledEvent builds a calendar.Event with the given Title and UID set on its
+// embedded JSCalendar Event, plus the opaque store ID.
+func titledEvent(id, uid, title string) calendar.Event {
+	e := calendar.Event{ID: id}
+	e.UID = uid
+	e.Title = title
+	return e
+}
 
 func TestCreateEvent(t *testing.T) {
 	cl := dialTest(t, func(w http.ResponseWriter, body map[string]any) {
@@ -31,10 +41,7 @@ func TestCreateEvent(t *testing.T) {
 		})
 	})
 
-	e := calendar.Event{
-		Subject: "New Event",
-		UID:     "u9",
-	}
+	e := titledEvent("", "u9", "New Event")
 	created, err := cl.CreateEvent(context.Background(), "cal1", e)
 	if err != nil {
 		t.Fatalf("CreateEvent: %v", err)
@@ -66,10 +73,7 @@ func TestCreateEventNilCreated(t *testing.T) {
 		})
 	})
 
-	e := calendar.Event{
-		Subject: "New Event",
-		UID:     "u9",
-	}
+	e := titledEvent("", "u9", "New Event")
 	// With a nil created response we fall back to the sent event; we cannot
 	// return a server-assigned ID because the server returned null. The call
 	// should not error, and the returned ID must be empty (known limitation:
@@ -101,7 +105,7 @@ func TestCreateEventRejected(t *testing.T) {
 		})
 	})
 
-	e := calendar.Event{Subject: "Bad Event"}
+	e := titledEvent("", "", "Bad Event")
 	_, err := cl.CreateEvent(context.Background(), "cal1", e)
 	if err == nil {
 		t.Fatal("CreateEvent: expected error for notCreated, got nil")
@@ -126,11 +130,7 @@ func TestUpdateEvent(t *testing.T) {
 		})
 	})
 
-	e := calendar.Event{
-		ID:      "e1",
-		Subject: "Updated Event",
-		UID:     "u1",
-	}
+	e := titledEvent("e1", "u1", "Updated Event")
 	updated, err := cl.UpdateEvent(context.Background(), e)
 	if err != nil {
 		t.Fatalf("UpdateEvent: %v", err)
@@ -159,7 +159,7 @@ func TestUpdateEventRejected(t *testing.T) {
 		})
 	})
 
-	e := calendar.Event{ID: "e1", Subject: "Conflict Event"}
+	e := titledEvent("e1", "", "Conflict Event")
 	_, err := cl.UpdateEvent(context.Background(), e)
 	if err == nil {
 		t.Fatal("UpdateEvent: expected error for notUpdated, got nil")
@@ -249,13 +249,10 @@ func TestWriteInstanceOverride(t *testing.T) {
 		})
 	})
 
-	rid := time.Date(2024, 3, 15, 10, 0, 0, 0, time.UTC)
-	override := calendar.Event{
-		ID:             "e1_i0",
-		Subject:        "Override Title",
-		RecurrenceID:   rid,
-		SeriesMasterID: "e1",
-	}
+	override := calendar.Event{ID: "e1_i0", SeriesMasterID: "e1"}
+	override.Title = "Override Title"
+	override.RecurrenceID = &jscalendar.LocalDateTime{Year: 2024, Month: 3, Day: 15, Hour: 10}
+	override.RecurrenceIDTimeZone = "Etc/UTC"
 	got, err := cl.WriteInstanceOverride(context.Background(), "e1", override)
 	if err != nil {
 		t.Fatalf("WriteInstanceOverride: %v", err)
@@ -285,14 +282,12 @@ func TestWriteInstanceOverrideNoRecurrenceID(t *testing.T) {
 		http.Error(w, "unexpected call", http.StatusBadRequest)
 	})
 
-	override := calendar.Event{
-		ID:      "e1_i0",
-		Subject: "Should Not Send",
-		// RecurrenceID deliberately zero
-	}
+	override := calendar.Event{ID: "e1_i0"}
+	override.Title = "Should Not Send"
+	// RecurrenceID deliberately nil
 	_, err := cl.WriteInstanceOverride(context.Background(), "e1", override)
 	if err == nil {
-		t.Fatal("expected error for zero RecurrenceID, got nil")
+		t.Fatal("expected error for nil RecurrenceID, got nil")
 	}
 	if called {
 		t.Error("HTTP handler was called despite zero RecurrenceID — expected early return")
@@ -308,12 +303,10 @@ func TestWriteInstanceOverrideNoID(t *testing.T) {
 		http.Error(w, "unexpected call", http.StatusBadRequest)
 	})
 
-	rid := time.Date(2024, 3, 15, 10, 0, 0, 0, time.UTC)
-	override := calendar.Event{
-		// ID deliberately empty
-		Subject:      "No ID Event",
-		RecurrenceID: rid,
-	}
+	override := calendar.Event{} // ID deliberately empty
+	override.Title = "No ID Event"
+	override.RecurrenceID = &jscalendar.LocalDateTime{Year: 2024, Month: 3, Day: 15, Hour: 10}
+	override.RecurrenceIDTimeZone = "Etc/UTC"
 	_, err := cl.WriteInstanceOverride(context.Background(), "e1", override)
 	if err == nil {
 		t.Fatal("expected error for empty override.ID, got nil")
@@ -345,12 +338,10 @@ func TestWriteInstanceOverrideNilEcho(t *testing.T) {
 		})
 	})
 
-	rid := time.Date(2024, 3, 15, 10, 0, 0, 0, time.UTC)
-	override := calendar.Event{
-		ID:           "e1_i0",
-		Subject:      "Override Nil Echo",
-		RecurrenceID: rid,
-	}
+	override := calendar.Event{ID: "e1_i0"}
+	override.Title = "Override Nil Echo"
+	override.RecurrenceID = &jscalendar.LocalDateTime{Year: 2024, Month: 3, Day: 15, Hour: 10}
+	override.RecurrenceIDTimeZone = "Etc/UTC"
 	got, err := cl.WriteInstanceOverride(context.Background(), "e1", override)
 	if err != nil {
 		t.Fatalf("WriteInstanceOverride (nil echo): %v", err)
@@ -358,7 +349,7 @@ func TestWriteInstanceOverrideNilEcho(t *testing.T) {
 	if !got.IsOverride {
 		t.Errorf("IsOverride = false, want true (fallback must stamp IsOverride)")
 	}
-	if got.Subject != override.Subject {
-		t.Errorf("Subject = %q, want %q (fallback must return input override)", got.Subject, override.Subject)
+	if got.Title != override.Title {
+		t.Errorf("Title = %q, want %q (fallback must return input override)", got.Title, override.Title)
 	}
 }

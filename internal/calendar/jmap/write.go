@@ -174,7 +174,7 @@ func setErrorString(se *gojmap.SetError) string {
 // returned with IsOverride set.
 func (cl *Client) WriteInstanceOverride(ctx context.Context, masterID string, override calendar.Event) (calendar.Event, error) {
 	// masterID is accepted for interface symmetry; the update is keyed by the synthetic instance id (override.ID), from which the server resolves the series master.
-	if override.RecurrenceID.IsZero() {
+	if override.RecurrenceID == nil {
 		return calendar.Event{}, fmt.Errorf("jmap: WriteInstanceOverride requires a non-zero RecurrenceID")
 	}
 	if override.ID == "" {
@@ -220,21 +220,22 @@ func (cl *Client) WriteInstanceOverride(ctx context.Context, masterID string, ov
 }
 
 // patchFromCalendarEvent converts a *jscal.CalendarEvent into a gojmap.Patch
-// (map[string]interface{}) with one entry per top-level property that
-// fromCalendarEvent populates. This mirrors how Email/set updates in
-// mail/jmap/write.go express per-property JSON-pointer patches so that the
-// server performs a partial update rather than a blind replace.
+// (map[string]interface{}) with one entry per top-level property the neutral
+// model carries on its embedded JSCalendar Event. This mirrors how Email/set
+// updates in mail/jmap/write.go express per-property JSON-pointer patches so
+// that the server performs a partial update rather than a blind replace.
 //
-// Only the properties that fromCalendarEvent may set are included; properties
-// absent from the neutral model (e.g. recurrenceOverrides) are still included
-// when non-nil so that existing server data is replaced with our representation.
+// The property set targets the embedded jscalendar.Event fields directly
+// (title/start/status/…), preserving the same patch paths the JMAP server
+// expects. uid is immutable per RFC 8984 §4.1.1 and sequence is server-managed
+// under delegated scheduling, so both are intentionally omitted from patches.
 func patchFromCalendarEvent(ce *jscal.CalendarEvent) gojmap.Patch {
 	p := make(gojmap.Patch)
 	if ce == nil {
 		return p
 	}
 
-	// CalendarEvent-level properties.
+	// CalendarEvent-level (JMAP) properties.
 	p["calendarIds"] = ce.CalendarIDs
 	if ce.BaseEventID != nil {
 		p["baseEventId"] = ce.BaseEventID
@@ -244,9 +245,7 @@ func patchFromCalendarEvent(ce *jscal.CalendarEvent) gojmap.Patch {
 		return p
 	}
 
-	// JSCalendar Event properties populated by fromCalendarEvent.
-	// uid is immutable per RFC 8984 §4.1.1 and sequence is server-managed
-	// under delegated scheduling — both are intentionally omitted from patches.
+	// JSCalendar Event content properties.
 	p["title"] = ce.Title
 	p["status"] = ce.Status
 	p["showWithoutTime"] = ce.ShowWithoutTime
@@ -270,8 +269,17 @@ func patchFromCalendarEvent(ce *jscal.CalendarEvent) gojmap.Patch {
 	if ce.RecurrenceRules != nil {
 		p["recurrenceRules"] = ce.RecurrenceRules
 	}
+	if ce.ExcludedRecurrenceRules != nil {
+		p["excludedRecurrenceRules"] = ce.ExcludedRecurrenceRules
+	}
 	if ce.RecurrenceOverrides != nil {
 		p["recurrenceOverrides"] = ce.RecurrenceOverrides
+	}
+
+	// Override-instance linkage: present only on exception events.
+	if ce.RecurrenceID != nil {
+		p["recurrenceId"] = ce.RecurrenceID
+		p["recurrenceIdTimeZone"] = ce.RecurrenceIDTimeZone
 	}
 
 	return p

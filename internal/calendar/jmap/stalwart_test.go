@@ -478,11 +478,10 @@ func TestStalwartJMAP(t *testing.T) {
 	if !ok {
 		t.Fatal("*Client does not implement calendar.Writer")
 	}
-	created, err := w.CreateEvent(ctx, cal.ID, calendar.Event{
-		Subject: eventSubject,
-		Start:   eventStart,
-		End:     eventEnd,
-	})
+	newEvent := calendar.Event{}
+	newEvent.Title = eventSubject
+	newEvent.SetUTCTimes(eventStart, eventEnd)
+	created, err := w.CreateEvent(ctx, cal.ID, newEvent)
 	if err != nil {
 		t.Fatalf("CreateEvent: %v", err)
 	}
@@ -500,7 +499,7 @@ func TestStalwartJMAP(t *testing.T) {
 			t.Fatalf("ListEvents (re-fetch): %v", err)
 		}
 		for i := range evs {
-			if evs[i].Subject == eventSubject {
+			if evs[i].Title == eventSubject {
 				masterID = evs[i].ID
 				break
 			}
@@ -531,11 +530,11 @@ func TestStalwartJMAP(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetEvent: %v", err)
 	}
-	if got.Subject != eventSubject {
-		t.Errorf("GetEvent Subject = %q, want %q", got.Subject, eventSubject)
+	if got.Title != eventSubject {
+		t.Errorf("GetEvent Title = %q, want %q", got.Title, eventSubject)
 	}
-	if !got.Start.Equal(eventStart) {
-		t.Errorf("GetEvent Start = %v, want %v", got.Start, eventStart)
+	if !got.StartTime().Equal(eventStart) {
+		t.Errorf("GetEvent Start = %v, want %v", got.StartTime(), eventStart)
 	}
 
 	// — 7. ListInstances — assert ≥ 2 occurrences -----------------------------
@@ -572,9 +571,9 @@ func TestStalwartJMAP(t *testing.T) {
 		t.Fatal("*Client does not implement calendar.InstanceWriter")
 	}
 	firstInst := instances[0]
-	if !firstInst.RecurrenceID.IsZero() {
+	if firstInst.RecurrenceID != nil {
 		override := firstInst
-		override.Subject = recurSummary + " (rescheduled)"
+		override.Title = recurSummary + " (rescheduled)"
 		_, overrideErr := iw.WriteInstanceOverride(ctx, recurMasterID, override)
 		if overrideErr == nil {
 			// Stalwart v1.0 should have rejected this; if it succeeds in a future
@@ -605,7 +604,7 @@ func TestStalwartJMAP(t *testing.T) {
 	// in changed (filtered to this calendar).
 	foundInDelta := false
 	for _, ev := range changed {
-		if ev.ID == masterID || ev.Subject == eventSubject || ev.UID == recurUID {
+		if ev.ID == masterID || ev.Title == eventSubject || ev.UID == recurUID {
 			foundInDelta = true
 			break
 		}

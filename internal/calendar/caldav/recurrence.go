@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"sort"
-	"strings"
 	"time"
 
 	"github.com/emersion/go-ical"
@@ -13,24 +12,6 @@ import (
 )
 
 var _ calendar.InstanceReader = (*Client)(nil)
-
-// recurrenceFromEvent reads the recurrence pattern off a master VEVENT: its RRULE
-// value plus any EXDATE exception instants. It returns nil when the VEVENT carries
-// no RRULE (a non-recurring event), so a plain event maps to a nil
-// Event.Recurrence.
-func recurrenceFromEvent(ev *ical.Event) *calendar.RecurrencePattern {
-	rrule := ev.Props.Get(ical.PropRecurrenceRule)
-	if rrule == nil || strings.TrimSpace(rrule.Value) == "" {
-		return nil
-	}
-	pat := &calendar.RecurrencePattern{RRULE: strings.TrimSpace(rrule.Value)}
-	for _, ex := range ev.Props.Values(ical.PropExceptionDates) {
-		if t, err := ex.DateTime(time.UTC); err == nil {
-			pat.ExceptionDates = append(pat.ExceptionDates, t.UTC())
-		}
-	}
-	return pat
-}
 
 // recurrenceIDOf returns the RECURRENCE-ID instant of an override VEVENT (the
 // original start of the occurrence it replaces) and whether the VEVENT carries
@@ -112,7 +93,7 @@ func expandInstances(calID, objectPath string, cal *ical.Calendar, r calendar.Ra
 		// No RRULE: a single (possibly all-day) event. Surface it when it falls in
 		// the window, addressed by its own master ID (it is not part of a series).
 		base := mapEvent(master)
-		if !base.Start.IsZero() && inWindow(base.Start, r) {
+		if start := base.StartTime(); !start.IsZero() && inWindow(start, r) {
 			base.ID = masterID
 			base.CalendarID = calID
 			out = append(out, base)
@@ -141,13 +122,14 @@ func expandInstances(calID, objectPath string, cal *ical.Calendar, r calendar.Ra
 			inst.IsOverride = true
 		} else {
 			inst = mapEvent(master)
-			inst.Recurrence = nil // an occurrence is not itself a series
-			inst.Start = occ
+			inst.RecurrenceRules = nil // an occurrence is not itself a series
 			if dur > 0 {
-				inst.End = occ.Add(dur)
+				inst.SetUTCTimes(occ, occ.Add(dur))
+			} else {
+				inst.SetUTCTimes(occ, time.Time{})
 			}
 		}
-		inst.RecurrenceID = occ
+		setRecurrenceID(&inst, occ)
 		inst.ID = instanceEventID(objectPath, occ)
 		inst.CalendarID = calID
 		inst.SeriesMasterID = masterID
@@ -159,7 +141,7 @@ func expandInstances(calID, objectPath string, cal *ical.Calendar, r calendar.Ra
 	// a moved instance) still need surfacing. Add any not already emitted.
 	seen := make(map[time.Time]bool, len(out))
 	for _, e := range out {
-		seen[e.RecurrenceID] = true
+		seen[recurrenceIDTime(e)] = true
 	}
 	for rid, ov := range overrides {
 		if seen[rid] || !inWindow(rid, r) {
@@ -167,14 +149,16 @@ func expandInstances(calID, objectPath string, cal *ical.Calendar, r calendar.Ra
 		}
 		inst := mapEvent(ov)
 		inst.IsOverride = true
-		inst.RecurrenceID = rid
+		setRecurrenceID(&inst, rid)
 		inst.ID = instanceEventID(objectPath, rid)
 		inst.CalendarID = calID
 		inst.SeriesMasterID = masterID
 		out = append(out, inst)
 	}
 
-	sort.Slice(out, func(i, j int) bool { return out[i].RecurrenceID.Before(out[j].RecurrenceID) })
+	sort.Slice(out, func(i, j int) bool {
+		return recurrenceIDTime(out[i]).Before(recurrenceIDTime(out[j]))
+	})
 	return out, nil
 }
 

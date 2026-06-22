@@ -10,6 +10,8 @@ import (
 
 	ht "github.com/ogen-go/ogen/http"
 
+	"github.com/hstern/go-jscalendar"
+
 	"github.com/hstern/go-mailbox-720/internal/calendar"
 	"github.com/hstern/go-mailbox-720/internal/graph/api"
 	"github.com/hstern/go-mailbox-720/internal/itip"
@@ -200,11 +202,11 @@ func rosterAdded(current, merged calendar.Event, organizer string) bool {
 // neutral PARTSTAT=NEEDS-ACTION an organizer's significant change re-solicits, so
 // the stored event shows responses are pending again.
 func resetRecipientStatus(event *calendar.Event, organizer string) {
-	for i := range event.Attendees {
-		if isSchedulingRecipient(event.Attendees[i], organizer) {
-			event.Attendees[i].Status = "notResponded"
+	eachAttendee(event, func(a *jscalParticipant) {
+		if isSchedulingRecipient(*a, organizer) {
+			a.ParticipationStatus = "needs-action"
 		}
-	}
+	})
 }
 
 // shouldSelfSchedule decides whether the server must send iMIP scheduling messages
@@ -221,7 +223,7 @@ func (h Handler) shouldSelfSchedule(ctx context.Context, b calendar.Backend, eve
 		return "", false
 	}
 	hasRecipient := false
-	for _, a := range event.Attendees {
+	for _, a := range event.Attendees() {
 		if isSchedulingRecipient(a, organizer) {
 			hasRecipient = true
 			break
@@ -238,8 +240,9 @@ func (h Handler) shouldSelfSchedule(ctx context.Context, b calendar.Backend, eve
 
 // isSchedulingRecipient reports whether an attendee should receive a scheduling
 // message: a real address that is not the organizer's own.
-func isSchedulingRecipient(a calendar.Attendee, organizer string) bool {
-	return a.Email != "" && !strings.EqualFold(a.Email, organizer)
+func isSchedulingRecipient(a jscalParticipant, organizer string) bool {
+	email := calendar.ParticipantEmail(a)
+	return email != "" && !strings.EqualFold(email, organizer)
 }
 
 // schedulingRecipients keeps the attendees a scheduling message should go to (real
@@ -271,14 +274,14 @@ func organizerFor(eventOrganizer scheduling.Address, mailbox string) scheduling.
 // message just sent onto each recipient attendee, so the persisted event reflects
 // delivery. Shared by the create (REQUEST) and update (re-invite) paths.
 func recordSchedulingOutcome(event *calendar.Event, organizer string, status scheduling.ScheduleStatus) {
-	if !strings.EqualFold(event.Organizer.Email, organizer) {
-		event.Organizer = calendar.Address{Email: organizer}
+	if org, ok := event.Organizer(); !ok || !strings.EqualFold(calendar.ParticipantEmail(org), organizer) {
+		setEventOrganizer(event, calendar.NewParticipant("", organizer, "", "owner"))
 	}
-	for i := range event.Attendees {
-		if isSchedulingRecipient(event.Attendees[i], organizer) {
-			event.Attendees[i].ScheduleStatus = string(status)
+	eachAttendee(event, func(a *jscalParticipant) {
+		if isSchedulingRecipient(*a, organizer) {
+			a.ScheduleStatus = []string{string(status)}
 		}
-	}
+	})
 }
 
 // reinviteOnUpdate carries a PATCH's scheduling consequences to a meeting's
@@ -340,9 +343,9 @@ func (h Handler) reinviteOnUpdate(ctx context.Context, b calendar.Backend, curre
 // attendee-set change is handled separately (see reinviteOnUpdate) and does not
 // reset existing attendees' responses.
 func significantChange(current, merged calendar.Event) bool {
-	return !current.Start.Equal(merged.Start) ||
-		!current.End.Equal(merged.End) ||
-		current.Location != merged.Location
+	return !current.StartTime().Equal(merged.StartTime()) ||
+		!current.EndTime().Equal(merged.EndTime()) ||
+		eventLocation(current) != eventLocation(merged)
 }
 
 // MeUpdateEvents implements PATCH /me/events/{event-id}. PATCH is a partial
@@ -420,47 +423,184 @@ func (h Handler) MeDeleteEvents(ctx context.Context, params api.MeDeleteEventsPa
 
 // graphToEvent maps the inbound Graph event onto the neutral calendar.Event — the
 // inverse of toGraphEvent. Read-only and server-assigned fields (ID, ICalUId) are
-// ignored: the backend stamps the created event with its own opaque ID/UID.
+// ignored: the backend stamps the created event with its own opaque ID/UID. Times
+// are interpreted in their declared zone and stored as UTC instants (via
+// SetUTCTimes); the embedded JSCalendar participants/locations/recurrence are built
+// from the helpers in internal/calendar.
 func graphToEvent(ge *api.MicrosoftGraphEvent) (calendar.Event, error) {
-	e := calendar.Event{
-		Subject:   ge.Subject.Or(""),
-		IsAllDay:  ge.IsAllDay.Or(false),
-		Attendees: graphToAttendees(ge.Attendees),
+	var e calendar.Event
+	e.Title = ge.Subject.Or("")
+	e.ShowWithoutTime = ge.IsAllDay.Or(false)
+
+	start, end, err := graphStartEnd(ge.Start, ge.End)
+	if err != nil {
+		return calendar.Event{}, err
 	}
-	if v, ok := ge.Start.Get(); ok {
-		t, err := graphToTime(v)
-		if err != nil {
-			return calendar.Event{}, fmt.Errorf("start: %w", err)
-		}
-		e.Start = t
-	}
-	if v, ok := ge.End.Get(); ok {
-		t, err := graphToTime(v)
-		if err != nil {
-			return calendar.Event{}, fmt.Errorf("end: %w", err)
-		}
-		e.End = t
-	}
+	e.SetUTCTimes(start, end)
+
 	if v, ok := ge.Location.Get(); ok {
-		e.Location = v.DisplayName.Or("")
-	}
-	if v, ok := ge.Organizer.Get(); ok {
-		e.Organizer = graphRecipientToAddress(v)
+		setEventLocation(&e, v.DisplayName.Or(""))
 	}
 	if v, ok := ge.Body.Get(); ok {
-		e.Body = calendar.Body{
-			Content:     v.Content.Or(""),
-			ContentType: neutralBodyType(v.ContentType),
-		}
+		e.Description = v.Content.Or("")
+		e.DescriptionContentType = neutralBodyType(v.ContentType)
 	}
 	if v, ok := ge.Recurrence.Get(); ok {
-		rp, err := recurrenceFromGraph(v)
+		rules, err := recurrenceFromGraph(v)
 		if err != nil {
 			return calendar.Event{}, fmt.Errorf("recurrence: %w", err)
 		}
-		e.Recurrence = rp
+		e.RecurrenceRules = rules
 	}
+
+	var organizer *jscalParticipant
+	if v, ok := ge.Organizer.Get(); ok {
+		if p, ok := graphRecipientToParticipant(v); ok {
+			organizer = &p
+		}
+	}
+	e.SetOrganizerAttendees(organizer, graphToAttendees(ge.Attendees))
 	return e, nil
+}
+
+// graphStartEnd parses the optional Graph start/end dateTimeTimeZone pair to UTC
+// instants. A zone the server cannot resolve is a 400-worthy error on either side.
+func graphStartEnd(start, end api.OptMicrosoftGraphDateTimeTimeZone) (s, e time.Time, err error) {
+	if v, ok := start.Get(); ok {
+		if s, err = graphToTime(v); err != nil {
+			return time.Time{}, time.Time{}, fmt.Errorf("start: %w", err)
+		}
+	}
+	if v, ok := end.Get(); ok {
+		if e, err = graphToTime(v); err != nil {
+			return time.Time{}, time.Time{}, fmt.Errorf("end: %w", err)
+		}
+	}
+	return s, e, nil
+}
+
+// setEventLocation stores a single display-name location under JSCalendar key "1"
+// (the one eventLocation reads back), or clears the locations when name is empty.
+func setEventLocation(e *calendar.Event, name string) {
+	if name == "" {
+		e.Locations = nil
+		return
+	}
+	e.Locations = map[jscalendar.Id]jscalendar.Location{"1": {Name: name}}
+}
+
+// patchedZone reports the IANA zone a patched Graph Start carries, resolving
+// Windows zone names (and treating ""/"UTC" as Etc/UTC), so a time PATCH that names
+// a zone rebinds the event to it. ok is false when the dateTime is an RFC 3339
+// instant (it fixes its own offset, carrying no named zone) or carries no zone.
+func patchedZone(dt api.MicrosoftGraphDateTimeTimeZone) (jscalendar.TimeZoneId, bool) {
+	s, ok := dt.DateTime.Get()
+	if !ok || s == "" {
+		return "", false
+	}
+	// An RFC 3339 instant has no named zone to preserve.
+	if _, err := time.Parse(time.RFC3339, s); err == nil {
+		return "", false
+	}
+	name, ok := dt.TimeZone.Get()
+	if !ok || name == "" {
+		return "", false
+	}
+	if strings.EqualFold(name, "UTC") {
+		return "Etc/UTC", true
+	}
+	loc, err := tz.Lookup(name)
+	if err != nil {
+		return "", false
+	}
+	return jscalendar.TimeZoneId(loc.String()), true
+}
+
+// setTimesInZone sets the event's Start (as a wall-clock LocalDateTime in zone),
+// TimeZone, and Duration from a pair of absolute UTC instants — the zone-preserving
+// counterpart to the frozen SetUTCTimes (which always stamps Etc/UTC). An empty or
+// unresolvable zone falls back to SetUTCTimes' UTC behavior.
+func setTimesInZone(e *calendar.Event, start, end time.Time, zone jscalendar.TimeZoneId) {
+	if zone == "" || zone == "Etc/UTC" {
+		e.SetUTCTimes(start, end)
+		return
+	}
+	loc, err := time.LoadLocation(string(zone))
+	if err != nil {
+		e.SetUTCTimes(start, end)
+		return
+	}
+	if start.IsZero() {
+		e.Start = nil
+		e.TimeZone = ""
+		e.Duration = nil
+		return
+	}
+	local := start.In(loc)
+	ldt := jscalendar.LocalDateTime{
+		Year: local.Year(), Month: int(local.Month()), Day: local.Day(),
+		Hour: local.Hour(), Minute: local.Minute(), Second: local.Second(),
+	}
+	e.Start = &ldt
+	e.TimeZone = zone
+	if !end.IsZero() && end.After(start) {
+		e.Duration = durationToJSCal(end.Sub(start))
+	} else {
+		e.Duration = nil
+	}
+}
+
+// durationToJSCal expresses a positive Go duration as a JSCalendar Duration in
+// hours/minutes/seconds, matching the frozen SetUTCTimes emission. A non-positive
+// duration yields nil (default zero-length).
+func durationToJSCal(d time.Duration) *jscalendar.Duration {
+	if d <= 0 {
+		return nil
+	}
+	return &jscalendar.Duration{
+		Hours:   uint64(d / time.Hour),
+		Minutes: uint64((d % time.Hour) / time.Minute),
+		Seconds: uint64((d % time.Minute) / time.Second),
+	}
+}
+
+// setEventOrganizer replaces the event's organizer (the "owner"-role participant)
+// while preserving the attendee roster, rebuilding the Participants map through the
+// frozen helper so keying stays deterministic.
+func setEventOrganizer(e *calendar.Event, organizer jscalParticipant) {
+	org := organizer
+	e.SetOrganizerAttendees(&org, e.Attendees())
+}
+
+// setEventAttendees replaces the event's attendee roster while preserving its
+// organizer, rebuilding the Participants map deterministically.
+func setEventAttendees(e *calendar.Event, attendees []jscalParticipant) {
+	var org *jscalParticipant
+	if o, ok := e.Organizer(); ok {
+		org = &o
+	}
+	e.SetOrganizerAttendees(org, attendees)
+}
+
+// eachAttendee applies fn to a mutable copy of every attendee participant and
+// writes the result back, leaving the organizer untouched. It is the in-place
+// mutation primitive for the scheduling status/SCHEDULE-STATUS bookkeeping that the
+// bespoke model did by indexing into a slice.
+func eachAttendee(e *calendar.Event, fn func(*jscalParticipant)) {
+	attendees := e.Attendees()
+	for i := range attendees {
+		fn(&attendees[i])
+	}
+	setEventAttendees(e, attendees)
+}
+
+// scheduleStatusValue returns a participant's single SCHEDULE-STATUS code (the
+// neutral model carries the RFC 6638 codes as a list), or "" when none is set.
+func scheduleStatusValue(p jscalParticipant) string {
+	if len(p.ScheduleStatus) == 0 {
+		return ""
+	}
+	return p.ScheduleStatus[0]
 }
 
 // mergeEventPatch overlays the fields present in the inbound Graph PATCH body
@@ -469,43 +609,60 @@ func graphToEvent(ge *api.MicrosoftGraphEvent) (calendar.Event, error) {
 // fields via .Get() (a set field overlays, even when its value is empty), and the
 // Attendees collection via a non-empty slice. The event's identity (ID, UID, and
 // the rest of the current record) is preserved so UpdateEvent rewrites in place.
-// A patched Start/End with a non-UTC time zone is rejected just like create.
+// A patched Start/End naming an *unresolvable* time zone is rejected with a 400,
+// just like create; a resolvable named zone is honored and preserved.
 func mergeEventPatch(current calendar.Event, ge *api.MicrosoftGraphEvent) (calendar.Event, error) {
 	merged := current
 	if v, ok := ge.Subject.Get(); ok {
-		merged.Subject = v
+		merged.Title = v
 	}
 	if v, ok := ge.IsAllDay.Get(); ok {
-		merged.IsAllDay = v
+		merged.ShowWithoutTime = v
 	}
-	if v, ok := ge.Start.Get(); ok {
-		t, err := graphToTime(v)
-		if err != nil {
-			return calendar.Event{}, fmt.Errorf("start: %w", err)
+	// Start and End are coupled in the neutral model (End is Start + Duration), so a
+	// patch to either is applied by recomputing the pair from absolute instants: the
+	// patched side overlays the current instant. The event's named TimeZone is
+	// PRESERVED (the MB720-49 fidelity goal) — a time-only edit must not silently
+	// relabel an America/New_York event to UTC — unless the patched Start itself
+	// carries a different zone, in which case that zone wins. Only re-apply when the
+	// patch actually touches a time field, to leave the stored times untouched
+	// otherwise.
+	if _, hasStart := ge.Start.Get(); hasStart || ge.End.Set {
+		start, end := merged.StartTime(), merged.EndTime()
+		zone := merged.TimeZone
+		if v, ok := ge.Start.Get(); ok {
+			t, err := graphToTime(v)
+			if err != nil {
+				return calendar.Event{}, fmt.Errorf("start: %w", err)
+			}
+			start = t
+			if z, ok := patchedZone(v); ok {
+				zone = z
+			}
 		}
-		merged.Start = t
-	}
-	if v, ok := ge.End.Get(); ok {
-		t, err := graphToTime(v)
-		if err != nil {
-			return calendar.Event{}, fmt.Errorf("end: %w", err)
+		if v, ok := ge.End.Get(); ok {
+			t, err := graphToTime(v)
+			if err != nil {
+				return calendar.Event{}, fmt.Errorf("end: %w", err)
+			}
+			end = t
 		}
-		merged.End = t
+		setTimesInZone(&merged, start, end, zone)
 	}
 	if v, ok := ge.Location.Get(); ok {
-		merged.Location = v.DisplayName.Or("")
-	}
-	if v, ok := ge.Organizer.Get(); ok {
-		merged.Organizer = graphRecipientToAddress(v)
+		setEventLocation(&merged, v.DisplayName.Or(""))
 	}
 	if v, ok := ge.Body.Get(); ok {
-		merged.Body = calendar.Body{
-			Content:     v.Content.Or(""),
-			ContentType: neutralBodyType(v.ContentType),
+		merged.Description = v.Content.Or("")
+		merged.DescriptionContentType = neutralBodyType(v.ContentType)
+	}
+	if v, ok := ge.Organizer.Get(); ok {
+		if p, ok := graphRecipientToParticipant(v); ok {
+			setEventOrganizer(&merged, p)
 		}
 	}
 	if len(ge.Attendees) > 0 {
-		merged.Attendees = mergeAttendees(current.Attendees, graphToAttendees(ge.Attendees))
+		setEventAttendees(&merged, mergeAttendees(current.Attendees(), graphToAttendees(ge.Attendees)))
 	}
 	return merged, nil
 }
@@ -515,21 +672,21 @@ func mergeEventPatch(current calendar.Event, ge *api.MicrosoftGraphEvent) (calen
 // patch does not restate it — a Graph client that re-lists attendees by address
 // alone should not silently drop their existing PARTSTAT. Attendees only on the
 // patch are added; those only on the current roster are dropped (a removal).
-func mergeAttendees(current, patched []calendar.Attendee) []calendar.Attendee {
-	byEmail := make(map[string]calendar.Attendee, len(current))
+func mergeAttendees(current, patched []jscalParticipant) []jscalParticipant {
+	byEmail := make(map[string]jscalParticipant, len(current))
 	for _, a := range current {
-		byEmail[strings.ToLower(a.Email)] = a
+		byEmail[strings.ToLower(calendar.ParticipantEmail(a))] = a
 	}
-	out := make([]calendar.Attendee, 0, len(patched))
+	out := make([]jscalParticipant, 0, len(patched))
 	for _, p := range patched {
-		if prev, ok := byEmail[strings.ToLower(p.Email)]; ok {
+		if prev, ok := byEmail[strings.ToLower(calendar.ParticipantEmail(p))]; ok {
 			// Carry the stored response forward only when the patch omits it; but
 			// SCHEDULE-STATUS has no Graph representation, so a patch can never
 			// restate it — always preserve the stored value.
-			if p.Status == "" {
-				p.Status = prev.Status
+			if p.ParticipationStatus == "" {
+				p.ParticipationStatus = prev.ParticipationStatus
 			}
-			if p.ScheduleStatus == "" {
+			if len(p.ScheduleStatus) == 0 {
 				p.ScheduleStatus = prev.ScheduleStatus
 			}
 		}
@@ -571,49 +728,49 @@ func graphToTime(dt api.MicrosoftGraphDateTimeTimeZone) (time.Time, error) {
 	return time.Time{}, nil
 }
 
-// graphRecipientToAddress maps a Graph recipient onto a calendar.Address.
-func graphRecipientToAddress(r api.MicrosoftGraphRecipient) calendar.Address {
+// graphRecipientToParticipant maps a Graph recipient onto a JSCalendar owner
+// participant (the organizer), reporting ok=false when the recipient carries no
+// email address.
+func graphRecipientToParticipant(r api.MicrosoftGraphRecipient) (jscalParticipant, bool) {
 	ea, ok := r.EmailAddress.Get()
 	if !ok {
-		return calendar.Address{}
+		return jscalParticipant{}, false
 	}
-	return calendar.Address{
-		Name:  ea.Name.Or(""),
-		Email: ea.Address.Or(""),
+	email := ea.Address.Or("")
+	if email == "" {
+		return jscalParticipant{}, false
 	}
+	return calendar.NewParticipant(ea.Name.Or(""), email, "", "owner"), true
 }
 
-// graphToAddresses maps Graph attendees onto neutral calendar.Address values.
-func graphToAttendees(as []api.MicrosoftGraphAttendee) []calendar.Attendee {
+// graphToAttendees maps Graph attendees onto JSCalendar attendee participants,
+// translating the Graph responseStatus.response onto the participationStatus.
+func graphToAttendees(as []api.MicrosoftGraphAttendee) []jscalParticipant {
 	if len(as) == 0 {
 		return nil
 	}
-	out := make([]calendar.Attendee, 0, len(as))
+	out := make([]jscalParticipant, 0, len(as))
 	for _, a := range as {
 		ea, ok := a.EmailAddress.Get()
 		if !ok {
 			continue
 		}
-		att := calendar.Attendee{
-			Name:  ea.Name.Or(""),
-			Email: ea.Address.Or(""),
-		}
-		// Graph's responseStatus.response uses the same tokens as the neutral status.
+		partStat := ""
 		if rs, ok := a.Status.Get(); ok {
 			if rt, ok := rs.Response.Get(); ok {
-				att.Status = string(rt)
+				partStat = calendar.ResponseToPartStat(string(rt))
 			}
 		}
-		out = append(out, att)
+		out = append(out, calendar.NewParticipant(ea.Name.Or(""), ea.Address.Or(""), partStat, "attendee"))
 	}
 	return out
 }
 
-// neutralBodyType maps a Graph bodyType back onto the neutral "text"/"html"
-// string — the inverse of graphBodyType.
+// neutralBodyType maps a Graph bodyType onto the JSCalendar descriptionContentType
+// media type ("text/html" / "text/plain") — the inverse of graphBodyType.
 func neutralBodyType(bt api.OptMicrosoftGraphBodyType) string {
 	if v, ok := bt.Get(); ok && v == api.MicrosoftGraphBodyTypeHTML {
-		return "html"
+		return "text/html"
 	}
-	return "text"
+	return "text/plain"
 }

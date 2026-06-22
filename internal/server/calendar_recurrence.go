@@ -10,13 +10,18 @@ import (
 	ht "github.com/ogen-go/ogen/http"
 	"github.com/teambition/rrule-go"
 
+	"github.com/hstern/go-jscalendar"
+
 	"github.com/hstern/go-mailbox-720/internal/calendar"
 	"github.com/hstern/go-mailbox-720/internal/graph/api"
 )
 
-// graphRecurrence maps the neutral recurrence pattern (an iCalendar RRULE plus its
-// series start) onto Graph's patternedRecurrence (recurrencePattern +
-// recurrenceRange). It returns ok=false when the RRULE cannot be parsed or uses a
+// graphRecurrence maps the event's structured JSCalendar recurrence rules onto
+// Graph's patternedRecurrence (recurrencePattern + recurrenceRange). It derives an
+// RFC 5545 RRULE string from the structured rules via calendar.RRULEFromRules
+// (anchored at the event's Start/TimeZone so BY* parts emit correctly) and feeds it
+// through the same RRULE->Graph-pattern logic as before. It returns ok=false when
+// the event has no rules, the RRULE cannot be derived/parsed, or it uses a
 // frequency the Graph shape does not model (e.g. HOURLY), so the caller simply
 // omits event.recurrence rather than emitting a malformed one.
 //
@@ -25,11 +30,16 @@ import (
 // month). INTERVAL maps to pattern.interval; COUNT -> numbered range, UNTIL ->
 // endDate range, neither -> noEnd. Relative monthly/yearly (BYDAY with an ordinal,
 // e.g. "the second Tuesday") is reported unmapped — a deliberate first-cut bound.
-func graphRecurrence(p *calendar.RecurrencePattern, seriesStart time.Time) (api.MicrosoftGraphPatternedRecurrence, bool) {
-	if p == nil || strings.TrimSpace(p.RRULE) == "" {
+func graphRecurrence(e calendar.Event) (api.MicrosoftGraphPatternedRecurrence, bool) {
+	if len(e.RecurrenceRules) == 0 {
 		return api.MicrosoftGraphPatternedRecurrence{}, false
 	}
-	opt, err := rrule.StrToROption(p.RRULE)
+	rruleStr, err := calendar.RRULEFromRules(e.Start, e.TimeZone, e.RecurrenceRules)
+	if err != nil || strings.TrimSpace(rruleStr) == "" {
+		return api.MicrosoftGraphPatternedRecurrence{}, false
+	}
+	seriesStart := e.StartTime()
+	opt, err := rrule.StrToROption(rruleStr)
 	if err != nil {
 		return api.MicrosoftGraphPatternedRecurrence{}, false
 	}
@@ -172,13 +182,15 @@ func graphDayOfWeek(d time.Weekday) api.MicrosoftGraphDayOfWeek {
 	}[d]
 }
 
-// recurrenceFromGraph maps a Graph patternedRecurrence onto the neutral
-// recurrence pattern (an iCalendar RRULE), the inverse of graphRecurrence for
-// create/patch. It returns ok=false when the pattern is absent or carries no
-// usable type. Relative monthly/yearly types are rejected with an error, matching
-// graphRecurrence's first-cut bound, so the caller can surface a 400 rather than
-// silently dropping the rule.
-func recurrenceFromGraph(pr api.MicrosoftGraphPatternedRecurrence) (*calendar.RecurrencePattern, error) {
+// recurrenceFromGraph maps a Graph patternedRecurrence onto structured JSCalendar
+// recurrence rules, the inverse of graphRecurrence for create/patch. It builds the
+// RFC 5545 RRULE string from the Graph pattern as before, then parses it into the
+// neutral []jscalendar.RecurrenceRule via calendar.RulesFromRRULE so the event
+// carries structured rules. It returns nil rules when the pattern is absent or
+// carries no usable type. Relative monthly/yearly types are rejected with an error,
+// matching graphRecurrence's first-cut bound, so the caller can surface a 400
+// rather than silently dropping the rule.
+func recurrenceFromGraph(pr api.MicrosoftGraphPatternedRecurrence) ([]jscalendar.RecurrenceRule, error) {
 	pat, ok := pr.Pattern.Get()
 	if !ok {
 		return nil, nil
@@ -234,7 +246,11 @@ func recurrenceFromGraph(pr api.MicrosoftGraphPatternedRecurrence) (*calendar.Re
 		}
 	}
 
-	return &calendar.RecurrencePattern{RRULE: strings.Join(parts, ";")}, nil
+	rules, err := calendar.RulesFromRRULE(strings.Join(parts, ";"))
+	if err != nil {
+		return nil, fmt.Errorf("recurrence: %w", err)
+	}
+	return rules, nil
 }
 
 // rruleByDay maps Graph dayOfWeek tokens onto the comma-joined RRULE BYDAY value
@@ -267,11 +283,11 @@ func rruleByDay(days []api.MicrosoftGraphDayOfWeek) string {
 // series master is a "seriesMaster", and anything else is a "singleInstance".
 func graphEventType(e calendar.Event) api.MicrosoftGraphEventType {
 	switch {
-	case !e.RecurrenceID.IsZero() && e.IsOverride:
+	case e.RecurrenceID != nil && e.IsOverride:
 		return api.MicrosoftGraphEventTypeException
-	case !e.RecurrenceID.IsZero():
+	case e.RecurrenceID != nil:
 		return api.MicrosoftGraphEventTypeOccurrence
-	case e.Recurrence != nil:
+	case len(e.RecurrenceRules) > 0:
 		return api.MicrosoftGraphEventTypeSeriesMaster
 	default:
 		return api.MicrosoftGraphEventTypeSingleInstance

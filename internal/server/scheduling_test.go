@@ -8,6 +8,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/hstern/go-jscalendar"
+
 	"github.com/hstern/go-mailbox-720/internal/calendar"
 	"github.com/hstern/go-mailbox-720/internal/graph/api"
 	"github.com/hstern/go-mailbox-720/internal/scheduling"
@@ -41,16 +43,19 @@ func (p fakeSchedulingProvider) MailboxAddress(_ context.Context) (string, error
 // seededInvite is a calendar backend whose GetEvent returns one event carrying a
 // UID + organizer — what a reply needs.
 func seededInvite() *fakeCalendarBackend {
+	e := calendar.Event{ID: "evt-1"}
+	e.UID = "uid-1@example.com"
+	e.Title = "Standup"
+	e.SetUTCTimes(
+		time.Date(2026, 6, 20, 9, 0, 0, 0, time.UTC),
+		time.Date(2026, 6, 20, 10, 0, 0, 0, time.UTC),
+	)
+	org := calendar.NewParticipant("Alice", "alice@example.com", "", "owner")
+	e.SetOrganizerAttendees(&org, []jscalendar.Participant{
+		calendar.NewParticipant("", "me@example.com", "", "attendee"),
+	})
 	return &fakeCalendarBackend{
-		events: map[string][]calendar.Event{"cal-primary": {{
-			ID:        "evt-1",
-			UID:       "uid-1@example.com",
-			Subject:   "Standup",
-			Start:     time.Date(2026, 6, 20, 9, 0, 0, 0, time.UTC),
-			End:       time.Date(2026, 6, 20, 10, 0, 0, 0, time.UTC),
-			Organizer: calendar.Address{Name: "Alice", Email: "alice@example.com"},
-			Attendees: []calendar.Attendee{{Email: "me@example.com"}},
-		}}},
+		events: map[string][]calendar.Event{"cal-primary": {e}},
 	}
 }
 
@@ -146,14 +151,15 @@ func (p nativeCalendarProvider) Calendar(context.Context) (calendar.Backend, err
 }
 
 func seededNativeInvite() *nativeCalendarBackend {
+	e := calendar.Event{ID: "evt-1"}
+	e.UID = "uid-1@example.com"
+	e.Title = "Standup"
+	org := calendar.NewParticipant("Alice", "alice@example.com", "", "owner")
+	e.SetOrganizerAttendees(&org, []jscalendar.Participant{
+		calendar.NewParticipant("", "me@example.com", "needs-action", "attendee"),
+	})
 	return &nativeCalendarBackend{writableCalendarBackend: writableCalendarBackend{
-		fakeCalendarBackend: fakeCalendarBackend{events: map[string][]calendar.Event{"cal-primary": {{
-			ID:        "evt-1",
-			UID:       "uid-1@example.com",
-			Subject:   "Standup",
-			Organizer: calendar.Address{Name: "Alice", Email: "alice@example.com"},
-			Attendees: []calendar.Attendee{{Email: "me@example.com", Status: "notResponded"}},
-		}}}},
+		fakeCalendarBackend: fakeCalendarBackend{events: map[string][]calendar.Event{"cal-primary": {e}}},
 	}}
 }
 
@@ -178,13 +184,13 @@ func TestMeEventsEventAcceptNativeUpdatesPartStat(t *testing.T) {
 		t.Error("emailed an iMIP reply even though the server schedules natively")
 	}
 	var status string
-	for _, a := range backend.updatedEvent.Attendees {
-		if a.Email == "me@example.com" {
-			status = a.Status
+	for _, a := range backend.updatedEvent.Attendees() {
+		if calendar.ParticipantEmail(a) == "me@example.com" {
+			status = a.ParticipationStatus
 		}
 	}
 	if status != "accepted" {
-		t.Errorf("responder PARTSTAT in UpdateEvent = %q, want accepted (attendees: %+v)", status, backend.updatedEvent.Attendees)
+		t.Errorf("responder PARTSTAT in UpdateEvent = %q, want accepted (attendees: %+v)", status, backend.updatedEvent.Attendees())
 	}
 }
 

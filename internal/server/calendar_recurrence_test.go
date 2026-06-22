@@ -6,13 +6,23 @@ import (
 	"testing"
 	"time"
 
+	"github.com/hstern/go-jscalendar"
+
 	"github.com/hstern/go-mailbox-720/internal/calendar"
 	"github.com/hstern/go-mailbox-720/internal/graph/api"
 )
 
 func TestGraphRecurrenceWeekly(t *testing.T) {
 	start := time.Date(2026, 6, 15, 9, 0, 0, 0, time.UTC) // a Monday
-	pr, ok := graphRecurrence(&calendar.RecurrencePattern{RRULE: "FREQ=WEEKLY;INTERVAL=2;BYDAY=MO,WE"}, start)
+	rules, err := calendar.RulesFromRRULE("FREQ=WEEKLY;INTERVAL=2;BYDAY=MO,WE")
+	if err != nil {
+		t.Fatalf("RulesFromRRULE: %v", err)
+	}
+	var e calendar.Event
+	e.SetUTCTimes(start, start.Add(time.Hour))
+	e.RecurrenceRules = rules
+
+	pr, ok := graphRecurrence(e)
 	if !ok {
 		t.Fatal("graphRecurrence returned ok=false for a weekly rule")
 	}
@@ -38,18 +48,26 @@ func TestRecurrenceFromGraphWeekly(t *testing.T) {
 	pat.SetInterval(api.NewOptInt32(2))
 	pat.SetDaysOfWeek([]api.MicrosoftGraphDayOfWeek{api.MicrosoftGraphDayOfWeekMonday, api.MicrosoftGraphDayOfWeekWednesday})
 
-	rp, err := recurrenceFromGraph(api.MicrosoftGraphPatternedRecurrence{
+	rules, err := recurrenceFromGraph(api.MicrosoftGraphPatternedRecurrence{
 		Pattern: api.NewOptMicrosoftGraphRecurrencePattern(pat),
 	})
 	if err != nil {
 		t.Fatalf("recurrenceFromGraph: %v", err)
 	}
-	if rp == nil {
-		t.Fatal("recurrenceFromGraph returned nil for a weekly pattern")
+	if len(rules) == 0 {
+		t.Fatal("recurrenceFromGraph returned no rules for a weekly pattern")
+	}
+	// Re-derive an RRULE from the structured rules to assert the mapping landed the
+	// frequency, interval, and BYDAY parts.
+	start := time.Date(2026, 6, 15, 9, 0, 0, 0, time.UTC)
+	ldt := &jscalendar.LocalDateTime{Year: start.Year(), Month: int(start.Month()), Day: start.Day(), Hour: start.Hour()}
+	rrule, err := calendar.RRULEFromRules(ldt, "Etc/UTC", rules)
+	if err != nil {
+		t.Fatalf("RRULEFromRules: %v", err)
 	}
 	for _, want := range []string{"FREQ=WEEKLY", "INTERVAL=2", "BYDAY=MO,WE"} {
-		if !strings.Contains(rp.RRULE, want) {
-			t.Errorf("RRULE %q missing %q", rp.RRULE, want)
+		if !strings.Contains(rrule, want) {
+			t.Errorf("RRULE %q missing %q", rrule, want)
 		}
 	}
 }
@@ -64,6 +82,19 @@ func (f *fakeInstanceBackend) ListInstances(_ context.Context, _ string, _ calen
 	return f.instances, nil
 }
 
+// instanceEvent builds a single expanded occurrence of a series: a JSCalendar event
+// at start (UTC, one hour long) carrying its RecurrenceID + SeriesMasterID, as an
+// InstanceReader would surface it.
+func instanceEvent(id, title string, start time.Time) calendar.Event {
+	e := calendar.Event{ID: id, SeriesMasterID: id}
+	e.Title = title
+	e.SetUTCTimes(start, start.Add(time.Hour))
+	rid := jscalendar.LocalDateTime{Year: start.Year(), Month: int(start.Month()), Day: start.Day(), Hour: start.Hour(), Minute: start.Minute(), Second: start.Second()}
+	e.RecurrenceID = &rid
+	e.RecurrenceIDTimeZone = "Etc/UTC"
+	return e
+}
+
 type fakeInstanceProvider struct{ b calendar.Backend }
 
 func (p fakeInstanceProvider) Calendar(_ context.Context) (calendar.Backend, error) { return p.b, nil }
@@ -74,8 +105,8 @@ func TestMeEventsListInstances(t *testing.T) {
 	backend := &fakeInstanceBackend{
 		fakeCalendarBackend: newCalendarFixture(),
 		instances: []calendar.Event{
-			{ID: "evt-1", Subject: "Standup", Start: first, End: first.Add(time.Hour), RecurrenceID: first, SeriesMasterID: "evt-1"},
-			{ID: "evt-1", Subject: "Standup", Start: second, End: second.Add(time.Hour), RecurrenceID: second, SeriesMasterID: "evt-1"},
+			instanceEvent("evt-1", "Standup", first),
+			instanceEvent("evt-1", "Standup", second),
 		},
 	}
 	h := Handler{calendar: fakeInstanceProvider{b: backend}}

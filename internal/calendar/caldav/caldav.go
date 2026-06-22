@@ -19,6 +19,8 @@ import (
 	"github.com/emersion/go-ical"
 	"github.com/emersion/go-webdav"
 	gocaldav "github.com/emersion/go-webdav/caldav"
+	"github.com/hstern/go-jscalendar"
+	jsical "github.com/hstern/go-jscalendar/ical"
 
 	"github.com/hstern/go-mailbox-720/internal/calendar"
 )
@@ -219,7 +221,7 @@ func instanceFromObject(calID, objectPath string, cal *ical.Calendar, recurrence
 			if rid.Equal(recurrenceID) {
 				e := mapEvent(&events[i])
 				e.IsOverride = true
-				e.RecurrenceID = recurrenceID
+				setRecurrenceID(&e, recurrenceID)
 				e.ID = instanceEventID(objectPath, recurrenceID)
 				e.CalendarID = calID
 				e.SeriesMasterID = eventID(objectPath)
@@ -236,14 +238,15 @@ func instanceFromObject(calID, objectPath string, cal *ical.Calendar, recurrence
 	}
 	master := &events[masterIdx]
 	e := mapEvent(master)
-	e.Recurrence = nil // a single occurrence is not itself a series
+	e.RecurrenceRules = nil // a single occurrence is not itself a series
 	start, _ := master.DateTimeStart(time.UTC)
 	end, _ := master.DateTimeEnd(time.UTC)
-	e.Start = recurrenceID
 	if !start.IsZero() && !end.IsZero() {
-		e.End = recurrenceID.Add(end.Sub(start))
+		e.SetUTCTimes(recurrenceID, recurrenceID.Add(end.Sub(start)))
+	} else {
+		e.SetUTCTimes(recurrenceID, time.Time{})
 	}
-	e.RecurrenceID = recurrenceID
+	setRecurrenceID(&e, recurrenceID)
 	e.ID = instanceEventID(objectPath, recurrenceID)
 	e.CalendarID = calID
 	e.SeriesMasterID = eventID(objectPath)
@@ -289,55 +292,128 @@ func eventFromObject(calID, objectPath string, cal *ical.Calendar) (calendar.Eve
 	return e, true
 }
 
-// mapEvent maps an iCalendar VEVENT to a neutral Event. It is best-effort: a
-// missing or malformed property yields a zero value for that field rather than
-// failing the whole event. ID and CalendarID are left to the caller.
+// mapEvent maps an iCalendar VEVENT to a neutral Event by routing it through the
+// go-jscalendar/ical bridge — the single place iCal↔JSCalendar mapping lives — and
+// then reconciling the two things the bridge does not carry: each attendee's
+// PARTSTAT (its participationStatus) and the override RECURRENCE-ID. It is
+// best-effort: a VEVENT the bridge cannot convert yields a near-empty Event rather
+// than failing. ID, CalendarID, and SeriesMasterID are left to the caller.
 func mapEvent(ev *ical.Event) calendar.Event {
-	e := calendar.Event{
-		Subject:   propText(ev, ical.PropSummary),
-		UID:       propText(ev, ical.PropUID),
-		Location:  propText(ev, ical.PropLocation),
-		Status:    strings.ToLower(propText(ev, ical.PropStatus)),
-		Sequence:  propInt(ev, ical.PropSequence),
-		Organizer: calAddress(ev.Props.Get(ical.PropOrganizer)),
-		Body: calendar.Body{
-			ContentType: "text",
-			Content:     propText(ev, ical.PropDescription),
-		},
-	}
-	if start, err := ev.DateTimeStart(time.UTC); err == nil {
-		e.Start = start
-	}
-	if end, err := ev.DateTimeEnd(time.UTC); err == nil {
-		e.End = end
-	}
-	if created, err := ev.Props.DateTime(ical.PropCreated, time.UTC); err == nil {
-		e.CreatedAt = created
-	}
-	e.IsAllDay = isAllDay(ev)
-	e.Recurrence = recurrenceFromEvent(ev)
+	jsEvent := bridgeFromVEVENT(ev)
+	e := calendar.Event{Event: jsEvent}
+	reconcilePartStat(&e, ev)
 	if rid, ok := recurrenceIDOf(ev); ok {
-		e.RecurrenceID = rid
+		setRecurrenceID(&e, rid)
 		e.IsOverride = true
-	}
-	for _, p := range ev.Props.Values(ical.PropAttendee) {
-		if a := calAddress(&p); a != (calendar.Address{}) {
-			e.Attendees = append(e.Attendees, calendar.Attendee{
-				Name:           a.Name,
-				Email:          a.Email,
-				Status:         attendeeStatus(&p),
-				ScheduleStatus: p.Params.Get(paramScheduleStatus),
-			})
-		}
 	}
 	return e
 }
 
-// isAllDay reports whether an event's DTSTART is a date-only value (VALUE=DATE),
-// which iCalendar uses to mark an all-day event.
-func isAllDay(ev *ical.Event) bool {
-	prop := ev.Props.Get(ical.PropDateTimeStart)
-	return prop != nil && prop.ValueType() == ical.ValueDate
+// bridgeFromVEVENT runs one VEVENT through the ical bridge and returns the
+// resulting jscalendar.Event. The bridge consumes a whole VCALENDAR, so the
+// VEVENT is wrapped in a minimal one; a convert failure (or a VCALENDAR yielding
+// no event) degrades to an empty event so a single bad component does not fail the
+// listing.
+func bridgeFromVEVENT(ev *ical.Event) jscalendar.Event {
+	cal := ical.NewCalendar()
+	cal.Children = append(cal.Children, ev.Component)
+	objs, err := jsical.FromICal(cal)
+	if err != nil {
+		return jscalendar.Event{}
+	}
+	for _, o := range objs {
+		if jsEvent, ok := o.(*jscalendar.Event); ok {
+			return *jsEvent
+		}
+	}
+	return jscalendar.Event{}
+}
+
+// reconcilePartStat copies each ATTENDEE's PARTSTAT and RFC 6638 SCHEDULE-STATUS —
+// which the ical bridge drops — onto the matching participant's
+// participationStatus and ScheduleStatus, matching by scheduling address
+// (CAL-ADDRESS / sendTo imip). Without this the read path would lose the
+// attendee's response and the recorded scheduling-delivery outcome.
+func reconcilePartStat(e *calendar.Event, ev *ical.Event) {
+	if len(e.Participants) == 0 {
+		return
+	}
+	type attendeeAttrs struct{ partStat, schedStatus string }
+	byAddr := make(map[string]attendeeAttrs)
+	for _, p := range ev.Props.Values(ical.PropAttendee) {
+		a := attendeeAttrs{partStat: attendeePartStat(&p), schedStatus: attendeeScheduleStatus(&p)}
+		if a.partStat == "" && a.schedStatus == "" {
+			continue
+		}
+		byAddr[normalizeCalAddress(p.Value)] = a
+	}
+	if len(byAddr) == 0 {
+		return
+	}
+	for id, p := range e.Participants {
+		addr := p.SendTo["imip"]
+		if addr == "" && p.Email != "" {
+			addr = "mailto:" + p.Email
+		}
+		a, ok := byAddr[normalizeCalAddress(addr)]
+		if !ok {
+			continue
+		}
+		changed := false
+		if a.partStat != "" {
+			p.ParticipationStatus = a.partStat
+			changed = true
+		}
+		if a.schedStatus != "" {
+			p.ScheduleStatus = []string{a.schedStatus}
+			changed = true
+		}
+		if changed {
+			e.Participants[id] = p
+		}
+	}
+}
+
+// normalizeCalAddress lowercases a CAL-ADDRESS for matching, since iCalendar
+// addresses are case-insensitive in the mailto scheme.
+func normalizeCalAddress(addr string) string {
+	return strings.ToLower(strings.TrimSpace(addr))
+}
+
+// setRecurrenceID stamps the override RECURRENCE-ID instant onto the envelope as a
+// UTC LocalDateTime + zone, the JSCalendar shape for an expanded standalone
+// override (RFC 8984 §4.3.1–4.3.2). The adapter reads and writes RECURRENCE-ID in
+// UTC, so the zone is always "Etc/UTC".
+func setRecurrenceID(e *calendar.Event, rid time.Time) {
+	ldt := localDateTimeFromUTC(rid.UTC())
+	e.RecurrenceID = &ldt
+	e.RecurrenceIDTimeZone = "Etc/UTC"
+}
+
+// recurrenceIDTime resolves the envelope's RECURRENCE-ID LocalDateTime back to a
+// UTC instant, the form the recurrence-expansion code compares against. It returns
+// the zero time when no RECURRENCE-ID is set.
+func recurrenceIDTime(e calendar.Event) time.Time {
+	if e.RecurrenceID == nil {
+		return time.Time{}
+	}
+	r := e.RecurrenceID
+	loc := time.UTC
+	if e.RecurrenceIDTimeZone != "" {
+		if l, err := time.LoadLocation(string(e.RecurrenceIDTimeZone)); err == nil {
+			loc = l
+		}
+	}
+	return time.Date(r.Year, time.Month(r.Month), r.Day, r.Hour, r.Minute, r.Second, 0, loc).UTC()
+}
+
+// localDateTimeFromUTC builds a JSCalendar LocalDateTime from a UTC instant's
+// wall-clock fields.
+func localDateTimeFromUTC(t time.Time) jscalendar.LocalDateTime {
+	return jscalendar.LocalDateTime{
+		Year: t.Year(), Month: int(t.Month()), Day: t.Day(),
+		Hour: t.Hour(), Minute: t.Minute(), Second: t.Second(),
+	}
 }
 
 // propText returns a component property's text value, or "" if absent or
@@ -347,32 +423,4 @@ func propText(ev *ical.Event, name string) string {
 		return v
 	}
 	return ""
-}
-
-// propInt returns a component property's integer value, or 0 if absent or
-// unparseable (e.g. SEQUENCE, whose RFC 5545 default is 0).
-func propInt(ev *ical.Event, name string) int {
-	if p := ev.Props.Get(name); p != nil {
-		if v, err := p.Int(); err == nil {
-			return v
-		}
-	}
-	return 0
-}
-
-// calAddress maps an iCalendar CAL-ADDRESS property (ORGANIZER / ATTENDEE) to a
-// neutral Address. The value is a "mailto:" URI; the optional CN parameter
-// carries the display name.
-func calAddress(prop *ical.Prop) calendar.Address {
-	if prop == nil {
-		return calendar.Address{}
-	}
-	email := strings.TrimSpace(prop.Value)
-	if i := strings.IndexByte(email, ':'); i >= 0 && strings.EqualFold(email[:i], "mailto") {
-		email = email[i+1:]
-	}
-	return calendar.Address{
-		Name:  prop.Params.Get(ical.ParamCommonName),
-		Email: email,
-	}
 }
