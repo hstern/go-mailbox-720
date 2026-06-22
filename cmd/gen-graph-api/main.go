@@ -85,6 +85,15 @@ var mailboxConfig = specsubset.Config{
 		"/me/mailFolders/{mailFolder-id}/messageRules/{messageRule-id}",
 		"/users/{user-id}/mailFolders/{mailFolder-id}/messageRules",
 		"/users/{user-id}/mailFolders/{mailFolder-id}/messageRules/{messageRule-id}",
+		// Calendar sharing (calendarPermission): who a calendar is shared with and
+		// their role, translated to the backend sharing mechanism (JMAP Sharing
+		// RFC 9670 shareWith on the JMAP tier; CalDAV/WebDAV ACL is not yet wired) —
+		// MB720-24. A leaf entity under calendars/{id}, like messageRules under
+		// mailFolders/{id}.
+		"/me/calendars/{calendar-id}/calendarPermissions",
+		"/me/calendars/{calendar-id}/calendarPermissions/{calendarPermission-id}",
+		"/users/{user-id}/calendars/{calendar-id}/calendarPermissions",
+		"/users/{user-id}/calendars/{calendar-id}/calendarPermissions/{calendarPermission-id}",
 		"/users/{user-id}/events/{event-id}/instances",
 		"/users/{user-id}/messages",
 		"/users/{user-id}/messages/{message-id}",

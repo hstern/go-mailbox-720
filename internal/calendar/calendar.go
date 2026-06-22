@@ -12,6 +12,7 @@ package calendar
 
 import (
 	"context"
+	"errors"
 	"time"
 )
 
@@ -276,3 +277,81 @@ type InstanceWriter interface {
 	// instance ID, CalendarID, and SeriesMasterID.
 	WriteInstanceOverride(ctx context.Context, masterID string, override Event) (Event, error)
 }
+
+// PermissionRole is a backend-neutral calendar-sharing role, mirroring Microsoft
+// Graph's calendarRoleType: the level of access a grantee has to a shared calendar.
+type PermissionRole string
+
+// The calendarRoleType vocabulary (Graph). Backends map these onto their own rights
+// model (e.g. JMAP Sharing shareWith rights).
+const (
+	RoleNone            PermissionRole = "none"
+	RoleFreeBusyRead    PermissionRole = "freeBusyRead"
+	RoleLimitedRead     PermissionRole = "limitedRead"
+	RoleRead            PermissionRole = "read"
+	RoleWrite           PermissionRole = "write"
+	RoleDelegate        PermissionRole = "delegateWithoutPrivateEventAccess"
+	RoleDelegatePrivate PermissionRole = "delegateWithPrivateEventAccess"
+	RoleCustom          PermissionRole = "custom"
+)
+
+// Permission is a backend-neutral calendar-sharing grant: an identity (the grantee's
+// email and display name) and the role it holds on the calendar. It is the neutral
+// shape the server maps Microsoft Graph's calendarPermission onto, and that a
+// PermissionReader/PermissionWriter adapter translates to the backend sharing
+// mechanism (JMAP Sharing shareWith on the JMAP tier; MB720-24).
+type Permission struct {
+	// ID is an opaque, stable identifier for the grant within its calendar. Empty on
+	// a grant being created; the PermissionWriter assigns it.
+	ID string
+	// Email is the grantee's address; Name its display name (best-effort).
+	Email string
+	Name  string
+	// Role is the access level granted. AllowedRoles, when known, lists the roles the
+	// grantee could be assigned (Graph surfaces it read-only).
+	Role         PermissionRole
+	AllowedRoles []PermissionRole
+	// IsInsideOrganization reports whether the grantee is in the owner's organization;
+	// IsRemovable whether the grant can be removed (false for the owner's own entry).
+	IsInsideOrganization bool
+	IsRemovable          bool
+}
+
+// PermissionReader is the optional capability to read a calendar's sharing grants —
+// who it is shared with and their roles. It is kept separate from Backend so an
+// adapter without sharing support need not implement it; consumers type-assert:
+//
+//	if pr, ok := backend.(calendar.PermissionReader); ok {
+//		perms, err := pr.ListCalendarPermissions(ctx, calendarID)
+//	}
+//
+// It backs Graph's GET .../calendars/{id}/calendarPermissions and .../{id}. A
+// PermissionReader is bound to the same authenticated principal as its Backend.
+type PermissionReader interface {
+	// ListCalendarPermissions returns the calendar's sharing grants. The MVP returns
+	// the explicit grantees only; it does not synthesize the owner's own entry that
+	// Graph normally includes (so IsRemovable is true on every returned grant).
+	ListCalendarPermissions(ctx context.Context, calendarID string) ([]Permission, error)
+	// GetCalendarPermission returns the grant with the given opaque id, or
+	// ErrPermissionNotFound.
+	GetCalendarPermission(ctx context.Context, calendarID, permissionID string) (Permission, error)
+}
+
+// PermissionWriter is the optional capability to grant, change, and revoke calendar
+// sharing, backing Graph's POST/PATCH/DELETE .../calendarPermissions. Like
+// PermissionReader it is type-asserted and bound to the same authenticated principal.
+type PermissionWriter interface {
+	// CreateCalendarPermission grants p (whose ID is empty) on the calendar and
+	// returns it with the backend-assigned ID.
+	CreateCalendarPermission(ctx context.Context, calendarID string, p Permission) (Permission, error)
+	// UpdateCalendarPermission changes the grant with the given id, returning the
+	// updated grant, or ErrPermissionNotFound.
+	UpdateCalendarPermission(ctx context.Context, calendarID, permissionID string, p Permission) (Permission, error)
+	// DeleteCalendarPermission revokes the grant with the given id, or returns
+	// ErrPermissionNotFound.
+	DeleteCalendarPermission(ctx context.Context, calendarID, permissionID string) error
+}
+
+// ErrPermissionNotFound is returned by PermissionReader/PermissionWriter when no
+// sharing grant has the requested id.
+var ErrPermissionNotFound = errors.New("calendar: permission not found")
