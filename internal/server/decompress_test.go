@@ -45,8 +45,26 @@ func TestDecompressRequestsGzip(t *testing.T) {
 	req.Header.Set("Content-Encoding", "gzip")
 	req.Header.Set("Content-Type", "application/json")
 
+	// A handler that asserts the gzip framing was stripped, then echoes the body.
+	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if enc := r.Header.Get("Content-Encoding"); enc != "" {
+			t.Errorf("Content-Encoding still set: %q", enc)
+		}
+		if cl := r.Header.Get("Content-Length"); cl != "" {
+			t.Errorf("Content-Length still set: %q", cl)
+		}
+		if r.ContentLength != -1 {
+			t.Errorf("ContentLength = %d, want -1", r.ContentLength)
+		}
+		b, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read body: %v", err)
+		}
+		_, _ = w.Write(b)
+	})
+
 	rec := httptest.NewRecorder()
-	DecompressRequests(echoBody(t)).ServeHTTP(rec, req)
+	DecompressRequests(inner).ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", rec.Code)
@@ -69,6 +87,26 @@ func TestDecompressRequestsPassThrough(t *testing.T) {
 	}
 	if got := rec.Body.String(); got != want {
 		t.Errorf("body = %q, want %q (should be untouched)", got, want)
+	}
+}
+
+func TestDecompressRequestsCapsInflatedSize(t *testing.T) {
+	// A small gzip payload that inflates past the cap (a gzip bomb). Reading the
+	// decompressed body must fail rather than allocate it all.
+	big := bytes.Repeat([]byte("a"), maxDecompressedBytes+1<<20)
+	req := httptest.NewRequest(http.MethodPost, "/v1.0/me/messages", bytes.NewReader(gzipBytes(t, string(big))))
+	req.Header.Set("Content-Encoding", "gzip")
+
+	var readErr error
+	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, readErr = io.ReadAll(r.Body)
+	})
+
+	rec := httptest.NewRecorder()
+	DecompressRequests(next).ServeHTTP(rec, req)
+
+	if readErr == nil {
+		t.Error("reading an over-large inflated body should fail, got nil error")
 	}
 }
 
