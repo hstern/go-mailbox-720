@@ -10,6 +10,7 @@ import (
 	subjectid "github.com/hstern/go-subjectid"
 
 	"github.com/hstern/go-mailbox-720/internal/auth"
+	"github.com/hstern/go-mailbox-720/internal/calendar"
 	"github.com/hstern/go-mailbox-720/internal/contacts"
 	"github.com/hstern/go-mailbox-720/internal/mail"
 	"github.com/hstern/go-mailbox-720/internal/smtp"
@@ -157,13 +158,26 @@ func (m mailIdentityProvider) Mail(ctx context.Context) (mail.Backend, error) {
 	return m.p.get(ctx)
 }
 
-// jmapContactsIdentityProvider adapts a perIdentityBackend to server.ContactsProvider.
-type jmapContactsIdentityProvider struct {
-	p *perIdentityBackend[contacts.Backend]
+// contactsIdentityProvider adapts a perIdentityBackend to server.ContactsProvider
+// for either JMAP or CardDAV; proto labels which, for startup logging.
+type contactsIdentityProvider struct {
+	p     *perIdentityBackend[contacts.Backend]
+	proto string
 }
 
-func (j jmapContactsIdentityProvider) Contacts(ctx context.Context) (contacts.Backend, error) {
-	return j.p.get(ctx)
+func (c contactsIdentityProvider) Contacts(ctx context.Context) (contacts.Backend, error) {
+	return c.p.get(ctx)
+}
+
+// calendarIdentityProvider adapts a perIdentityBackend to server.CalendarProvider
+// (CalDAV today; proto labels it for startup logging).
+type calendarIdentityProvider struct {
+	p     *perIdentityBackend[calendar.Backend]
+	proto string
+}
+
+func (c calendarIdentityProvider) Calendar(ctx context.Context) (calendar.Backend, error) {
+	return c.p.get(ctx)
 }
 
 // schedulingIdentityProvider adapts a perIdentityBackend[smtp.Sender] to

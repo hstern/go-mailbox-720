@@ -74,11 +74,13 @@ func main() {
 	mailJMAPAudience := flag.String("mail-jmap-audience", "", "RFC 8693 audience to request for the JMAP mail backend (MB720-42). When set together with -tokenexchange-endpoint, the mail backend authenticates per-identity — exchanging the user's token for a backend-audience token preserving their sub — instead of using the shared MAILBOXD_JMAP_TOKEN")
 	caldavURL := flag.String("cal-caldav-url", "", "CalDAV base URL for the calendar backend (empty: calendar operations return 501; password from MAILBOXD_CALDAV_PASSWORD). Use an https:// URL for TLS")
 	caldavUser := flag.String("cal-caldav-username", "", "CalDAV username for the calendar backend")
+	caldavAudience := flag.String("cal-caldav-audience", "", "RFC 8693 audience to request for the CalDAV calendar backend (MB720-44). When set together with -tokenexchange-endpoint, CalDAV authenticates per-identity with an Authorization: Bearer exchanged token instead of -cal-caldav-username/MAILBOXD_CALDAV_PASSWORD")
 	jmapCalSession := flag.String("cal-jmap-session-url", "", "JMAP session resource URL for the calendar backend (empty: use CalDAV, or return 501 if neither set; access token from MAILBOXD_CALENDAR_JMAP_TOKEN). Takes precedence over the CalDAV flags when set")
 	jmapCalUsername := flag.String("cal-jmap-username", "", "JMAP calendar username for HTTP Basic auth (empty: use bearer token from MAILBOXD_CALENDAR_JMAP_TOKEN; password from MAILBOXD_CALENDAR_JMAP_PASSWORD)")
 	jmapCalAPIURL := flag.String("cal-jmap-api-url", "", "override the apiUrl advertised in the JMAP session document (for servers advertising an unreachable internal apiUrl)")
 	carddavURL := flag.String("contacts-carddav-url", "", "CardDAV base URL for the contacts backend (empty: contacts operations return 501; password from MAILBOXD_CARDDAV_PASSWORD). Use an https:// URL for TLS")
 	carddavUser := flag.String("contacts-carddav-username", "", "CardDAV username for the contacts backend")
+	carddavAudience := flag.String("contacts-carddav-audience", "", "RFC 8693 audience to request for the CardDAV contacts backend (MB720-44). When set together with -tokenexchange-endpoint, CardDAV authenticates per-identity with an Authorization: Bearer exchanged token instead of -contacts-carddav-username/MAILBOXD_CARDDAV_PASSWORD")
 	contactsJMAP := flag.String("contacts-jmap-session-url", "", "JMAP session resource URL for the contacts backend (empty: use CardDAV, or return 501 if neither set; access token from MAILBOXD_CONTACTS_JMAP_TOKEN). Takes precedence over the CardDAV flags when set")
 	contactsJMAPAudience := flag.String("contacts-jmap-audience", "", "RFC 8693 audience to request for the JMAP contacts backend (MB720-42). When set together with -tokenexchange-endpoint, the contacts backend authenticates per-identity instead of using the shared MAILBOXD_CONTACTS_JMAP_TOKEN")
 	enableScheduling := flag.Bool("enable-scheduling", false, "run the iTIP scheduling trigger: turn inbound mail invitations into tentative calendar events (needs IMAP + CalDAV backends; opt-in, since it writes to the calendar). Auto-disables when the CalDAV server schedules natively (RFC 6638)")
@@ -130,7 +132,7 @@ func main() {
 	// A per-identity audience without an exchange endpoint is a misconfiguration:
 	// the backend would silently fall back to the shared static token, serving every
 	// authenticated user from one account. Fail loudly rather than leak across tenants.
-	if exchanger == nil && (*mailJMAPAudience != "" || *contactsJMAPAudience != "" || *mailIMAPAudience != "" || *smtpAudience != "") {
+	if exchanger == nil && (*mailJMAPAudience != "" || *contactsJMAPAudience != "" || *mailIMAPAudience != "" || *smtpAudience != "" || *caldavAudience != "" || *carddavAudience != "") {
 		log.Fatalln("mailboxd: the -*-audience flags require -tokenexchange-endpoint (per-identity backends need the token exchange)")
 	}
 
@@ -189,6 +191,14 @@ func main() {
 			password: os.Getenv("MAILBOXD_CALENDAR_JMAP_PASSWORD"),
 			apiURL:   *jmapCalAPIURL,
 		}
+	case *caldavURL != "" && exchanger != nil && *caldavAudience != "":
+		// Per-identity (MB720-44): exchange for a CalDAV-audience token and dial with
+		// Authorization: Bearer. Caching — CalDAV Close is a no-op (stateless HTTP, like JMAP).
+		url := *caldavURL
+		calProvider = calendarIdentityProvider{proto: "CalDAV", p: newPerIdentityBackend(exchanger, *caldavAudience,
+			func(_ subjectid.IssSubID, token string) (calendar.Backend, error) {
+				return caldav.Dial(url, "", "", &caldav.Options{BearerToken: token})
+			})}
 	case *caldavURL != "":
 		calProvider = staticCalDAVProvider{
 			url:      *caldavURL,
@@ -203,7 +213,7 @@ func main() {
 	case *contactsJMAP != "" && exchanger != nil && *contactsJMAPAudience != "":
 		// Per-identity (MB720-42), mirroring the JMAP mail backend.
 		sessionURL := *contactsJMAP
-		contactsProvider = jmapContactsIdentityProvider{newPerIdentityBackend(exchanger, *contactsJMAPAudience,
+		contactsProvider = contactsIdentityProvider{proto: "JMAP", p: newPerIdentityBackend(exchanger, *contactsJMAPAudience,
 			func(_ subjectid.IssSubID, token string) (contacts.Backend, error) {
 				return jmapcontacts.Dial(sessionURL, token, nil)
 			})}
@@ -214,6 +224,13 @@ func main() {
 			// appear in the process table.
 			token: os.Getenv("MAILBOXD_CONTACTS_JMAP_TOKEN"),
 		}
+	case *carddavURL != "" && exchanger != nil && *carddavAudience != "":
+		// Per-identity (MB720-44), mirroring the CalDAV backend (Bearer HTTPClient, caching).
+		url := *carddavURL
+		contactsProvider = contactsIdentityProvider{proto: "CardDAV", p: newPerIdentityBackend(exchanger, *carddavAudience,
+			func(_ subjectid.IssSubID, token string) (contacts.Backend, error) {
+				return carddav.Dial(url, "", "", &carddav.Options{BearerToken: token})
+			})}
 	case *carddavURL != "":
 		contactsProvider = staticCardDAVProvider{
 			url:      *carddavURL,
@@ -365,6 +382,8 @@ func run(addr string, authCfg auth.Config, revSink receiver.Sink, ssfReceiverPat
 		log.Println("mail: no backend configured — mail operations return 501")
 	}
 	switch p := calProvider.(type) {
+	case calendarIdentityProvider:
+		log.Printf("calendar: %s backend enabled (per-identity token exchange)", p.proto)
 	case staticJMAPCalendarProvider:
 		if p.username != "" {
 			log.Println("calendar: JMAP backend enabled (Basic auth)")
@@ -376,9 +395,9 @@ func run(addr string, authCfg auth.Config, revSink receiver.Sink, ssfReceiverPat
 	default:
 		log.Println("calendar: no backend configured — calendar operations return 501")
 	}
-	switch contactsProvider.(type) {
-	case jmapContactsIdentityProvider:
-		log.Println("contacts: JMAP backend enabled (per-identity token exchange)")
+	switch pv := contactsProvider.(type) {
+	case contactsIdentityProvider:
+		log.Printf("contacts: %s backend enabled (per-identity token exchange)", pv.proto)
 	case staticJMAPContactsProvider:
 		log.Println("contacts: JMAP backend enabled")
 	case staticCardDAVProvider:

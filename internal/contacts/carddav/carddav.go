@@ -20,6 +20,7 @@ import (
 	gocarddav "github.com/emersion/go-webdav/carddav"
 
 	"github.com/hstern/go-mailbox-720/internal/contacts"
+	"github.com/hstern/go-mailbox-720/internal/davauth"
 )
 
 // Options configures the CardDAV connection.
@@ -27,6 +28,11 @@ type Options struct {
 	// HTTPClient performs the underlying requests. When nil, http.DefaultClient
 	// is used. Supply a custom client to control TLS, timeouts, or proxies.
 	HTTPClient webdav.HTTPClient
+	// BearerToken, when non-empty, authenticates every request with
+	// Authorization: Bearer (the per-identity path, MB720-44) instead of HTTP
+	// Basic — the Dial username and password are then ignored. The token is an
+	// exchanged backend-audience access token.
+	BearerToken string
 }
 
 // Client is a CardDAV-backed contacts.Backend over a single authenticated
@@ -38,8 +44,10 @@ type Client struct {
 var _ contacts.Backend = (*Client)(nil)
 
 // Dial builds a CardDAV client for endpoint (the server's CardDAV base URL),
-// authenticating every request with HTTP Basic credentials. It does not perform
-// any network I/O itself — discovery happens lazily on the first call.
+// authenticating every request with HTTP Basic credentials — or, when
+// Options.BearerToken is set, with Authorization: Bearer (the per-identity path).
+// It does not perform any network I/O itself — discovery happens lazily on the
+// first call.
 func Dial(endpoint, username, password string, o *Options) (*Client, error) {
 	if o == nil {
 		o = &Options{}
@@ -48,7 +56,11 @@ func Dial(endpoint, username, password string, o *Options) (*Client, error) {
 	if httpClient == nil {
 		httpClient = http.DefaultClient
 	}
-	httpClient = webdav.HTTPClientWithBasicAuth(httpClient, username, password)
+	if o.BearerToken != "" {
+		httpClient = davauth.BearerHTTPClient(httpClient, o.BearerToken)
+	} else {
+		httpClient = webdav.HTTPClientWithBasicAuth(httpClient, username, password)
+	}
 
 	c, err := gocarddav.NewClient(httpClient, endpoint)
 	if err != nil {
