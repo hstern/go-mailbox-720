@@ -15,6 +15,7 @@ import (
 	"context"
 	"errors"
 	"flag"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -26,6 +27,7 @@ import (
 	// (internal/tz) works regardless of the host's system zoneinfo.
 	_ "time/tzdata"
 
+	clientauthn "github.com/hstern/go-oauth-client-authn"
 	"github.com/hstern/go-ssf/receiver"
 
 	"github.com/hstern/go-mailbox-720/internal/auth"
@@ -45,6 +47,7 @@ import (
 	"github.com/hstern/go-mailbox-720/internal/server"
 	"github.com/hstern/go-mailbox-720/internal/smtp"
 	"github.com/hstern/go-mailbox-720/internal/subscriptions"
+	"github.com/hstern/go-mailbox-720/internal/tokenexchange"
 )
 
 func main() {
@@ -56,6 +59,9 @@ func main() {
 	scopeClaims := flag.String("auth-scope-claims", "scope,roles", "comma-separated claims that carry granted scopes (Microsoft Entra/Azure AD: \"scope,scp,roles\" — scp is Entra's non-standard delegated-scope claim)")
 	introspectID := flag.String("auth-introspect-client-id", "", "OAuth2 client id for RFC 7662 introspection of opaque tokens (enables introspection; secret from MAILBOXD_INTROSPECT_CLIENT_SECRET)")
 	resourceID := flag.String("auth-resource", "", "this resource's identifier URL (RFC 8707); when set, publishes RFC 9728 protected-resource metadata at /.well-known/oauth-protected-resource")
+	tokenExchangeEndpoint := flag.String("tokenexchange-endpoint", "", "OAuth2 token endpoint for RFC 8693 token exchange (empty disables). Enables per-identity backends (MB720-41): a backend provider exchanges the authenticated user's token for a backend-audience token preserving the user's sub")
+	tokenExchangeClientID := flag.String("tokenexchange-client-id", "", "OAuth2 client id mailboxd authenticates with at the token-exchange endpoint (required when -tokenexchange-endpoint is set; secret from MAILBOXD_TOKENEXCHANGE_CLIENT_SECRET)")
+	tokenExchangeClientAuth := flag.String("tokenexchange-client-auth", "client_secret_basic", "client-authentication method at the token-exchange endpoint: client_secret_basic or client_secret_post")
 	ssfReceiverPath := flag.String("ssf-receiver-path", "/ssf/events", "public path for the Shared Signals SET receiver (CAEP/RISC revocation, MB720-18); served unauthenticated since the SET signature is the gate. Active only when auth is enabled")
 	imapAddr := flag.String("mail-imap-addr", "", "IMAP server address host:port for the mail backend (empty: mail operations return 501; password from MAILBOXD_IMAP_PASSWORD)")
 	imapUser := flag.String("mail-imap-username", "", "IMAP username for the mail backend")
@@ -101,6 +107,22 @@ func main() {
 			ClientSecret: os.Getenv("MAILBOXD_INTROSPECT_CLIENT_SECRET"),
 		}
 	}
+	// Build the RFC 8693 token-exchange helper that per-identity backend providers
+	// (MB720-42/43/44) use to mint backend-audience tokens from the authenticated
+	// user's token. It is nil when no endpoint is configured — the current default,
+	// where the static single-credential providers below serve every request.
+	exchanger, err := buildExchanger(*tokenExchangeEndpoint, *tokenExchangeClientID, *tokenExchangeClientAuth)
+	if err != nil {
+		log.Fatalln("mailboxd:", err)
+	}
+	// exchanger is consumed by the per-identity providers in MB720-42/43/44; for now
+	// it is constructed (validating its configuration at startup) and its status logged.
+	if exchanger != nil {
+		log.Println("token exchange: enabled (RFC 8693) — per-identity backend auth ready")
+	} else {
+		log.Println("token exchange: disabled — backends use their configured static credentials")
+	}
+
 	// JMAP and IMAP are alternative mail backends behind the same port; JMAP wins
 	// when its session URL is set (it is the closer fit for the JMAP-shaped port).
 	var provider server.MailProvider
@@ -585,6 +607,36 @@ func startScheduler(ctx context.Context, provider server.MailProvider, calProvid
 			log.Println("scheduling: trigger stopped:", err)
 		}
 	}()
+}
+
+// buildExchanger constructs the RFC 8693 token-exchange helper per-identity
+// backend providers use to mint backend-audience tokens from the authenticated
+// user's token (MB720-41). It returns (nil, nil) when no endpoint is configured —
+// the single-credential default. The client secret comes from the environment,
+// never a flag, so it does not appear in the process table; the chosen client-
+// authentication method (go-oauth-client-authn) travels on the http.Client the
+// exchange uses.
+func buildExchanger(endpoint, clientID, clientAuth string) (tokenexchange.Exchanger, error) {
+	if endpoint == "" {
+		return nil, nil
+	}
+	if clientID == "" {
+		return nil, fmt.Errorf("token exchange: -tokenexchange-client-id is required when -tokenexchange-endpoint is set")
+	}
+	secret := os.Getenv("MAILBOXD_TOKENEXCHANGE_CLIENT_SECRET")
+	if secret == "" {
+		return nil, fmt.Errorf("token exchange: MAILBOXD_TOKENEXCHANGE_CLIENT_SECRET is required for %s", clientAuth)
+	}
+	var method clientauthn.Method
+	switch clientAuth {
+	case "client_secret_basic":
+		method = clientauthn.ClientSecretBasic(clientID, secret)
+	case "client_secret_post":
+		method = clientauthn.ClientSecretPost(clientID, secret)
+	default:
+		return nil, fmt.Errorf("token exchange: unsupported -tokenexchange-client-auth %q (want client_secret_basic or client_secret_post)", clientAuth)
+	}
+	return tokenexchange.New(endpoint, clientauthn.NewClient(method, nil)), nil
 }
 
 // splitList parses a comma-separated flag value into a trimmed, non-empty slice.

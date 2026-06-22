@@ -248,6 +248,66 @@ func TestMiddleware(t *testing.T) {
 	}
 }
 
+func TestRawTokenInContext(t *testing.T) {
+	idp := newIDP(t)
+	a, err := New(context.Background(), Config{
+		Issuers:        []string{idp.issuer},
+		Audience:       testAud,
+		RequiredScopes: []string{"Mail.Read"},
+		ScopeClaims:    []string{"scope", "scp", "roles"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("set on accepted request", func(t *testing.T) {
+		tok := idp.sign(t, baseClaims(idp.issuer))
+		var gotRaw string
+		var gotOK bool
+		next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			gotRaw, gotOK = RawToken(r.Context())
+			w.WriteHeader(http.StatusOK)
+		})
+		req := httptest.NewRequest(http.MethodGet, "/v1.0/me/messages", nil)
+		req.Header.Set("Authorization", "Bearer "+tok)
+		a.Middleware(next).ServeHTTP(httptest.NewRecorder(), req)
+
+		if !gotOK {
+			t.Fatal("RawToken not present on an accepted request")
+		}
+		if gotRaw != tok {
+			t.Errorf("RawToken = %q, want the presented bearer token %q", gotRaw, tok)
+		}
+	})
+
+	t.Run("absent on rejected request", func(t *testing.T) {
+		// next must not run for a rejected request, but guard anyway: a rejected
+		// token must never expose a raw token downstream.
+		var gotOK bool
+		next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_, gotOK = RawToken(r.Context())
+		})
+		req := httptest.NewRequest(http.MethodGet, "/v1.0/me/messages", nil)
+		req.Header.Set("Authorization", "Bearer not-a-valid-token")
+		rec := httptest.NewRecorder()
+		a.Middleware(next).ServeHTTP(rec, req)
+
+		if rec.Code == http.StatusOK {
+			t.Fatal("invalid token was accepted")
+		}
+		if gotOK {
+			t.Error("RawToken present on a rejected request")
+		}
+	})
+}
+
+// RawToken on a context the middleware never touched reports absent.
+func TestRawTokenAbsentByDefault(t *testing.T) {
+	if raw, ok := RawToken(context.Background()); ok || raw != "" {
+		t.Errorf("RawToken on a bare context = (%q, %v), want (\"\", false)", raw, ok)
+	}
+}
+
 func TestSubjectClaimMapping(t *testing.T) {
 	idp := newIDP(t)
 	a, err := New(context.Background(), Config{
