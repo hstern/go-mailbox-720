@@ -69,6 +69,7 @@ func main() {
 	sieveAddr := flag.String("mail-managesieve-addr", "", "ManageSieve server host:port (RFC 5804) for inbox rules on the IMAP tier (empty: mail-filter operations return 501; SASL PLAIN reuses the IMAP username and MAILBOXD_IMAP_PASSWORD)")
 	sieveTLS := flag.Bool("mail-managesieve-starttls", true, "use STARTTLS on the ManageSieve connection (RFC 5804 §2.2); disabling it sends the SASL PLAIN credentials in the clear — for local servers only")
 	jmapSession := flag.String("mail-jmap-session-url", "", "JMAP session resource URL for the mail backend (empty: use IMAP, or return 501 if neither set; access token from MAILBOXD_JMAP_TOKEN). Takes precedence over the IMAP flags when set")
+	mailJMAPAudience := flag.String("mail-jmap-audience", "", "RFC 8693 audience to request for the JMAP mail backend (MB720-42). When set together with -tokenexchange-endpoint, the mail backend authenticates per-identity — exchanging the user's token for a backend-audience token preserving their sub — instead of using the shared MAILBOXD_JMAP_TOKEN")
 	caldavURL := flag.String("cal-caldav-url", "", "CalDAV base URL for the calendar backend (empty: calendar operations return 501; password from MAILBOXD_CALDAV_PASSWORD). Use an https:// URL for TLS")
 	caldavUser := flag.String("cal-caldav-username", "", "CalDAV username for the calendar backend")
 	jmapCalSession := flag.String("cal-jmap-session-url", "", "JMAP session resource URL for the calendar backend (empty: use CalDAV, or return 501 if neither set; access token from MAILBOXD_CALENDAR_JMAP_TOKEN). Takes precedence over the CalDAV flags when set")
@@ -77,6 +78,7 @@ func main() {
 	carddavURL := flag.String("contacts-carddav-url", "", "CardDAV base URL for the contacts backend (empty: contacts operations return 501; password from MAILBOXD_CARDDAV_PASSWORD). Use an https:// URL for TLS")
 	carddavUser := flag.String("contacts-carddav-username", "", "CardDAV username for the contacts backend")
 	contactsJMAP := flag.String("contacts-jmap-session-url", "", "JMAP session resource URL for the contacts backend (empty: use CardDAV, or return 501 if neither set; access token from MAILBOXD_CONTACTS_JMAP_TOKEN). Takes precedence over the CardDAV flags when set")
+	contactsJMAPAudience := flag.String("contacts-jmap-audience", "", "RFC 8693 audience to request for the JMAP contacts backend (MB720-42). When set together with -tokenexchange-endpoint, the contacts backend authenticates per-identity instead of using the shared MAILBOXD_CONTACTS_JMAP_TOKEN")
 	enableScheduling := flag.Bool("enable-scheduling", false, "run the iTIP scheduling trigger: turn inbound mail invitations into tentative calendar events (needs IMAP + CalDAV backends; opt-in, since it writes to the calendar). Auto-disables when the CalDAV server schedules natively (RFC 6638)")
 	smtpAddr := flag.String("smtp-addr", "", "SMTP submission server host:port for emailing meeting accept/decline replies (empty: those operations return 501; password from MAILBOXD_SMTP_PASSWORD)")
 	smtpUser := flag.String("smtp-username", "", "SMTP username")
@@ -122,11 +124,23 @@ func main() {
 	} else {
 		log.Println("token exchange: disabled — backends use their configured static credentials")
 	}
+	// A per-identity audience without an exchange endpoint is a misconfiguration:
+	// the backend would silently fall back to the shared static token, serving every
+	// authenticated user from one account. Fail loudly rather than leak across tenants.
+	if exchanger == nil && (*mailJMAPAudience != "" || *contactsJMAPAudience != "") {
+		log.Fatalln("mailboxd: -mail-jmap-audience/-contacts-jmap-audience require -tokenexchange-endpoint (per-identity backends need the token exchange)")
+	}
 
 	// JMAP and IMAP are alternative mail backends behind the same port; JMAP wins
 	// when its session URL is set (it is the closer fit for the JMAP-shaped port).
 	var provider server.MailProvider
 	switch {
+	case *jmapSession != "" && exchanger != nil && *mailJMAPAudience != "":
+		// Per-identity (MB720-42): exchange each user's token for a JMAP-mail-
+		// audience token and dial as that user. sessionURL is captured for the dial.
+		sessionURL := *jmapSession
+		provider = jmapMailIdentityProvider{newPerIdentityBackend(exchanger, *mailJMAPAudience,
+			func(token string) (mail.Backend, error) { return mailjmap.Dial(sessionURL, token, nil) })}
 	case *jmapSession != "":
 		provider = staticJMAPProvider{
 			sessionURL: *jmapSession,
@@ -172,6 +186,11 @@ func main() {
 	// wins when its session URL is set (it is the closer fit for the JMAP-shaped port).
 	var contactsProvider server.ContactsProvider
 	switch {
+	case *contactsJMAP != "" && exchanger != nil && *contactsJMAPAudience != "":
+		// Per-identity (MB720-42), mirroring the JMAP mail backend.
+		sessionURL := *contactsJMAP
+		contactsProvider = jmapContactsIdentityProvider{newPerIdentityBackend(exchanger, *contactsJMAPAudience,
+			func(token string) (contacts.Backend, error) { return jmapcontacts.Dial(sessionURL, token, nil) })}
 	case *contactsJMAP != "":
 		contactsProvider = staticJMAPContactsProvider{
 			sessionURL: *contactsJMAP,
@@ -308,6 +327,8 @@ func run(addr string, authCfg auth.Config, revSink receiver.Sink, ssfReceiverPat
 		return err
 	}
 	switch provider.(type) {
+	case jmapMailIdentityProvider:
+		log.Println("mail: JMAP backend enabled (per-identity token exchange)")
 	case staticJMAPProvider:
 		log.Println("mail: JMAP backend enabled")
 	case staticIMAPProvider:
@@ -327,9 +348,14 @@ func run(addr string, authCfg auth.Config, revSink receiver.Sink, ssfReceiverPat
 	default:
 		log.Println("calendar: no backend configured — calendar operations return 501")
 	}
-	if contactsProvider != nil {
+	switch contactsProvider.(type) {
+	case jmapContactsIdentityProvider:
+		log.Println("contacts: JMAP backend enabled (per-identity token exchange)")
+	case staticJMAPContactsProvider:
+		log.Println("contacts: JMAP backend enabled")
+	case staticCardDAVProvider:
 		log.Println("contacts: CardDAV backend enabled")
-	} else {
+	default:
 		log.Println("contacts: no backend configured — contacts operations return 501")
 	}
 
