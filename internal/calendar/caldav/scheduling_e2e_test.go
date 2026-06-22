@@ -32,7 +32,9 @@ type e2eSchedulingProvider struct {
 }
 
 func (p e2eSchedulingProvider) Sender(context.Context) (smtp.Sender, error) { return p.sender, nil }
-func (p e2eSchedulingProvider) MailboxAddress() string                      { return p.addr }
+func (p e2eSchedulingProvider) MailboxAddress(context.Context) (string, error) {
+	return p.addr, nil
+}
 
 type clientCalendarProvider struct{ cl *Client }
 

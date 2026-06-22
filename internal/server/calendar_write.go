@@ -216,8 +216,8 @@ func (h Handler) shouldSelfSchedule(ctx context.Context, b calendar.Backend, eve
 	if h.scheduling == nil {
 		return "", false
 	}
-	organizer = h.scheduling.MailboxAddress()
-	if organizer == "" {
+	organizer, err := h.scheduling.MailboxAddress(ctx)
+	if err != nil || organizer == "" {
 		return "", false
 	}
 	hasRecipient := false
@@ -300,8 +300,8 @@ func (h Handler) reinviteOnUpdate(ctx context.Context, b calendar.Backend, curre
 	if h.scheduling == nil {
 		return merged
 	}
-	organizer := h.scheduling.MailboxAddress()
-	if organizer == "" {
+	organizer, err := h.scheduling.MailboxAddress(ctx)
+	if err != nil || organizer == "" {
 		return merged
 	}
 	if native, _ := serverSchedulesEvents(ctx, b); native {

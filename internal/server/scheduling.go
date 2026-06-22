@@ -24,8 +24,11 @@ type SchedulingProvider interface {
 	// Sender returns an SMTP sender for one reply; the caller closes it.
 	Sender(ctx context.Context) (smtp.Sender, error)
 	// MailboxAddress is the mailbox owner's email, the responding attendee on a
-	// reply. An empty value means the responder is unknown and replies are refused.
-	MailboxAddress() string
+	// reply. It takes ctx because a per-identity provider derives it from the
+	// authenticated principal (MB720-43). An empty value means the responder is
+	// unknown and replies are refused; a non-nil error means it could not be
+	// resolved (e.g. an unauthenticated request).
+	MailboxAddress(ctx context.Context) (string, error)
 }
 
 // MeEventsEventAccept implements POST /me/events/{event-id}/accept: it emails an
@@ -99,7 +102,10 @@ func (h Handler) respondToInvite(ctx context.Context, eventID string, sendRespon
 		return nil, nil
 	}
 
-	me := h.scheduling.MailboxAddress()
+	me, err := h.scheduling.MailboxAddress(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("resolve mailbox address: %w", err)
+	}
 	if me == "" {
 		return badRequest("no mailbox address is configured, so a meeting response cannot be sent"), nil
 	}

@@ -14,7 +14,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -22,6 +24,7 @@ import (
 	"github.com/emersion/go-imap/v2/imapclient"
 	gomessage "github.com/emersion/go-message"
 	gomail "github.com/emersion/go-message/mail"
+	"github.com/emersion/go-sasl"
 
 	"github.com/hstern/go-mailbox-720/internal/mail"
 	"github.com/hstern/go-mailbox-720/internal/odata"
@@ -37,6 +40,12 @@ type Options struct {
 	// which the rules live as a Sieve script. When nil the backend reports filters
 	// unsupported (the server maps that to 501).
 	ManageSieve *ManageSieveOptions
+	// BearerToken, when non-empty, authenticates with SASL OAUTHBEARER (RFC 7628)
+	// using this token instead of the IMAP LOGIN command — the per-identity path
+	// (MB720-43), where the token is an exchanged backend-audience access token. The
+	// Dial username becomes the OAUTHBEARER authorization identity and the Dial
+	// password is ignored.
+	BearerToken string
 }
 
 // ManageSieveOptions configures the ManageSieve connection used for inbox rules. It
@@ -121,9 +130,9 @@ func Dial(addr, username, password string, o *Options) (*Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("imap: dial %s: %w", addr, err)
 	}
-	if err := c.Login(username, password).Wait(); err != nil {
+	if err := authenticate(c, addr, username, password, o.BearerToken); err != nil {
 		_ = c.Close()
-		return nil, fmt.Errorf("imap: login: %w", err)
+		return nil, err
 	}
 	cl.c = c
 	cl.sieve = resolveManageSieve(o.ManageSieve, username, password)
@@ -138,6 +147,37 @@ func Dial(addr, username, password string, o *Options) (*Client, error) {
 		}
 	}
 	return cl, nil
+}
+
+// authenticate logs in to the IMAP connection: SASL OAUTHBEARER (RFC 7628) when a
+// bearer token is supplied — the per-identity path, where username is the
+// authorization identity and password is ignored — else the IMAP LOGIN command.
+func authenticate(c *imapclient.Client, addr, username, password, bearer string) error {
+	if bearer != "" {
+		host, port := splitAddr(addr)
+		sc := sasl.NewOAuthBearerClient(&sasl.OAuthBearerOptions{
+			Username: username, Token: bearer, Host: host, Port: port,
+		})
+		if err := c.Authenticate(sc); err != nil {
+			return fmt.Errorf("imap: oauthbearer: %w", err)
+		}
+		return nil
+	}
+	if err := c.Login(username, password).Wait(); err != nil {
+		return fmt.Errorf("imap: login: %w", err)
+	}
+	return nil
+}
+
+// splitAddr splits a host:port into host and integer port (0 when unparseable),
+// for the OAUTHBEARER GS2 header (RFC 7628 §3.1).
+func splitAddr(addr string) (string, int) {
+	host, portStr, err := net.SplitHostPort(addr)
+	if err != nil {
+		return addr, 0
+	}
+	port, _ := strconv.Atoi(portStr)
+	return host, port
 }
 
 // fireUnilateral invokes the currently-registered watch callback, if any. It is

@@ -34,7 +34,9 @@ type fakeSchedulingProvider struct {
 }
 
 func (p fakeSchedulingProvider) Sender(_ context.Context) (smtp.Sender, error) { return p.sender, nil }
-func (p fakeSchedulingProvider) MailboxAddress() string                        { return p.addr }
+func (p fakeSchedulingProvider) MailboxAddress(_ context.Context) (string, error) {
+	return p.addr, nil
+}
 
 // seededInvite is a calendar backend whose GetEvent returns one event carrying a
 // UID + organizer — what a reply needs.
