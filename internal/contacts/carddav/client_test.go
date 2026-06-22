@@ -169,8 +169,8 @@ func TestClientListContacts(t *testing.T) {
 		t.Fatalf("got %d contacts, want 1", len(got))
 	}
 	c := got[0]
-	if c.DisplayName != "Alice Gopher" {
-		t.Errorf("DisplayName = %q", c.DisplayName)
+	if c.DisplayName() != "Alice Gopher" {
+		t.Errorf("DisplayName = %q", c.DisplayName())
 	}
 	if c.AddressBookID != abID {
 		t.Errorf("AddressBookID = %q, want %q", c.AddressBookID, abID)
@@ -178,8 +178,8 @@ func TestClientListContacts(t *testing.T) {
 	if c.ID != contactID(testCardPath) {
 		t.Errorf("ID = %q, want %q", c.ID, contactID(testCardPath))
 	}
-	if len(c.Emails) != 1 || c.Emails[0].Address != "alice@example.com" {
-		t.Errorf("Emails = %+v", c.Emails)
+	if emails := c.EmailList(); len(emails) != 1 || emails[0].Address != "alice@example.com" {
+		t.Errorf("Emails = %+v", emails)
 	}
 }
 
@@ -206,8 +206,8 @@ func TestClientGetContact(t *testing.T) {
 	if c.AddressBookID != addressBookID(testAddressBook) {
 		t.Errorf("AddressBookID = %q, want %q", c.AddressBookID, addressBookID(testAddressBook))
 	}
-	if len(c.Phones) != 1 || c.Phones[0].Number != "+1-555-0100" {
-		t.Errorf("Phones = %+v", c.Phones)
+	if phones := c.PhoneList(); len(phones) != 1 || phones[0].Number != "+1-555-0100" {
+		t.Errorf("Phones = %+v", phones)
 	}
 }
 

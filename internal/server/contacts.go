@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/hstern/go-jscontact"
 	ht "github.com/ogen-go/ogen/http"
 
 	"github.com/hstern/go-mailbox-720/internal/contacts"
@@ -88,27 +89,29 @@ func (h Handler) MeGetContacts(ctx context.Context, params api.MeGetContactsPara
 }
 
 // toGraphContact maps the neutral contacts.Contact onto the generated Graph type.
+// The rich jscontact.Card is projected onto the flat, single-valued Graph DTO via
+// the helper methods (DisplayName/GivenName/… read the embedded Card).
 func toGraphContact(c contacts.Contact) api.MicrosoftGraphContact {
 	gc := api.MicrosoftGraphContact{
 		ID:             api.NewOptString(c.ID),
-		DisplayName:    api.NewOptNilString(c.DisplayName),
-		GivenName:      api.NewOptNilString(c.GivenName),
-		Surname:        api.NewOptNilString(c.Surname),
-		CompanyName:    api.NewOptNilString(c.Organization),
-		JobTitle:       api.NewOptNilString(c.Title),
-		EmailAddresses: toGraphEmailAddresses(c.Emails),
+		DisplayName:    api.NewOptNilString(c.DisplayName()),
+		GivenName:      api.NewOptNilString(c.GivenName()),
+		Surname:        api.NewOptNilString(c.Surname()),
+		CompanyName:    api.NewOptNilString(c.Organization()),
+		JobTitle:       api.NewOptNilString(c.Title()),
+		EmailAddresses: toGraphEmailAddresses(c.EmailList()),
 	}
-	if c.Note != "" {
-		gc.PersonalNotes = api.NewOptNilString(c.Note)
+	if c.Note() != "" {
+		gc.PersonalNotes = api.NewOptNilString(c.Note())
 	}
-	addPhones(&gc, c.Phones)
+	addPhones(&gc, c.PhoneList())
 	return gc
 }
 
 // toGraphEmailAddresses maps the contact's emails onto Graph emailAddress
-// objects. The vCard TYPE label becomes the Graph name, the closest analog the
-// emailAddress shape offers.
-func toGraphEmailAddresses(emails []contacts.EmailAddress) []api.MicrosoftGraphEmailAddress {
+// objects. The JSContact type label (contacts.EmailType) becomes the Graph name,
+// the closest analog the emailAddress shape offers.
+func toGraphEmailAddresses(emails []jscontact.EmailAddress) []api.MicrosoftGraphEmailAddress {
 	if len(emails) == 0 {
 		return nil
 	}
@@ -116,7 +119,7 @@ func toGraphEmailAddresses(emails []contacts.EmailAddress) []api.MicrosoftGraphE
 	for _, e := range emails {
 		out = append(out, api.MicrosoftGraphEmailAddress{
 			Address: api.NewOptNilString(e.Address),
-			Name:    api.NewOptNilString(e.Type),
+			Name:    api.NewOptNilString(contacts.EmailType(e)),
 		})
 	}
 	return out
@@ -124,12 +127,13 @@ func toGraphEmailAddresses(emails []contacts.EmailAddress) []api.MicrosoftGraphE
 
 // addPhones distributes the contact's phone numbers across the Graph contact's
 // type-specific phone fields. Graph splits phone numbers by kind (business,
-// home, mobile) rather than carrying a TYPE label, so the vCard TEL TYPE selects
-// the destination: "cell"/"mobile" -> mobilePhone (a single value, first wins),
-// "home" -> homePhones, everything else -> businessPhones (the Graph default).
-func addPhones(gc *api.MicrosoftGraphContact, phones []contacts.Phone) {
+// home, mobile) rather than carrying a TYPE label, so the JSContact phone type
+// (contacts.PhoneType) selects the destination: "cell"/"mobile" -> mobilePhone (a
+// single value, first wins), "home" -> homePhones, everything else ->
+// businessPhones (the Graph default).
+func addPhones(gc *api.MicrosoftGraphContact, phones []jscontact.Phone) {
 	for _, p := range phones {
-		switch t := strings.ToLower(p.Type); {
+		switch t := strings.ToLower(contacts.PhoneType(p)); {
 		case strings.Contains(t, "cell"), strings.Contains(t, "mobile"):
 			if !gc.MobilePhone.Set {
 				gc.MobilePhone = api.NewOptNilString(p.Number)

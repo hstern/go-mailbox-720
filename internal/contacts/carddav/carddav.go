@@ -13,11 +13,11 @@ import (
 	"context"
 	"fmt"
 	"net/http"
-	"strings"
 
 	"github.com/emersion/go-vcard"
 	"github.com/emersion/go-webdav"
 	gocarddav "github.com/emersion/go-webdav/carddav"
+	jsvcard "github.com/hstern/go-jscontact/vcard"
 
 	"github.com/hstern/go-mailbox-720/internal/contacts"
 	"github.com/hstern/go-mailbox-720/internal/davauth"
@@ -145,77 +145,23 @@ func (cl *Client) GetContact(ctx context.Context, id string) (contacts.Contact, 
 }
 
 // contactFromObject maps one CardDAV address object's vCard to a neutral
-// Contact, stamping the opaque IDs. Reports false when the card is empty (nil or
-// no properties), so an unparseable object is skipped rather than yielding a
-// blank contact.
+// Contact, stamping the opaque IDs. The vCard↔JSContact field mapping (names,
+// orgs, titles, emails, phones, notes, TYPE params) is delegated to the
+// go-jscontact/vcard bridge (RFC 9555); this only sets the opaque envelope IDs
+// that are ours, not JSContact's. Reports false when the card is empty (nil or
+// no properties) or the bridge fails to convert it, so an unparseable object is
+// skipped rather than yielding a blank contact.
 func contactFromObject(abID, objectPath string, card vcard.Card) (contacts.Contact, bool) {
 	if len(card) == 0 {
 		return contacts.Contact{}, false
 	}
-	c := mapContact(card)
-	c.ID = contactID(objectPath)
-	c.AddressBookID = abID
-	return c, true
-}
-
-// mapContact maps a vCard to a neutral Contact. It is best-effort: a missing
-// property yields a zero value for that field rather than failing the whole
-// contact. ID and AddressBookID are left to the caller.
-func mapContact(card vcard.Card) contacts.Contact {
-	c := contacts.Contact{
-		UID:          card.Value(vcard.FieldUID),
-		DisplayName:  card.PreferredValue(vcard.FieldFormattedName),
-		Organization: orgName(card.Value(vcard.FieldOrganization)),
-		Title:        card.Value(vcard.FieldTitle),
-		Note:         card.Value(vcard.FieldNote),
+	jsCard, err := jsvcard.FromVCard(card)
+	if err != nil || jsCard == nil {
+		return contacts.Contact{}, false
 	}
-	if n := card.Name(); n != nil {
-		c.GivenName = n.GivenName
-		c.Surname = n.FamilyName
-	}
-	for _, f := range card[vcard.FieldEmail] {
-		addr := strings.TrimSpace(f.Value)
-		if addr == "" {
-			continue
-		}
-		c.Emails = append(c.Emails, contacts.EmailAddress{
-			Address: addr,
-			Type:    primaryType(f),
-		})
-	}
-	for _, f := range card[vcard.FieldTelephone] {
-		num := strings.TrimSpace(f.Value)
-		if num == "" {
-			continue
-		}
-		c.Phones = append(c.Phones, contacts.Phone{
-			Number: num,
-			Type:   primaryType(f),
-		})
-	}
-	return c
-}
-
-// orgName extracts the organization name from a vCard ORG value. ORG is a
-// structured value whose components (organization name, then organizational
-// units) are separated by ";"; only the first component is the organization
-// name.
-func orgName(org string) string {
-	if i := strings.IndexByte(org, ';'); i >= 0 {
-		return org[:i]
-	}
-	return org
-}
-
-// primaryType returns a field's first TYPE parameter value (e.g. "home" or
-// "work"), or "" when the field carries no TYPE. A vCard field may list several
-// types; the first is reported.
-func primaryType(f *vcard.Field) string {
-	if f == nil {
-		return ""
-	}
-	if types := f.Params.Types(); len(types) > 0 {
-		return types[0]
-	}
-	return ""
+	return contacts.Contact{
+		ID:            contactID(objectPath),
+		AddressBookID: abID,
+		Card:          *jsCard,
+	}, true
 }

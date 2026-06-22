@@ -13,21 +13,9 @@ package contacts
 
 import (
 	"context"
+
+	"github.com/hstern/go-jscontact"
 )
-
-// EmailAddress is a contact's email address with an optional type label (e.g.
-// "home" or "work") drawn from the vCard EMAIL property's TYPE parameter.
-type EmailAddress struct {
-	Address string
-	Type    string
-}
-
-// Phone is a contact's telephone number with an optional type label (e.g.
-// "home", "work", or "cell") drawn from the vCard TEL property's TYPE parameter.
-type Phone struct {
-	Number string
-	Type   string
-}
 
 // AddressBook is an address-book collection in Graph/JMAP object shape.
 type AddressBook struct {
@@ -36,21 +24,27 @@ type AddressBook struct {
 	Description string
 }
 
-// Contact is an address-book entry in Graph/JMAP object shape. Because CardDAV
-// returns whole vCards rather than a cheap envelope, list and get operations
-// populate the same fields; there is no body to defer.
+// Contact is an address-book entry in the standardized JSContact (RFC 9553)
+// object shape. It embeds [jscontact.Card] — the neutral pivot model the whole
+// contacts subsystem speaks — and adds the opaque, backend-derived routing IDs
+// that are ours, not JSContact's (the store/Graph ID a client round-trips and
+// the owning address book). The CardDAV adapter maps vCard↔[jscontact.Card] via
+// the go-jscontact/vcard bridge; the JMAP adapter carries it natively; the
+// server maps it to/from the Microsoft Graph contact DTO (MB720-50/26).
+//
+// The embedded fields carry the contact content: UID, Name, Organizations,
+// Titles, Emails, Phones, Notes, and the rest of RFC 9553. Access the
+// single-valued, Graph-shaped projections (DisplayName, GivenName, Organization,
+// …) and the ordered email/phone lists via the helpers in jscontact.go.
 type Contact struct {
-	ID            string
+	// ID is the opaque, stable store/Graph identifier (derived from the backend
+	// resource, e.g. a CardDAV href). Distinct from the embedded JSContact UID.
+	ID string
+	// AddressBookID is the opaque ID of the address-book collection the contact
+	// lives in.
 	AddressBookID string
-	UID           string // the vCard UID, stable across the contact's lifetime
-	DisplayName   string // mapped from the vCard FN (formatted name)
-	GivenName     string // the vCard N given-name component
-	Surname       string // the vCard N family-name component
-	Organization  string // the vCard ORG (organization name)
-	Title         string // the vCard TITLE (job title)
-	Emails        []EmailAddress
-	Phones        []Phone
-	Note          string
+
+	jscontact.Card
 }
 
 // Backend is the contacts backing-store port. Implementations adapt a concrete

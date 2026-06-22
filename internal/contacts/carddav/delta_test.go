@@ -27,7 +27,8 @@ import (
 //   - the supplied sync-token is passed through in the request body (empty for
 //     initial sync, the prior token on the next call),
 //   - each updated href is mapped to a Contact via the existing
-//     contactFromObject/mapContact path and stamped with its opaque id, and
+//     contactFromObject (go-jscontact/vcard bridge) path and stamped with its
+//     opaque id, and
 //   - the response's next sync-token is returned for the following call.
 //
 // The follow-up GET is necessary because go-webdav's SyncResponse.Updated
@@ -145,8 +146,8 @@ func TestSyncDelta(t *testing.T) {
 	if c.AddressBookID != abID {
 		t.Errorf("AddressBookID = %q, want %q", c.AddressBookID, abID)
 	}
-	if c.DisplayName != "Alice Gopher" {
-		t.Errorf("DisplayName = %q, want %q", c.DisplayName, "Alice Gopher")
+	if c.DisplayName() != "Alice Gopher" {
+		t.Errorf("DisplayName = %q, want %q", c.DisplayName(), "Alice Gopher")
 	}
 	if c.UID != "alice-uid-1" {
 		t.Errorf("UID = %q, want %q", c.UID, "alice-uid-1")

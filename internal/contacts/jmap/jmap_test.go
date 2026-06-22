@@ -174,23 +174,23 @@ func TestListContactsMapsJSContact(t *testing.T) {
 		"ID":            {c.ID, "card-1"},
 		"AddressBookID": {c.AddressBookID, "ab-1"},
 		"UID":           {c.UID, "uid-alice"},
-		"DisplayName":   {c.DisplayName, "Alice Smith"},
-		"GivenName":     {c.GivenName, "Alice"},
-		"Surname":       {c.Surname, "Smith"},
-		"Organization":  {c.Organization, "Acme"},
-		"Title":         {c.Title, "Engineer"},
-		"Note":          {c.Note, "VIP"},
+		"DisplayName":   {c.DisplayName(), "Alice Smith"},
+		"GivenName":     {c.GivenName(), "Alice"},
+		"Surname":       {c.Surname(), "Smith"},
+		"Organization":  {c.Organization(), "Acme"},
+		"Title":         {c.Title(), "Engineer"},
+		"Note":          {c.Note(), "VIP"},
 	}
 	for field, got := range checks {
 		if got[0] != got[1] {
 			t.Errorf("%s = %q, want %q", field, got[0], got[1])
 		}
 	}
-	if len(c.Emails) != 1 || c.Emails[0].Address != "alice@example.com" {
-		t.Errorf("emails = %+v", c.Emails)
+	if emails := c.EmailList(); len(emails) != 1 || emails[0].Address != "alice@example.com" {
+		t.Errorf("emails = %+v", emails)
 	}
-	if len(c.Phones) != 1 || c.Phones[0].Number != "+1-555-0100" {
-		t.Errorf("phones = %+v", c.Phones)
+	if phones := c.PhoneList(); len(phones) != 1 || phones[0].Number != "+1-555-0100" {
+		t.Errorf("phones = %+v", phones)
 	}
 }
 

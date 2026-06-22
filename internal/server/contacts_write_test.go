@@ -4,6 +4,8 @@ import (
 	"context"
 	"testing"
 
+	"github.com/hstern/go-jscontact"
+
 	"github.com/hstern/go-mailbox-720/internal/contacts"
 	"github.com/hstern/go-mailbox-720/internal/graph/api"
 )
@@ -48,17 +50,19 @@ func newWritableContactsBackend() *writableContactsBackend {
 // seededContact is the current contact the writable backend's GetContact
 // returns, used by the PATCH (read-modify-write) tests. Its fields stand in for
 // an existing stored record so a partial patch can be checked for leaving them
-// intact.
-var seededContact = contacts.Contact{
-	ID:           "contact-1",
-	UID:          "uid-1",
-	DisplayName:  "Old Name",
-	GivenName:    "Old",
-	Surname:      "Name",
-	Organization: "Old Inc",
-	Title:        "Old Title",
-	Emails:       []contacts.EmailAddress{{Address: "old@example.com", Type: "work"}},
-	Phones:       []contacts.Phone{{Number: "+1-555-0000", Type: "work"}},
+// intact. It is built through the JSContact builders (the projected fields are
+// read-only methods on the embedded Card).
+var seededContact = newSeededContact()
+
+func newSeededContact() contacts.Contact {
+	c := contacts.Contact{ID: "contact-1"}
+	c.UID = "uid-1"
+	c.SetName("Old Name", "Old", "Name")
+	c.SetOrganization("Old Inc")
+	c.SetTitle("Old Title")
+	c.SetEmails([]jscontact.EmailAddress{contacts.NewEmail("old@example.com", "work")})
+	c.SetPhones([]jscontact.Phone{contacts.NewPhone("+1-555-0000", "work")})
+	return c
 }
 
 // newWritableContactsBackendSeeded returns a writable backend whose GetContact
@@ -115,22 +119,22 @@ func TestMeCreateContactsMapsBodyAndCallsWriter(t *testing.T) {
 		t.Errorf("create address-book id = %q, want book-default", backend.createdBookID)
 	}
 	c := backend.createdContact
-	if c.DisplayName != "Carol Example" {
-		t.Errorf("mapped display name = %q, want Carol Example", c.DisplayName)
+	if c.DisplayName() != "Carol Example" {
+		t.Errorf("mapped display name = %q, want Carol Example", c.DisplayName())
 	}
-	if c.Organization != "Example Inc" {
-		t.Errorf("mapped organization = %q, want Example Inc", c.Organization)
+	if c.Organization() != "Example Inc" {
+		t.Errorf("mapped organization = %q, want Example Inc", c.Organization())
 	}
-	if c.Title != "Manager" {
-		t.Errorf("mapped title = %q, want Manager", c.Title)
+	if c.Title() != "Manager" {
+		t.Errorf("mapped title = %q, want Manager", c.Title())
 	}
-	if got := len(c.Emails); got != 1 || c.Emails[0].Address != "carol@example.com" {
-		t.Errorf("mapped emails = %+v, want one carol@example.com", c.Emails)
+	if emails := c.EmailList(); len(emails) != 1 || emails[0].Address != "carol@example.com" {
+		t.Errorf("mapped emails = %+v, want one carol@example.com", emails)
 	}
-	// Business + mobile phones both map back, with vCard TYPE labels.
+	// Business + mobile phones both map back, with JSContact type labels.
 	var work, cell bool
-	for _, p := range c.Phones {
-		switch p.Type {
+	for _, p := range c.PhoneList() {
+		switch contacts.PhoneType(p) {
 		case "work":
 			work = p.Number == "+1-555-0123"
 		case "cell":
@@ -138,7 +142,7 @@ func TestMeCreateContactsMapsBodyAndCallsWriter(t *testing.T) {
 		}
 	}
 	if !work || !cell {
-		t.Errorf("mapped phones = %+v, want work+cell", c.Phones)
+		t.Errorf("mapped phones = %+v, want work+cell", c.PhoneList())
 	}
 	if got := ok.Response.ID.Or(""); got != "contact-new" {
 		t.Errorf("returned contact id = %q, want contact-new (backend-stamped)", got)
@@ -211,23 +215,23 @@ func TestMeUpdateContactsPartialMergeLeavesAbsentFields(t *testing.T) {
 	}
 
 	got := backend.updatedContact
-	if got.DisplayName != "New Name" {
-		t.Errorf("merged display name = %q, want New Name", got.DisplayName)
+	if got.DisplayName() != "New Name" {
+		t.Errorf("merged display name = %q, want New Name", got.DisplayName())
 	}
-	if got.GivenName != "Old" || got.Surname != "Name" {
-		t.Errorf("merged name parts = (%q,%q), want (Old,Name) unchanged", got.GivenName, got.Surname)
+	if got.GivenName() != "Old" || got.Surname() != "Name" {
+		t.Errorf("merged name parts = (%q,%q), want (Old,Name) unchanged", got.GivenName(), got.Surname())
 	}
-	if got.Organization != "Old Inc" {
-		t.Errorf("merged organization = %q, want Old Inc (unchanged)", got.Organization)
+	if got.Organization() != "Old Inc" {
+		t.Errorf("merged organization = %q, want Old Inc (unchanged)", got.Organization())
 	}
-	if got.Title != "Old Title" {
-		t.Errorf("merged title = %q, want Old Title (unchanged)", got.Title)
+	if got.Title() != "Old Title" {
+		t.Errorf("merged title = %q, want Old Title (unchanged)", got.Title())
 	}
-	if n := len(got.Emails); n != 1 || got.Emails[0].Address != "old@example.com" {
-		t.Errorf("merged emails = %+v, want the original one (unchanged)", got.Emails)
+	if emails := got.EmailList(); len(emails) != 1 || emails[0].Address != "old@example.com" {
+		t.Errorf("merged emails = %+v, want the original one (unchanged)", emails)
 	}
-	if n := len(got.Phones); n != 1 || got.Phones[0].Number != "+1-555-0000" {
-		t.Errorf("merged phones = %+v, want the original one (unchanged)", got.Phones)
+	if phones := got.PhoneList(); len(phones) != 1 || phones[0].Number != "+1-555-0000" {
+		t.Errorf("merged phones = %+v, want the original one (unchanged)", phones)
 	}
 	if got.ID != "contact-1" || got.UID != "uid-1" {
 		t.Errorf("merged identity = (%q,%q), want (contact-1,uid-1) preserved", got.ID, got.UID)
@@ -268,8 +272,8 @@ func TestMeUpdateContactsPartialPhonePatchPreservesOtherKinds(t *testing.T) {
 		t.Fatalf("MeUpdateContacts: %v", err)
 	}
 	var work, cell string
-	for _, p := range backend.updatedContact.Phones {
-		switch p.Type {
+	for _, p := range backend.updatedContact.PhoneList() {
+		switch contacts.PhoneType(p) {
 		case "work":
 			work = p.Number
 		case "cell":

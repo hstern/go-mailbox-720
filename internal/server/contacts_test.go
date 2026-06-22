@@ -6,6 +6,8 @@ import (
 	"net/http"
 	"testing"
 
+	"github.com/hstern/go-jscontact"
+
 	"github.com/hstern/go-mailbox-720/internal/contacts"
 	"github.com/hstern/go-mailbox-720/internal/graph/api"
 )
@@ -59,23 +61,28 @@ func newContactsFixture() *fakeContactsBackend {
 			{ID: "book-work", Name: "Work"},
 		},
 		contacts: map[string][]contacts.Contact{
-			"book-default": {
-				{
-					ID:           "contact-1",
-					DisplayName:  "Alice Example",
-					GivenName:    "Alice",
-					Surname:      "Example",
-					Organization: "Example Inc",
-					Title:        "Engineer",
-					Emails:       []contacts.EmailAddress{{Address: "alice@example.com", Type: "work"}},
-					Phones: []contacts.Phone{
-						{Number: "+1-555-0100", Type: "work"},
-						{Number: "+1-555-0199", Type: "cell"},
-					},
-				},
-			},
+			"book-default": {newTestContact("contact-1", "Alice Example", "Alice", "Example",
+				"Example Inc", "Engineer",
+				[]jscontact.EmailAddress{contacts.NewEmail("alice@example.com", "work")},
+				[]jscontact.Phone{
+					contacts.NewPhone("+1-555-0100", "work"),
+					contacts.NewPhone("+1-555-0199", "cell"),
+				})},
 		},
 	}
+}
+
+// newTestContact builds a contacts.Contact through the JSContact builders — the
+// supported construction path now that the projected fields are read-only
+// methods on the embedded Card.
+func newTestContact(id, display, given, surname, org, title string, emails []jscontact.EmailAddress, phones []jscontact.Phone) contacts.Contact {
+	c := contacts.Contact{ID: id}
+	c.SetName(display, given, surname)
+	c.SetOrganization(org)
+	c.SetTitle(title)
+	c.SetEmails(emails)
+	c.SetPhones(phones)
+	return c
 }
 
 func TestMeListContactsMapsGraphContacts(t *testing.T) {

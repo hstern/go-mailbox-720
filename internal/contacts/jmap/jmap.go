@@ -139,5 +139,5 @@ func (cl *Client) GetContact(ctx context.Context, id string) (contacts.Contact, 
 		return contacts.Contact{}, fmt.Errorf("contact %q not found", id)
 	}
 	cc := resp.List[0]
-	return contactFromCard(cc, firstKey(cc.AddressBookIDs)), nil
+	return contactFromCard(cc, firstAddressBookID(cc.AddressBookIDs)), nil
 }
