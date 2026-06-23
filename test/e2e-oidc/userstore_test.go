@@ -37,11 +37,11 @@ type sentMail struct {
 // userStore holds per-subject seed data and SMTP captures, guarded by a mutex
 // so concurrent backend stubs may call it safely.
 type userStore struct {
-	mu       sync.Mutex
-	msgs     map[string][]message
-	evts     map[string][]event
-	cts      map[string][]contact
-	outbox   map[string][]sentMail
+	mu     sync.Mutex
+	msgs   map[string][]message
+	evts   map[string][]event
+	cts    map[string][]contact
+	outbox map[string][]sentMail
 }
 
 // newUserStore returns an empty, ready-to-use store.
