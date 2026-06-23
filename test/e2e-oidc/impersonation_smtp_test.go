@@ -41,6 +41,16 @@ func TestImpersonationSMTP(t *testing.T) {
 	if got := store.sent(z.subjectFor(t, userA)); len(got) == 0 {
 		t.Fatal("no iMIP reply recorded for userA")
 	}
+
+	// Two-user isolation: userB's reply must be recorded under userB's subject
+	// and must NOT bleed into userA's record.
+	acceptSeededInvite(t, base, z, store, userB)
+	if got := store.sent(z.subjectFor(t, userB)); len(got) == 0 {
+		t.Fatal("no iMIP reply recorded for userB")
+	}
+	if got := store.sent(z.subjectFor(t, userA)); len(got) != 1 {
+		t.Fatalf("userA record changed after userB accept: want 1 entry, got %d", len(got))
+	}
 }
 
 // acceptSeededInvite seeds an invitation event (carrying an ORGANIZER, so a reply

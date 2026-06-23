@@ -94,7 +94,12 @@ func (c *smtpFakeConn) serve() {
 		switch verb {
 		case "EHLO", "HELO":
 			// Advertise AUTH OAUTHBEARER so the client picks that mechanism.
-			if !c.reply("250-smtp fake\r\n250 AUTH OAUTHBEARER") {
+			// Two reply calls emit two properly CRLF-terminated lines without
+			// an extra blank line that a single call with an embedded \r\n would add.
+			if !c.reply("250-smtp fake") {
+				return
+			}
+			if !c.reply("250 AUTH OAUTHBEARER") {
 				return
 			}
 		case "AUTH":
