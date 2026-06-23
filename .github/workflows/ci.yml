@@ -319,3 +319,27 @@ jobs:
           cd test/e2e-oidc
           go test -timeout 900s -run TestImpersonationSMTP ./...
 
+  impersonation-foundation-e2e:
+    # Verifies foundational security invariants for the impersonation layer:
+    # TestTokenValidatorChecksBackendAudience is the negative proof that a backend
+    # introspection validator REJECTS a token exchanged for a different protocol's
+    # audience (boots Zitadel in Docker); TestUserStoreIsolatesSubjects is a fast
+    # no-docker unit test of per-subject store isolation. Docker is available on
+    # GitHub-hosted runners.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # The e2e builds mailboxd, which imports the generated package.
+      - name: Generate (fetch upstream spec + ogen)
+        run: go generate ./internal/graph
+
+      - name: Impersonation foundation e2e (token validator audience + user store isolation)
+        run: |
+          cd test/e2e-oidc
+          go test -timeout 900s -run 'TestTokenValidatorChecksBackendAudience|TestUserStoreIsolatesSubjects' ./...
+
