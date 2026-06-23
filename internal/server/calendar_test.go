@@ -159,6 +159,32 @@ func TestToGraphEventPreservesNamedTimeZone(t *testing.T) {
 	}
 }
 
+// An expanded occurrence carries SeriesMasterID on the neutral model; toGraphEvent
+// must surface it as Graph's seriesMasterId so a client can navigate from an
+// instance back to its series master. A standalone event (no master) omits it.
+func TestToGraphEventCarriesSeriesMasterID(t *testing.T) {
+	var inst calendar.Event
+	inst.ID = "evt-1_i0"
+	inst.Title = "Standup"
+	inst.SeriesMasterID = "evt-1"
+
+	ge := toGraphEvent(inst)
+	smid, ok := ge.SeriesMasterId.Get()
+	if !ok {
+		t.Fatal("seriesMasterId not set on instance event")
+	}
+	if smid != "evt-1" {
+		t.Errorf("seriesMasterId = %q, want evt-1", smid)
+	}
+
+	var standalone calendar.Event
+	standalone.ID = "evt-2"
+	standalone.Title = "One-off"
+	if got := toGraphEvent(standalone).SeriesMasterId; got.Set {
+		t.Errorf("seriesMasterId set on standalone event: %+v, want unset", got)
+	}
+}
+
 // A principal with no calendars yields an empty event list (200), not a query
 // against an empty/invalid calendar id.
 func TestMeListEventsNoCalendars(t *testing.T) {

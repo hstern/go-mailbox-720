@@ -178,6 +178,11 @@ func toGraphEvent(e calendar.Event) api.MicrosoftGraphEvent {
 	if pr, ok := graphRecurrence(e); ok {
 		ge.Recurrence = api.NewOptMicrosoftGraphPatternedRecurrence(pr)
 	}
+	// Expanded occurrences and exceptions carry the link back to their series
+	// master; surface it so a client can navigate from an instance to its series.
+	if e.SeriesMasterID != "" {
+		ge.SeriesMasterId = api.NewOptNilString(e.SeriesMasterID)
+	}
 	ge.Type = api.NewOptMicrosoftGraphEventType(graphEventType(e))
 	return ge
 }
