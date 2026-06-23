@@ -33,7 +33,9 @@ import (
 	"time"
 
 	"github.com/emersion/go-ical"
+	"github.com/emersion/go-vcard"
 	"github.com/emersion/go-webdav/caldav"
+	"github.com/emersion/go-webdav/carddav"
 )
 
 // Fixed WebDAV paths the fake advertises. The CalDAV client discovers the
@@ -50,6 +52,17 @@ const (
 	davHomeSetPath   = "/me/cal/"
 	davCalendarPath  = "/me/cal/default/"
 	davCalendarName  = "Calendar"
+)
+
+// CardDAV paths the fake advertises, nested the same way as the CalDAV ones so
+// the go-webdav carddav server classifies each PROPFIND by segment count
+// (1 = user-principal, 2 = addressbook-home-set, 3 = addressbook,
+// 4 = address-object). The principal is shared with CalDAV; the home set lives
+// under a distinct /me/card/ segment so the two surfaces never collide.
+const (
+	davAddressHomeSetPath = "/me/card/"
+	davAddressBookPath    = "/me/card/default/"
+	davAddressBookName    = "Contacts"
 )
 
 // davSubKey types the context key under which the auth middleware stashes the
@@ -217,4 +230,133 @@ func eventCalendar(i int, e event) (*ical.Calendar, error) {
 		return nil, fmt.Errorf("caldav fake: encode event %d: %w", i, err)
 	}
 	return cal, nil
+}
+
+// startCardDAVFake wires a carddav Backend behind the SAME Bearer-auth middleware
+// the CalDAV fake uses into an httptest.Server, returning its base URL (the
+// CardDAV endpoint mailboxd dials). v introspects the bearer for the CardDAV
+// audience and yields the subject; store supplies that subject's seeded contacts.
+// It mirrors startCalDAVFake exactly — only the protocol Handler and the synthesised
+// data differ.
+func startCardDAVFake(t *testing.T, v *tokenValidator, store *userStore) (url string) {
+	t.Helper()
+	handler := &carddav.Handler{Backend: &cardDAVBackend{store: store}}
+
+	srv := httptest.NewServer(davAuthMiddleware(v, handler))
+	t.Cleanup(srv.Close)
+	return srv.URL + "/"
+}
+
+// cardDAVBackend implements carddav.Backend over the shared store. Like davBackend
+// it is stateless: the subject comes from the request context (set by
+// davAuthMiddleware via subFromContext), so every method serves strictly that
+// subject's data. Only the read paths /me/contacts exercises are real; the write
+// paths reject loudly.
+type cardDAVBackend struct {
+	store *userStore
+}
+
+func (b *cardDAVBackend) CurrentUserPrincipal(_ context.Context) (string, error) {
+	return davPrincipalPath, nil
+}
+
+func (b *cardDAVBackend) AddressBookHomeSetPath(_ context.Context) (string, error) {
+	return davAddressHomeSetPath, nil
+}
+
+// theAddressBook is the single default address book the fake exposes for every
+// subject — its first (and only) entry is the one GET /me/contacts queries.
+func theAddressBook() carddav.AddressBook {
+	return carddav.AddressBook{
+		Path: davAddressBookPath,
+		Name: davAddressBookName,
+	}
+}
+
+func (b *cardDAVBackend) ListAddressBooks(_ context.Context) ([]carddav.AddressBook, error) {
+	return []carddav.AddressBook{theAddressBook()}, nil
+}
+
+func (b *cardDAVBackend) GetAddressBook(_ context.Context, _ string) (*carddav.AddressBook, error) {
+	ab := theAddressBook()
+	return &ab, nil
+}
+
+// addressObjects synthesises the subject's seeded contacts as CardDAV address
+// objects, each a vCard whose FN is the contact's DisplayName. Object paths are
+// positional and stable for one request, which is all the addressbook-query
+// REPORT needs.
+func (b *cardDAVBackend) addressObjects(ctx context.Context) ([]carddav.AddressObject, error) {
+	sub := subFromContext(ctx)
+	cts := b.store.contacts(sub)
+	out := make([]carddav.AddressObject, 0, len(cts))
+	for i, c := range cts {
+		card, err := contactCard(i, c)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, carddav.AddressObject{
+			Path: fmt.Sprintf("%scontact-%d.vcf", davAddressBookPath, i),
+			Card: card,
+		})
+	}
+	return out, nil
+}
+
+func (b *cardDAVBackend) ListAddressObjects(ctx context.Context, _ string, _ *carddav.AddressDataRequest) ([]carddav.AddressObject, error) {
+	return b.addressObjects(ctx)
+}
+
+func (b *cardDAVBackend) QueryAddressObjects(ctx context.Context, _ string, _ *carddav.AddressBookQuery) ([]carddav.AddressObject, error) {
+	return b.addressObjects(ctx)
+}
+
+func (b *cardDAVBackend) GetAddressObject(ctx context.Context, path string, _ *carddav.AddressDataRequest) (*carddav.AddressObject, error) {
+	objs, err := b.addressObjects(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for i := range objs {
+		if objs[i].Path == path {
+			return &objs[i], nil
+		}
+	}
+	return nil, fmt.Errorf("carddav fake: address object %q not found", path)
+}
+
+// The write surface is unused by /me/contacts; reject it loudly so a stray write
+// cannot silently succeed.
+func (b *cardDAVBackend) CreateAddressBook(context.Context, *carddav.AddressBook) error {
+	return fmt.Errorf("carddav fake: CreateAddressBook unsupported")
+}
+
+func (b *cardDAVBackend) DeleteAddressBook(context.Context, string) error {
+	return fmt.Errorf("carddav fake: DeleteAddressBook unsupported")
+}
+
+func (b *cardDAVBackend) PutAddressObject(context.Context, string, vcard.Card, *carddav.PutAddressObjectOptions) (*carddav.AddressObject, error) {
+	return nil, fmt.Errorf("carddav fake: PutAddressObject unsupported")
+}
+
+func (b *cardDAVBackend) DeleteAddressObject(context.Context, string) error {
+	return fmt.Errorf("carddav fake: DeleteAddressObject unsupported")
+}
+
+// contactCard builds a minimal valid vCard 4.0 for one seeded contact: a stable
+// UID and the contact's DisplayName as FN (the required formatted name, RFC 6350).
+// The card is round-tripped through the encoder to validate it is well-formed
+// before the server hands it to the client (a malformed card would fail the
+// client's vCard decode / JSContact bridge with an opaque error). go-vcard's
+// ToV4 stamps VERSION:4.0, which the addressbook-query REPORT advertises.
+func contactCard(i int, c contact) (vcard.Card, error) {
+	card := make(vcard.Card)
+	card.SetValue(vcard.FieldUID, fmt.Sprintf("ct-%d@go-mailbox-720.test", i))
+	card.SetValue(vcard.FieldFormattedName, c.DisplayName)
+	vcard.ToV4(card)
+
+	var buf bytes.Buffer
+	if err := vcard.NewEncoder(&buf).Encode(card); err != nil {
+		return nil, fmt.Errorf("carddav fake: encode contact %d: %w", i, err)
+	}
+	return card, nil
 }
