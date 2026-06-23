@@ -56,6 +56,17 @@ type zitadelIDP struct {
 	exchangeApp    string
 	exchangeAppSec string
 
+	// backendIntrospect maps a backend project id to the Basic creds of an API app
+	// registered IN that project. Zitadel scopes introspection to the introspecting
+	// client's own project: an API app sees a token as active only when the token's
+	// audience is that app's project, and reports active:false for any other
+	// project's token (empirically verified — Task 1). So each backend introspects
+	// with creds rooted in its own project; that per-project scoping IS the backend
+	// audience check (a CalDAV introspector accepts a CalDAV token and rejects a
+	// JMAP-mail one). A single shared introspector cannot validate per-protocol
+	// audiences, so the creds are keyed by project id rather than stored once.
+	backendIntrospect map[string]clientCreds
+
 	// backendAud maps each logical backend audience (the aud* constants) to the
 	// Zitadel project id it was registered as. The exchanged token's aud carries
 	// these numeric project ids (Zitadel only admits project ids — resolved at
@@ -239,9 +250,31 @@ var backendAudiences = []string{
 	audMailJMAP, audContactsJMAP, audCalDAV, audCardDAV, audIMAP, audSMTP,
 }
 
-func (z *zitadelIDP) tokenEndpoint() string    { return zitadelBase + "/oauth/v2/token" }
-func (z *zitadelIDP) exchangeClientID() string { return z.exchangeApp }
-func (z *zitadelIDP) exchangeSecret() string   { return z.exchangeAppSec }
+func (z *zitadelIDP) tokenEndpoint() string         { return zitadelBase + "/oauth/v2/token" }
+func (z *zitadelIDP) introspectionEndpoint() string { return zitadelBase + "/oauth/v2/introspect" }
+func (z *zitadelIDP) exchangeClientID() string      { return z.exchangeApp }
+func (z *zitadelIDP) exchangeSecret() string        { return z.exchangeAppSec }
+
+// backendIntrospectClientID/backendIntrospectSecret return the HTTP Basic creds a
+// backend with the given audience (a resolved project id) uses to call RFC 7662
+// introspection. The creds belong to an API app registered in that same project —
+// Zitadel only reports active:true when the introspecting client and the token's
+// audience share a project, so a per-project introspector is required.
+func (z *zitadelIDP) backendIntrospectClientID(t *testing.T, backendAud string) string {
+	return z.introspectCreds(t, backendAud).clientID
+}
+func (z *zitadelIDP) backendIntrospectSecret(t *testing.T, backendAud string) string {
+	return z.introspectCreds(t, backendAud).secret
+}
+
+func (z *zitadelIDP) introspectCreds(t *testing.T, backendAud string) clientCreds {
+	t.Helper()
+	cc, ok := z.backendIntrospect[backendAud]
+	if !ok {
+		t.Fatalf("no introspection credential provisioned for backend audience %q", backendAud)
+	}
+	return cc
+}
 
 // backendAudience resolves a logical backend audience (an aud* constant) to the
 // concrete value the exchanged token will carry — the Zitadel project id it was
@@ -274,14 +307,30 @@ func (z *zitadelIDP) backendAudience(t *testing.T, logical string) string {
 func (z *zitadelIDP) provisionImpersonation(t *testing.T) {
 	t.Helper()
 
-	// 1. One project per backend audience; record logical -> project id.
+	// 1. One project per backend audience; record logical -> project id. Each project
+	//    also gets an API app (client_secret_basic) acting as that backend's resource
+	//    server / introspection client. Two reasons it must live in the project:
+	//    (a) Zitadel only issues an active, introspectable token for an audience whose
+	//    project hosts a registered client; (b) introspection is project-scoped — an
+	//    API app sees a token active only for its own project's audience. So this same
+	//    per-project app both anchors the audience and validates it (verified Task 1).
 	z.backendAud = make(map[string]string, len(backendAudiences))
+	z.backendIntrospect = make(map[string]clientCreds, len(backendAudiences))
 	for _, aud := range backendAudiences {
 		var p struct {
 			ID string `json:"id"`
 		}
 		z.mgmtJSON(t, http.MethodPost, "/management/v1/projects", map[string]any{"name": aud}, &p)
 		z.backendAud[aud] = p.ID
+		var ia struct {
+			ClientID     string `json:"clientId"`
+			ClientSecret string `json:"clientSecret"`
+		}
+		z.mgmtJSON(t, http.MethodPost, "/management/v1/projects/"+p.ID+"/apps/api", map[string]any{
+			"name":           aud + "-rs",
+			"authMethodType": "API_AUTH_METHOD_TYPE_BASIC",
+		}, &ia)
+		z.backendIntrospect[p.ID] = clientCreds{clientID: ia.ClientID, secret: ia.ClientSecret}
 	}
 
 	// 2. The exchanging client: an OIDC web app with the token-exchange grant.
@@ -343,4 +392,32 @@ func (z *zitadelIDP) mintUserToken(t *testing.T, user string) string {
 	return postToken(t, http.DefaultClient, z.tokenEndpoint(),
 		url.Values{"grant_type": {"client_credentials"}, "scope": {strings.Join(scopes, " ")}},
 		cc.clientID, cc.secret)
+}
+
+// subjectFor mints the named user's token and returns its sub claim — the subject a
+// sub-preserving exchange must keep, and the value a backend's validator must surface
+// after introspecting the exchanged token.
+func (z *zitadelIDP) subjectFor(t *testing.T, user string) string {
+	t.Helper()
+	return subjectOf(t, z.mintUserToken(t, user))
+}
+
+// exchangeForBackend performs the production-shape RFC 8693 exchange: it authenticates
+// as the OIDC exchange app and exchanges userToken for a token scoped to backendAud,
+// with requested_token_type=access_token — the value production mailboxd hardcodes
+// (internal/tokenexchange/tokenexchange.go:148), for which Zitadel returns an opaque
+// (encrypted JWE) access token. The returned token is therefore NOT a decodable JWT;
+// it must be introspected. Used by validator/fake-backend tests to produce a
+// realistic exchanged token without running mailboxd.
+func (z *zitadelIDP) exchangeForBackend(t *testing.T, userToken, backendAud string) string {
+	t.Helper()
+	form := url.Values{
+		"grant_type":           {"urn:ietf:params:oauth:grant-type:token-exchange"},
+		"subject_token":        {userToken},
+		"subject_token_type":   {"urn:ietf:params:oauth:token-type:access_token"},
+		"requested_token_type": {"urn:ietf:params:oauth:token-type:access_token"},
+		"audience":             {backendAud},
+		"scope":                {"openid"},
+	}
+	return postToken(t, httpClientFor(z), z.tokenEndpoint(), form, z.exchangeClientID(), z.exchangeSecret())
 }
