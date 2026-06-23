@@ -199,6 +199,19 @@ func (cl *Client) setUnilateral(cb func()) {
 	cl.mu.Unlock()
 }
 
+// Ping issues an IMAP NOOP to confirm the session is still alive. The connection
+// pool calls it on checkout so a connection the server has dropped while idle is
+// discarded and re-dialed rather than handed out dead (MB720-53).
+func (cl *Client) Ping(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := cl.c.Noop().Wait(); err != nil {
+		return fmt.Errorf("imap: noop: %w", err)
+	}
+	return nil
+}
+
 // Close logs out and closes the connection.
 func (cl *Client) Close() error {
 	if err := cl.c.Logout().Wait(); err != nil {

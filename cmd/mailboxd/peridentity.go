@@ -29,16 +29,25 @@ const identityBackendSkew = 30 * time.Second
 // JMAP, MB720-43 IMAP/SMTP). dial receives the principal so a protocol whose
 // auth needs the username (OAUTHBEARER authzid) can use issSub.Sub.
 //
-// Caching is opt-in (noCache). When enabled, one backend is cached per principal
-// until its exchanged token nears expiry, so a burst of requests does not re-dial.
-// The cache hands the SAME backend value to concurrent and successive requests —
-// safe ONLY because the JMAP backends' Close is a no-op (stateless HTTP), so the
-// per-request `defer b.Close()` in the handlers does not tear down the shared
-// client. A backend with a real Close (IMAP/SMTP, whose Close drops the
-// connection) MUST set noCache: it dials a fresh backend per request, which the
-// handler then closes — connection pooling for those is deferred (matching the
-// adapters' existing dial-per-request posture). The token itself is still cached
-// by the exchanger, so no-cache mode does not re-hit the authorization server.
+// There are three modes, one per constructor:
+//
+//   - Caching (newPerIdentityBackend): one backend is cached per principal until
+//     its exchanged token nears expiry, so a burst of requests does not re-dial.
+//     The cache hands the SAME backend value to concurrent and successive requests
+//     — safe ONLY because the JMAP/DAV backends' Close is a no-op (stateless HTTP),
+//     so the per-request `defer b.Close()` in the handlers does not tear down the
+//     shared client.
+//   - No-cache (newPerIdentityDialer): dials a fresh backend per request, which
+//     the handler then closes. The fallback for a backend with a real Close.
+//   - Pooled (newPerIdentityPool): a per-principal connection pool for a backend
+//     with a real Close (IMAP/SMTP, whose Close issues LOGOUT/QUIT and drops the
+//     TCP connection). get leases a parked connection and the lease's Close
+//     returns it to the pool rather than dropping the socket, so the handlers keep
+//     their unchanged `defer b.Close()` while the per-request connect + TLS + SASL
+//     handshake is amortized. See connPool.
+//
+// In every mode the token itself is cached by the exchanger, so a re-dial does not
+// re-hit the authorization server.
 type perIdentityBackend[B io.Closer] struct {
 	exchanger tokenexchange.Exchanger
 	audience  string
@@ -51,10 +60,17 @@ type perIdentityBackend[B io.Closer] struct {
 	rawToken func(context.Context) (string, bool)
 
 	// noCache dials a fresh backend on every get and never caches — required for
-	// backends with a real Close (see the type doc).
+	// backends with a real Close when pooling is not in use (see the type doc).
 	noCache bool
 	skew    time.Duration
 	now     func() time.Time
+
+	// pool, when non-nil, selects connection-pooling mode (MB720-53): get checks
+	// out a parked connection for the principal (or dials one) and hands back a
+	// lease whose Close returns it to the pool rather than dropping the socket.
+	// Used for backends with a real Close (IMAP/SMTP) in place of noCache's
+	// dial-per-request. Mutually exclusive with the cache.
+	pool *connPool[B]
 
 	mu    sync.Mutex
 	cache map[subjectid.IssSubID]identityEntry[B]
@@ -98,8 +114,58 @@ func newPerIdentityDialer[B io.Closer](exchanger tokenexchange.Exchanger, audien
 	}
 }
 
+// poolOptions configures connection-pooling mode for newPerIdentityPool. wrap is
+// required (it builds the lease whose Close returns the connection to the pool);
+// the rest fall back to sensible defaults when zero.
+type poolOptions[B io.Closer] struct {
+	// wrap builds the per-checkout lease for backend type B — see connPool.wrap.
+	wrap func(conn B, release func()) B
+	// healthCheck probes a parked connection on checkout (NOOP); nil skips it.
+	healthCheck func(context.Context, B) error
+	// maxIdle bounds parked connections per principal (0 → defaultMaxIdlePerPrincipal).
+	maxIdle int
+	// idleTimeout evicts a connection parked longer than this (0 → defaultIdleTimeout).
+	idleTimeout time.Duration
+}
+
+// newPerIdentityPool builds a POOLING per-identity provider for a backend with a
+// real Close (IMAP/SMTP): it hands out a parked connection per principal and the
+// returned lease's Close returns it to the pool, amortizing the per-request
+// connect + TLS + SASL handshake. The caller starts the pool's reaper with
+// startPoolReaper bound to the server's shutdown context. See the type doc.
+func newPerIdentityPool[B io.Closer](exchanger tokenexchange.Exchanger, audience string, dial func(id subjectid.IssSubID, token string) (B, error), opts poolOptions[B]) *perIdentityBackend[B] {
+	maxIdle := opts.maxIdle
+	if maxIdle == 0 {
+		maxIdle = defaultMaxIdlePerPrincipal
+	}
+	idleTimeout := opts.idleTimeout
+	if idleTimeout == 0 {
+		idleTimeout = defaultIdleTimeout
+	}
+	return &perIdentityBackend[B]{
+		exchanger: exchanger,
+		audience:  audience,
+		dial:      dial,
+		mailbox:   auth.Mailbox,
+		rawToken:  auth.RawToken,
+		noCache:   true, // pooling supersedes the cache; the cache map stays unused
+		skew:      identityBackendSkew,
+		now:       time.Now,
+		pool: &connPool[B]{
+			wrap:        opts.wrap,
+			healthCheck: opts.healthCheck,
+			maxIdle:     maxIdle,
+			idleTimeout: idleTimeout,
+			skew:        identityBackendSkew,
+			now:         time.Now,
+			idle:        make(map[subjectid.IssSubID][]idleConn[B]),
+		},
+	}
+}
+
 // get resolves the request's backend: a cached one for the principal when its
-// token is still fresh, else a freshly exchanged-and-dialed one.
+// token is still fresh, else a freshly exchanged-and-dialed one. In pooling mode
+// it leases a parked connection (or dials one), reusing it across requests.
 func (p *perIdentityBackend[B]) get(ctx context.Context) (B, error) {
 	var zero B
 	id, ok := p.mailbox(ctx)
@@ -117,6 +183,24 @@ func (p *perIdentityBackend[B]) get(ctx context.Context) (B, error) {
 		return zero, fmt.Errorf("per-identity backend: no bearer token on the request")
 	}
 	now := p.now()
+
+	// Pooling mode: lease a parked connection for the principal, dialing a fresh
+	// one (exchange + connect) only on a pool miss. The exchanger still caches the
+	// token, so a miss does not re-hit the authorization server.
+	if p.pool != nil {
+		return p.pool.get(ctx, issSub, func() (B, time.Time, error) {
+			var zero B
+			tok, err := p.exchanger.Exchange(ctx, raw, p.audience)
+			if err != nil {
+				return zero, time.Time{}, fmt.Errorf("per-identity backend: token exchange: %w", err)
+			}
+			backend, err := p.dial(issSub, tok.AccessToken)
+			if err != nil {
+				return zero, time.Time{}, fmt.Errorf("per-identity backend: dial: %w", err)
+			}
+			return backend, tok.ExpiresAt, nil
+		})
+	}
 
 	if !p.noCache {
 		p.mu.Lock()
