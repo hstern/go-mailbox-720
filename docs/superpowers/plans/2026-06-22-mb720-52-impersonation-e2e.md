@@ -208,17 +208,25 @@ git commit -m "Prove Zitadel RFC 8693 impersonation recipe in the e2e harness (M
 
 ---
 
-## Task 1: Shared `tokenValidator`
+## Task 1: Shared `tokenValidator` (RFC 7662 introspection)
+
+> **Design note (from the Task 0 investigation):** production mailboxd hardcodes
+> `requested_token_type=access_token` (`internal/tokenexchange/tokenexchange.go:148`),
+> and Zitadel returns an **encrypted JWE** for that — opaque to JWKS. It is
+> introspectable. So the backend validator MUST use RFC 7662 introspection, not
+> JWKS. This matches the existing project memory `kanidm-opaque-tokens-need-introspection`.
 
 **Files:**
 - Create: `test/e2e-oidc/tokenvalidator_test.go`
+- Modify: `test/e2e-oidc/zitadel_test.go` (add the introspection API-app credential + accessors + a production-shape exchange helper for tests)
 
 **Interfaces:**
-- Consumes: Zitadel discovery (`issuer + /.well-known/openid-configuration` → `jwks_uri`).
+- Consumes: Zitadel introspection endpoint + an introspection client credential; `z.backendAudience(t, logical)` (the resolver from Task 0 — backend audiences are runtime Zitadel project ids, not the literal `aud*` strings); the production-shape exchange.
 - Produces:
-  - `type tokenValidator struct { issuer, audience string; ... }`
-  - `func newTokenValidator(t *testing.T, issuer, audience string) *tokenValidator` — fetches discovery + JWKS once.
-  - `func (v *tokenValidator) validate(bearer string) (sub string, err error)` — verifies signature against the JWKS, checks `iss == issuer`, `aud` contains `audience`, `exp` not past; returns `sub`. Returns a non-nil error for a wrong-audience or otherwise invalid token.
+  - On `zitadelIDP`: `introspectionEndpoint() string` (`issuer + "/oauth/v2/introspect"`), `backendIntrospectClientID() string` / `backendIntrospectSecret() string` (an API app created in `provisionImpersonation` whose Basic creds authorize introspection), and `exchangeForBackend(t *testing.T, userToken, backendAud string) string` — performs the **production-shape** exchange (`requested_token_type=access_token`, authenticated as the OIDC exchange app) and returns the issued (opaque) backend token, so validator/fake tests can produce a realistic exchanged token without running mailboxd.
+  - `type tokenValidator struct { ... }`
+  - `func newTokenValidator(t *testing.T, z *zitadelIDP, backendAud string) *tokenValidator` — captures the introspection endpoint + creds + the required backend audience (a resolved project id).
+  - `func (v *tokenValidator) validate(bearer string) (sub string, err error)` — POSTs `token=<bearer>` to the introspection endpoint with HTTP Basic (introspection client creds), requires `active == true` AND that the response carries the required backend audience (Zitadel surfaces it as the reserved scope `urn:zitadel:iam:org:project:id:<projectID>:aud` in `scope`, and/or in `aud`), and returns `sub`. Returns a non-nil error for an inactive token or one lacking the required backend audience.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -227,43 +235,55 @@ package e2e
 
 import "testing"
 
-func TestTokenValidatorRejectsWrongAudience(t *testing.T) {
+func TestTokenValidatorChecksBackendAudience(t *testing.T) {
 	requireDocker(t)
 	z := &zitadelIDP{}
 	z.start(t)
 	z.provision(t)
 	z.provisionImpersonation(t)
 
-	// A token minted for the mailbox audience must be REJECTED by a validator that
-	// expects a backend audience — this is the property that makes the backend
-	// "trust the exchanged token" rather than any Zitadel token.
+	// A token exchanged for the CalDAV backend audience must validate for a CalDAV
+	// validator (returning the user's sub) and be REJECTED by a JMAP-mail validator
+	// — this audience check is what makes the backend "trust the exchanged token"
+	// for ITS protocol rather than any Zitadel token.
 	userTok := z.mintUserToken(t, userA)
-	v := newTokenValidator(t, z.issuer(), audMailJMAP)
-	if _, err := v.validate(userTok); err == nil {
-		t.Fatal("validator accepted a token without the backend audience")
+	calTok := z.exchangeForBackend(t, userTok, z.backendAudience(t, audCalDAV))
+
+	calV := newTokenValidator(t, z, z.backendAudience(t, audCalDAV))
+	sub, err := calV.validate(calTok)
+	if err != nil {
+		t.Fatalf("CalDAV validator rejected a CalDAV-audience token: %v", err)
+	}
+	if want := z.subjectFor(t, userA); sub != want {
+		t.Fatalf("validated sub = %q, want %q", sub, want)
+	}
+
+	mailV := newTokenValidator(t, z, z.backendAudience(t, audMailJMAP))
+	if _, err := mailV.validate(calTok); err == nil {
+		t.Fatal("JMAP-mail validator accepted a CalDAV-audience token")
 	}
 }
 ```
 
 - [ ] **Step 2: Run; expect failure**
 
-Run: `cd test/e2e-oidc && go test -run TestTokenValidatorRejectsWrongAudience -timeout 600s ./...`
-Expected: FAIL — `newTokenValidator`/`tokenValidator.validate` undefined.
+Run: `cd test/e2e-oidc && go test -run TestTokenValidatorChecksBackendAudience -timeout 600s ./...`
+Expected: FAIL — `newTokenValidator`/`tokenValidator.validate`/`exchangeForBackend`/`introspectionEndpoint`/`backendIntrospect*` undefined.
 
-- [ ] **Step 3: Implement `tokenValidator`**
+- [ ] **Step 3: Implement the introspection validator + provisioning**
 
-Use the same JWT/JWKS dependency the parent module's `internal/auth` already uses (check `internal/auth/auth.go` imports — e.g. `github.com/coreos/go-oidc/v3/oidc` or a `jwx` package — and reuse it so the e2e module needs no new JWT stack; it is already an indirect dependency). Fetch discovery, build a key set / verifier keyed on `issuer`, and implement `validate` to verify signature + `iss` + `aud` membership + `exp`, returning `sub`.
+In `zitadel_test.go`: in `provisionImpersonation`, create an API app (e.g. project app with `authMethodType` client_secret_basic, or a machine user) whose Basic creds authorize calls to `POST {issuer}/oauth/v2/introspect`; store its id/secret and expose `backendIntrospectClientID()/backendIntrospectSecret()/introspectionEndpoint()`. Add `exchangeForBackend` (copy the spike's exchange call but with `requested_token_type=access_token` — the production value). In `tokenvalidator_test.go`: `newTokenValidator` stores endpoint+creds+required aud; `validate` does the introspection POST (form `token=<bearer>`, Basic auth), JSON-decodes `{active, sub, aud, scope}`, requires `active` and that the required backend project-id audience appears (in `aud` or as the `urn:zitadel:iam:org:project:id:<pid>:aud` scope token), and returns `sub`. Use only stdlib `net/http`/`encoding/json` — no JWT library needed (the token is opaque).
 
 - [ ] **Step 4: Run to green**
 
-Run: `cd test/e2e-oidc && go test -run TestTokenValidatorRejectsWrongAudience -timeout 600s ./...`
+Run: `cd test/e2e-oidc && go test -run TestTokenValidatorChecksBackendAudience -timeout 600s ./...`
 Expected: PASS.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add test/e2e-oidc/tokenvalidator_test.go test/e2e-oidc/go.mod test/e2e-oidc/go.sum
-git commit -m "Add shared JWKS token validator for impersonation e2e backends (MB720-52)"
+git add test/e2e-oidc/tokenvalidator_test.go test/e2e-oidc/zitadel_test.go
+git commit -m "Add RFC 7662 introspection validator for impersonation e2e backends (MB720-52)"
 ```
 
 ---
@@ -273,12 +293,24 @@ git commit -m "Add shared JWKS token validator for impersonation e2e backends (M
 **Files:**
 - Create: `test/e2e-oidc/userstore_test.go`
 - Modify: `test/e2e-oidc/impersonation_test.go` (add `startMailboxdImpersonation`)
+- Modify: `test/e2e-oidc/zitadel_test.go` (mailbox resource project + `mailboxAudience()` + extend `mintUserToken` to carry it — see Concern #2 below)
 
 **Interfaces:**
 - Produces:
   - `type message struct { Subject, FromAddr string }`, `type event struct { Subject string }`, `type contact struct { DisplayName string }`, `type sentMail struct { From string; To []string; Data string }`.
   - `type userStore struct { ... }` with `func newUserStore() *userStore`, `func (s *userStore) seedMessages(sub string, m ...message)`, `seedEvents`, `seedContacts`, getters `messages(sub) []message` / `events(sub)` / `contacts(sub)`, and `recordSent(sub string, m sentMail)` / `sent(sub) []sentMail` for SMTP. All keyed by validated `sub`; unknown sub returns empty.
-  - `func startMailboxdImpersonation(t *testing.T, z *zitadelIDP, extraArgs []string) string` — builds + runs mailboxd with `authFlags(z)` + `-tokenexchange-endpoint z.tokenEndpoint()` + `-tokenexchange-client-id z.exchangeClientID()` + `extraArgs`, env `MAILBOXD_TOKENEXCHANGE_CLIENT_SECRET=z.exchangeSecret()` (+ `authEnv(z)`), waits for readiness, returns the `/v1.0` base URL. Mirrors `startMailboxd`.
+  - `func startMailboxdImpersonation(t *testing.T, z *zitadelIDP, extraArgs []string) string` — builds + runs mailboxd with the auth + token-exchange flags + `extraArgs`, waits for readiness, returns the `/v1.0` base URL. Mirrors `startMailboxd`. Flags: `-auth-issuer z.issuer()`, **`-auth-audience z.mailboxAudience()`** (NOT `authFlags(z)`'s `audience()` — see the concern below), `-tokenexchange-endpoint z.tokenEndpoint()`, `-tokenexchange-client-id z.exchangeClientID()`. Env: `MAILBOXD_TOKENEXCHANGE_CLIENT_SECRET=z.exchangeSecret()` (+ `authEnv(z)`).
+
+> **Concern #2 resolution (from Task 0):** user tokens carry the six backend
+> project audiences, NOT the `mailbox` machine-user client_id that
+> `zitadelIDP.audience()` returns — so plain `authFlags(z)` would make mailboxd
+> reject userA/userB at the front door. This task provisions a dedicated
+> **mailbox resource project**, includes its reserved-audience scope in
+> `mintUserToken` (so user tokens carry it), and exposes
+> `mailboxAudience() string` (that project id) which `startMailboxdImpersonation`
+> passes as `-auth-audience`. So `provisionImpersonation` / `mintUserToken` in
+> `zitadel_test.go` are extended here, and this is first exercised end-to-end in
+> Task 3 (the harness cannot be fully validated without a backend).
 
 - [ ] **Step 1: Write the failing test**
 
@@ -310,7 +342,7 @@ Expected: FAIL — undefined `userStore`.
 
 - [ ] **Step 3: Implement `userStore` (mutex-guarded maps) and `startMailboxdImpersonation`**
 
-`userStore`: a `sync.Mutex` plus `map[string][]message`, `map[string][]event`, `map[string][]contact`, `map[string][]sentMail`. `startMailboxdImpersonation`: copy `startMailboxd`'s structure (buildMailboxd, freeAddr, exec, cleanup, waitFor) but swap the static backend flags/env for the token-exchange flags above + `extraArgs`.
+`userStore`: a `sync.Mutex` plus `map[string][]message`, `map[string][]event`, `map[string][]contact`, `map[string][]sentMail`. `startMailboxdImpersonation`: copy `startMailboxd`'s structure (buildMailboxd, freeAddr, exec, cleanup, waitFor) but swap the static backend flags/env for the token-exchange flags above + `extraArgs`. In `zitadel_test.go`, add the mailbox resource project (Concern #2): register a project, grant userA/userB to it, add its `urn:zitadel:iam:org:project:id:<pid>:aud` reserved scope to `mintUserToken`, and expose `mailboxAudience()` returning that project id for `-auth-audience`.
 
 - [ ] **Step 4: Run to green**
 
@@ -363,7 +395,7 @@ func TestImpersonationJMAPMail(t *testing.T) {
 	store.seedMessages(z.subjectFor(t, userA), message{Subject: "A inbox", FromAddr: "a@example.com"})
 	store.seedMessages(z.subjectFor(t, userB), message{Subject: "B inbox", FromAddr: "b@example.com"})
 
-	mailV := newTokenValidator(t, z.issuer(), audMailJMAP)
+	mailV := newTokenValidator(t, z, z.backendAudience(t, audMailJMAP))
 	sessionURL := startJMAPFake(t, mailV, nil, store)
 
 	base := startMailboxdImpersonation(t, z, []string{
@@ -448,7 +480,7 @@ func TestImpersonationContactsJMAP(t *testing.T) {
 	store.seedContacts(z.subjectFor(t, userA), contact{DisplayName: "A Contact"})
 	store.seedContacts(z.subjectFor(t, userB), contact{DisplayName: "B Contact"})
 
-	contactsV := newTokenValidator(t, z.issuer(), audContactsJMAP)
+	contactsV := newTokenValidator(t, z, z.backendAudience(t, audContactsJMAP))
 	sessionURL := startJMAPFake(t, nil, contactsV, store)
 
 	base := startMailboxdImpersonation(t, z, []string{
@@ -525,7 +557,7 @@ func TestImpersonationCalDAV(t *testing.T) {
 	store.seedEvents(z.subjectFor(t, userA), event{Subject: "A meeting"})
 	store.seedEvents(z.subjectFor(t, userB), event{Subject: "B meeting"})
 
-	v := newTokenValidator(t, z.issuer(), audCalDAV)
+	v := newTokenValidator(t, z, z.backendAudience(t, audCalDAV))
 	url := startCalDAVFake(t, v, store)
 
 	base := startMailboxdImpersonation(t, z, []string{
@@ -593,7 +625,7 @@ func TestImpersonationCardDAV(t *testing.T) {
 	store.seedContacts(z.subjectFor(t, userA), contact{DisplayName: "A Card"})
 	store.seedContacts(z.subjectFor(t, userB), contact{DisplayName: "B Card"})
 
-	v := newTokenValidator(t, z.issuer(), audCardDAV)
+	v := newTokenValidator(t, z, z.backendAudience(t, audCardDAV))
 	url := startCardDAVFake(t, v, store)
 
 	base := startMailboxdImpersonation(t, z, []string{
@@ -659,7 +691,7 @@ func TestImpersonationIMAP(t *testing.T) {
 	store.seedMessages(z.subjectFor(t, userA), message{Subject: "A imap", FromAddr: "a@example.com"})
 	store.seedMessages(z.subjectFor(t, userB), message{Subject: "B imap", FromAddr: "b@example.com"})
 
-	v := newTokenValidator(t, z.issuer(), audIMAP)
+	v := newTokenValidator(t, z, z.backendAudience(t, audIMAP))
 	addr := startIMAPFake(t, v, store)
 
 	base := startMailboxdImpersonation(t, z, []string{
@@ -721,9 +753,9 @@ func TestImpersonationSMTP(t *testing.T) {
 	z.start(t); z.provision(t); z.provisionImpersonation(t)
 
 	store := newUserStore()
-	calV := newTokenValidator(t, z.issuer(), audCalDAV)
+	calV := newTokenValidator(t, z, z.backendAudience(t, audCalDAV))
 	calURL := startCalDAVFake(t, calV, store) // accept-meeting needs a calendar backend
-	smtpV := newTokenValidator(t, z.issuer(), audSMTP)
+	smtpV := newTokenValidator(t, z, z.backendAudience(t, audSMTP))
 	smtpAddr := startSMTPFake(t, smtpV, store)
 
 	base := startMailboxdImpersonation(t, z, []string{
