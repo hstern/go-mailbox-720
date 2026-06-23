@@ -400,7 +400,7 @@ func TestImpersonationJMAPMail(t *testing.T) {
 
 	base := startMailboxdImpersonation(t, z, []string{
 		"-mail-jmap-session-url", sessionURL,
-		"-mail-jmap-audience", audMailJMAP,
+		"-mail-jmap-audience", z.backendAudience(t, audMailJMAP),
 	})
 
 	// userA sees only A's inbox.
@@ -485,7 +485,7 @@ func TestImpersonationContactsJMAP(t *testing.T) {
 
 	base := startMailboxdImpersonation(t, z, []string{
 		"-contacts-jmap-session-url", sessionURL,
-		"-contacts-jmap-audience", audContactsJMAP,
+		"-contacts-jmap-audience", z.backendAudience(t, audContactsJMAP),
 	})
 
 	assertSingleContact(t, base, z.mintUserToken(t, userA), "A Contact")
@@ -562,7 +562,7 @@ func TestImpersonationCalDAV(t *testing.T) {
 
 	base := startMailboxdImpersonation(t, z, []string{
 		"-cal-caldav-url", url,
-		"-cal-caldav-audience", audCalDAV,
+		"-cal-caldav-audience", z.backendAudience(t, audCalDAV),
 	})
 
 	assertSingleEvent(t, base, z.mintUserToken(t, userA), "A meeting")
@@ -630,7 +630,7 @@ func TestImpersonationCardDAV(t *testing.T) {
 
 	base := startMailboxdImpersonation(t, z, []string{
 		"-contacts-carddav-url", url,
-		"-contacts-carddav-audience", audCardDAV,
+		"-contacts-carddav-audience", z.backendAudience(t, audCardDAV),
 	})
 
 	assertSingleContact(t, base, z.mintUserToken(t, userA), "A Card")
@@ -697,7 +697,7 @@ func TestImpersonationIMAP(t *testing.T) {
 	base := startMailboxdImpersonation(t, z, []string{
 		"-mail-imap-addr", addr,
 		"-mail-imap-tls=false",
-		"-mail-imap-audience", audIMAP,
+		"-mail-imap-audience", z.backendAudience(t, audIMAP),
 	})
 
 	assertSingleMessageSubject(t, base, z.mintUserToken(t, userA), "A imap")
@@ -759,8 +759,8 @@ func TestImpersonationSMTP(t *testing.T) {
 	smtpAddr := startSMTPFake(t, smtpV, store)
 
 	base := startMailboxdImpersonation(t, z, []string{
-		"-cal-caldav-url", calURL, "-cal-caldav-audience", audCalDAV,
-		"-smtp-addr", smtpAddr, "-smtp-audience", audSMTP,
+		"-cal-caldav-url", calURL, "-cal-caldav-audience", z.backendAudience(t, audCalDAV),
+		"-smtp-addr", smtpAddr, "-smtp-audience", z.backendAudience(t, audSMTP),
 	})
 
 	acceptSeededInvite(t, base, z, store, userA) // helper: seed invite for userA, POST accept, return
