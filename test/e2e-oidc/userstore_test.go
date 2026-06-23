@@ -15,9 +15,11 @@ type message struct {
 	FromAddr string
 }
 
-// event is a seeded CalDAV event stub.
+// event is a seeded CalDAV event stub. Organizer, when non-empty, is emitted as
+// the VEVENT ORGANIZER so accept/decline produces an iMIP REPLY to that address.
 type event struct {
-	Subject string
+	Subject   string
+	Organizer string
 }
 
 // contact is a seeded CardDAV contact stub.

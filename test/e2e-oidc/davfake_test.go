@@ -220,6 +220,12 @@ func eventCalendar(i int, e event) (*ical.Calendar, error) {
 	ev.Props.SetDateTime(ical.PropDateTimeStart, start)
 	ev.Props.SetDateTime(ical.PropDateTimeEnd, start.Add(time.Hour))
 	ev.Props.SetText(ical.PropSummary, e.Subject)
+	// An ORGANIZER, when seeded, gives an accept/decline reply someone to go to;
+	// the go-ical/jscalendar bridge maps it to the event's "owner"-role
+	// participant, which itip.RespondToEvent replies to.
+	if e.Organizer != "" {
+		ev.Props.SetText(ical.PropOrganizer, "mailto:"+e.Organizer)
+	}
 	cal.Children = append(cal.Children, ev.Component)
 
 	// Round-trip through the encoder to validate the object is well-formed before
