@@ -174,6 +174,19 @@ func (cl *Client) Send(ctx context.Context, from string, to []string, raw []byte
 	return nil
 }
 
+// Ping issues an SMTP NOOP to confirm the connection is still alive. The
+// connection pool calls it on checkout so a connection the server has dropped
+// while idle is discarded and re-dialed rather than handed out dead (MB720-53).
+func (cl *Client) Ping(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := cl.c.Noop(); err != nil {
+		return fmt.Errorf("smtp: noop: %w", err)
+	}
+	return nil
+}
+
 // Close issues QUIT and closes the connection. A failed QUIT still tears down
 // the socket.
 func (cl *Client) Close() error {

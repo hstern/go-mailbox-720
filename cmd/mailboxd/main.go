@@ -136,6 +136,11 @@ func main() {
 		log.Fatalln("mailboxd: the -*-audience flags require -tokenexchange-endpoint (per-identity backends need the token exchange)")
 	}
 
+	// poolHooks collects the reaper + shutdown-drain of any connection pools wired
+	// below (IMAP/SMTP, MB720-53); run starts the reapers under the server's
+	// shutdown ctx and drains the pools on shutdown.
+	var poolHooks []connPoolHook
+
 	// JMAP and IMAP are alternative mail backends behind the same port; JMAP wins
 	// when its session URL is set (it is the closer fit for the JMAP-shaped port).
 	var provider server.MailProvider
@@ -157,13 +162,17 @@ func main() {
 		}
 	case *imapAddr != "" && exchanger != nil && *mailIMAPAudience != "":
 		// Per-identity (MB720-43): SASL OAUTHBEARER with the exchanged token; the
-		// OAUTHBEARER authzid is the principal's subject. No caching — IMAP Close
-		// drops the connection, so dial per request (the adapter's existing posture).
+		// OAUTHBEARER authzid is the principal's subject. Pooled (MB720-53): a
+		// per-principal connection pool amortizes the per-request TCP + TLS + SASL
+		// handshake; the lease's Close returns the connection to the pool rather
+		// than dropping the socket, and the reaper is started under run's ctx.
 		addr, tls := *imapAddr, *imapTLS
-		provider = mailIdentityProvider{proto: "IMAP", p: newPerIdentityDialer(exchanger, *mailIMAPAudience,
+		imapPool := newPerIdentityPool(exchanger, *mailIMAPAudience,
 			func(id subjectid.IssSubID, token string) (mail.Backend, error) {
 				return imap.Dial(addr, id.Sub, "", &imap.Options{TLS: tls, BearerToken: token})
-			})}
+			}, imapPoolOptions())
+		poolHooks = append(poolHooks, connPoolHook{reap: imapPool.pool.reap, closeAll: imapPool.pool.closeAll})
+		provider = mailIdentityProvider{proto: "IMAP", p: imapPool}
 	case *imapAddr != "":
 		provider = staticIMAPProvider{
 			addr:      *imapAddr,
@@ -243,12 +252,17 @@ func main() {
 	case *smtpAddr != "" && exchanger != nil && *smtpAudience != "":
 		// Per-identity (MB720-43): SASL OAUTHBEARER with the exchanged token; the
 		// OAUTHBEARER username and the responding-attendee address are the principal's
-		// subject. No caching — SMTP Close drops the connection (dial per request).
+		// subject. Pooled (MB720-53): the lease's Close returns the connection to the
+		// pool. Submission is bursty rather than long-lived, so SMTP gains less from
+		// pooling than IMAP, but the machinery is shared and a NOOP health check on
+		// checkout discards a connection the submission server has timed out.
 		addr, tls, startTLS := *smtpAddr, *smtpTLS, *smtpStartTLS
-		schedProvider = schedulingIdentityProvider{newPerIdentityDialer(exchanger, *smtpAudience,
+		smtpPool := newPerIdentityPool(exchanger, *smtpAudience,
 			func(id subjectid.IssSubID, token string) (smtp.Sender, error) {
 				return smtp.Dial(addr, id.Sub, "", &smtp.Options{TLS: tls, StartTLS: startTLS, BearerToken: token})
-			})}
+			}, smtpPoolOptions())
+		poolHooks = append(poolHooks, connPoolHook{reap: smtpPool.pool.reap, closeAll: smtpPool.pool.closeAll})
+		schedProvider = schedulingIdentityProvider{smtpPool}
 	case *smtpAddr != "":
 		schedProvider = staticSchedulingProvider{
 			addr:     *smtpAddr,
@@ -259,7 +273,7 @@ func main() {
 			mailbox:  *mailboxEmail,
 		}
 	}
-	if err := run(*addr, cfg, revStore, *ssfReceiverPath, provider, calProvider, contactsProvider, schedProvider, *enableScheduling); err != nil {
+	if err := run(*addr, cfg, revStore, *ssfReceiverPath, provider, calProvider, contactsProvider, schedProvider, *enableScheduling, poolHooks); err != nil {
 		log.Fatalln("mailboxd:", err)
 	}
 }
@@ -366,7 +380,7 @@ func (p staticSchedulingProvider) MailboxAddress(_ context.Context) (string, err
 	return p.mailbox, nil
 }
 
-func run(addr string, authCfg auth.Config, revSink receiver.Sink, ssfReceiverPath string, provider server.MailProvider, calProvider server.CalendarProvider, contactsProvider server.ContactsProvider, schedProvider server.SchedulingProvider, enableScheduling bool) error {
+func run(addr string, authCfg auth.Config, revSink receiver.Sink, ssfReceiverPath string, provider server.MailProvider, calProvider server.CalendarProvider, contactsProvider server.ContactsProvider, schedProvider server.SchedulingProvider, enableScheduling bool, poolHooks []connPoolHook) error {
 	h, err := server.New(provider, calProvider, contactsProvider, schedProvider)
 	if err != nil {
 		return err
@@ -515,6 +529,13 @@ func run(addr string, authCfg auth.Config, revSink receiver.Sink, ssfReceiverPat
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// Sweep idle connection-pool entries until shutdown (MB720-53). Lazy eviction
+	// on checkout handles connections of active principals; the reaper reclaims an
+	// inactive principal's connections so they do not linger until the process exits.
+	for _, h := range poolHooks {
+		startPoolReaper(ctx, poolReapInterval, h.reap)
+	}
+
 	// Drive change-notification delivery off the inbox when the mail backend
 	// supports IDLE + delta. It runs until ctx is cancelled (shutdown).
 	startNotifier(ctx, provider, subStore)
@@ -539,7 +560,14 @@ func run(addr string, authCfg auth.Config, revSink receiver.Sink, ssfReceiverPat
 	case <-ctx.Done():
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		return srv.Shutdown(shutdownCtx)
+		err := srv.Shutdown(shutdownCtx)
+		// Shutdown has drained in-flight requests, so their leases have returned to
+		// the pools; drain the parked connections too so the upstream servers
+		// reclaim the sessions via LOGOUT/QUIT rather than an abrupt socket drop.
+		for _, h := range poolHooks {
+			h.closeAll()
+		}
+		return err
 	}
 }
 
