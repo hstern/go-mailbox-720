@@ -73,6 +73,13 @@ type zitadelIDP struct {
 	// provisioning time — into a token's aud, never arbitrary strings).
 	backendAud map[string]string
 
+	// mailboxProjectID is the Zitadel project id for the dedicated "mailbox"
+	// resource project. User tokens carry this id in their aud (via the reserved
+	// project-audience scope) so mailboxd's -auth-audience check passes. It is
+	// distinct from the mailbox machine-user client_id (audience()), which is used
+	// only for the baseline client_credentials token.
+	mailboxProjectID string
+
 	// users maps a username (userA/userB) to its machine-user client credentials.
 	users map[string]clientCreds
 }
@@ -255,6 +262,12 @@ func (z *zitadelIDP) introspectionEndpoint() string { return zitadelBase + "/oau
 func (z *zitadelIDP) exchangeClientID() string      { return z.exchangeApp }
 func (z *zitadelIDP) exchangeSecret() string        { return z.exchangeAppSec }
 
+// mailboxAudience returns the Zitadel project id of the dedicated mailbox
+// resource project. startMailboxdImpersonation passes this as -auth-audience so
+// mailboxd accepts user tokens (which carry this id in their aud via the
+// reserved project-audience scope).
+func (z *zitadelIDP) mailboxAudience() string { return z.mailboxProjectID }
+
 // backendIntrospectClientID/backendIntrospectSecret return the HTTP Basic creds a
 // backend with the given audience (a resolved project id) uses to call RFC 7662
 // introspection. The creds belong to an API app registered in that same project —
@@ -294,9 +307,11 @@ func (z *zitadelIDP) backendAudience(t *testing.T, logical string) string {
 // end. It (1) registers each backend audience as a Zitadel project so the
 // exchange's audience param resolves to a real aud, (2) creates an OIDC web app
 // with the token-exchange grant as the exchanging client mailboxd authenticates
-// with, and (3) creates userA/userB as machine users whose client_credentials
-// tokens carry every backend audience (via the reserved project-audience scope) so
-// the exchange may narrow to any one of them.
+// with, (3) creates userA/userB as machine users whose client_credentials tokens
+// carry every backend audience (via the reserved project-audience scope) so the
+// exchange may narrow to any one of them, and (4) registers a dedicated mailbox
+// resource project whose id user tokens also carry — this is the audience
+// mailboxd's -auth-audience flag checks at the front door.
 //
 // Note on roles: a bare exchange that keeps the SAME subject (subject_token = a
 // user's token, no actor_token) is a standard RFC 8693 exchange — it preserves the
@@ -356,6 +371,17 @@ func (z *zitadelIDP) provisionImpersonation(t *testing.T) {
 	for _, u := range []string{userA, userB} {
 		z.users[u] = z.createMachineUser(t, u)
 	}
+
+	// 4. The mailbox resource project: the audience mailboxd's -auth-audience flag
+	//    checks when validating user tokens at the front door. Registering a project
+	//    and including its reserved scope in mintUserToken causes Zitadel to embed
+	//    the project id in the user token's aud claim — so startMailboxdImpersonation
+	//    can pass mailboxAudience() as -auth-audience and mailboxd will accept them.
+	var mbp struct {
+		ID string `json:"id"`
+	}
+	z.mgmtJSON(t, http.MethodPost, "/management/v1/projects", map[string]any{"name": "mailbox-resource"}, &mbp)
+	z.mailboxProjectID = mbp.ID
 }
 
 // createMachineUser creates a machine user with JWT access tokens and returns its
@@ -378,7 +404,9 @@ func (z *zitadelIDP) createMachineUser(t *testing.T, username string) clientCred
 
 // mintUserToken returns a subject access token for the named user whose aud carries
 // every backend audience (the reserved project-audience scope adds each project id
-// to the token), so a later exchange may narrow to any one of them.
+// to the token), so a later exchange may narrow to any one of them. It also
+// includes the mailbox resource project id so mailboxd's -auth-audience check
+// accepts the token at the front door.
 func (z *zitadelIDP) mintUserToken(t *testing.T, user string) string {
 	t.Helper()
 	cc, ok := z.users[user]
@@ -388,6 +416,11 @@ func (z *zitadelIDP) mintUserToken(t *testing.T, user string) string {
 	scopes := []string{"openid"}
 	for _, aud := range backendAudiences {
 		scopes = append(scopes, "urn:zitadel:iam:org:project:id:"+z.backendAud[aud]+":aud")
+	}
+	// Include the mailbox resource project so user tokens carry mailboxAudience()
+	// in their aud claim — required by mailboxd's front-door audience validation.
+	if z.mailboxProjectID != "" {
+		scopes = append(scopes, "urn:zitadel:iam:org:project:id:"+z.mailboxProjectID+":aud")
 	}
 	return postToken(t, http.DefaultClient, z.tokenEndpoint(),
 		url.Values{"grant_type": {"client_credentials"}, "scope": {strings.Join(scopes, " ")}},

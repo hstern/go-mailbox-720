@@ -10,8 +10,11 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/url"
+	"os"
+	"os/exec"
 	"strings"
 	"testing"
+	"time"
 )
 
 // Backend audiences requested per protocol. Distinct per protocol so each
@@ -122,4 +125,81 @@ func claims(t *testing.T, jwt string) map[string]any {
 		t.Fatalf("unmarshal JWT payload: %v (%s)", err, payload)
 	}
 	return m
+}
+
+// startMailboxdImpersonation builds and runs mailboxd wired for per-identity
+// (token-exchange) impersonation against the given Zitadel instance. It mirrors
+// startMailboxd's structure (buildMailboxd, freeAddr, exec, t.Cleanup kill,
+// waitFor readiness) but uses the impersonation-specific flags instead of the
+// static backend flags:
+//
+//   - -auth-issuer / -auth-audience use z.mailboxAudience() (NOT z.audience()),
+//     so user tokens (which carry the mailbox resource project id) pass the
+//     front-door audience check.
+//   - -tokenexchange-endpoint / -tokenexchange-client-id wire the RFC 8693
+//     exchanger mailboxd uses to narrow a user token to a backend audience.
+//   - MAILBOXD_TOKENEXCHANGE_CLIENT_SECRET is injected via env only, never flags.
+//   - extraArgs are appended last so callers can wire per-test backend flags.
+//
+// It returns the /v1.0 base URL once mailboxd is ready.
+func startMailboxdImpersonation(t *testing.T, z *zitadelIDP, extraArgs []string) string {
+	t.Helper()
+	bin := buildMailboxd(t)
+
+	addr := freeAddr(t)
+	args := []string{
+		"-addr", addr,
+		"-auth-issuer", z.issuer(),
+		"-auth-audience", z.mailboxAudience(),
+		"-tokenexchange-endpoint", z.tokenEndpoint(),
+		"-tokenexchange-client-id", z.exchangeClientID(),
+	}
+	args = append(args, extraArgs...)
+
+	cmd := exec.Command(bin, args...)
+	cmd.Env = append(os.Environ(), authEnv(z)...)
+	cmd.Env = append(cmd.Env, "MAILBOXD_TOKENEXCHANGE_CLIENT_SECRET="+z.exchangeSecret())
+
+	// Route server output to stderr so failures include mailboxd's log.
+	cmd.Stdout, cmd.Stderr = os.Stderr, os.Stderr
+
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start mailboxd (impersonation): %v", err)
+	}
+	t.Cleanup(func() { _ = cmd.Process.Kill(); _, _ = cmd.Process.Wait() })
+
+	base := "http://" + addr + "/v1.0"
+	waitFor(t, "mailboxd-impersonation", 30*time.Second, func() bool {
+		resp, err := http.Get(base + "/me/messages") // 401 once up (auth on, no token)
+		if err != nil {
+			return false
+		}
+		_ = resp.Body.Close()
+		return true
+	})
+	return base
+}
+
+// TestUserTokenCarriesMailboxAudience verifies that mintUserToken embeds the
+// mailbox resource project id in the user token's aud claim. This confirms the
+// mailbox-audience provisioning plumbing (step 4 of provisionImpersonation +
+// the extra scope in mintUserToken) is wired correctly before Task 3 wires a
+// real backend. Requires docker; skip in fast/unit-only runs.
+func TestUserTokenCarriesMailboxAudience(t *testing.T) {
+	requireDocker(t)
+	z := &zitadelIDP{}
+	z.start(t)
+	z.provision(t)
+	z.provisionImpersonation(t)
+
+	tok := z.mintUserToken(t, userA)
+	want := z.mailboxAudience()
+	if want == "" {
+		t.Fatal("mailboxAudience() is empty after provisionImpersonation")
+	}
+	if !audContains(t, tok, want) {
+		t.Fatalf("user token aud does not contain mailboxAudience %q; full aud: %v",
+			want, claims(t, tok)["aud"])
+	}
+	t.Logf("OK: user token aud contains mailboxAudience %q", want)
 }
