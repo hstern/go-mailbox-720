@@ -6,15 +6,18 @@
 // serves that subject's mail out of the shared userStore — so a request for
 // userA's data can never return userB's.
 //
-// It serves a JMAP session document advertising the mail capability + one
-// account + an apiUrl pointing back at itself, and answers the three methods the
-// mailjmap client issues to list mail: Mailbox/get (to find the inbox),
-// Email/query (to list the inbox's emails), and Email/get (to fetch envelopes).
-// The wire shapes are hand-built JSON maps rather than go-jmap structs, so the
-// standalone e2e test module need not depend on go-jmap; the field names mirror
-// the go-jmap response structs (RFC 8620/8621) the client decodes. The per-sub
-// emails are synthesised from store.messages(sub) on each request, so the fake
-// holds no per-user state of its own.
+// It serves a JMAP session document advertising the mail and/or contacts
+// capability + one account + an apiUrl pointing back at itself, and answers the
+// methods each client issues. For mail (mailV != nil): Mailbox/get (to find the
+// inbox), Email/query (to list the inbox's emails), and Email/get (to fetch
+// envelopes). For contacts (contactsV != nil): AddressBook/get (to find the
+// default book), ContactCard/query (to list the book's cards), and
+// ContactCard/get (to fetch JSContact cards). The wire shapes are hand-built JSON
+// maps rather than go-jmap structs, so the standalone e2e test module need not
+// depend on go-jmap; the field names mirror the go-jmap response structs (RFC
+// 8620/8621 for mail, RFC 9553/9610 for contacts) the clients decode. The per-sub
+// data is synthesised from store.messages(sub) / store.contacts(sub) on each
+// request, so the fake holds no per-user state of its own.
 package e2e
 
 import (
@@ -38,23 +41,32 @@ const (
 	// jmapFakeInbox is the id of the one mailbox the fake exposes (role inbox),
 	// which the client selects when /me/messages passes an empty folder.
 	jmapFakeInbox = "mbx-inbox"
+	// jmapContactsURI is the RFC 9610 contacts capability URI the contacts client
+	// looks up to resolve the primary contacts account.
+	jmapContactsURI = "urn:ietf:params:jmap:contacts"
+	// jmapFakeBook is the id of the one address book the fake exposes, which the
+	// contacts client selects as the principal's default book.
+	jmapFakeBook = "ab-1"
 )
 
 // jmapFake is the stateless adapter: it validates each request's bearer with a
-// tokenValidator and reads per-subject mail from the store.
+// tokenValidator and reads per-subject mail and/or contacts from the store. At
+// least one of mailV/contactsV is set; each gates the matching capability,
+// account, and methods. A nil validator means that protocol is not served.
 type jmapFake struct {
-	mailV *tokenValidator
-	store *userStore
+	mailV     *tokenValidator
+	contactsV *tokenValidator
+	store     *userStore
 }
 
 // startJMAPFake wires the fake into an httptest.Server and returns its session
-// URL. mailV introspects the bearer for the JMAP-mail audience; contactsV is
-// accepted for the Task 4 contacts slice and may be nil here (only mail is
-// wired). store supplies per-subject seed data.
+// URL. mailV introspects the bearer for the JMAP-mail audience and gates the mail
+// capability + methods; contactsV does the same for the JMAP-contacts audience.
+// Either may be nil to leave that protocol unwired. store supplies per-subject
+// seed data.
 func startJMAPFake(t *testing.T, mailV, contactsV *tokenValidator, store *userStore) (sessionURL string) {
 	t.Helper()
-	_ = contactsV // contacts is wired in Task 4; mail-only here.
-	f := &jmapFake{mailV: mailV, store: store}
+	f := &jmapFake{mailV: mailV, contactsV: contactsV, store: store}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/session", f.handleSession)
@@ -65,8 +77,11 @@ func startJMAPFake(t *testing.T, mailV, contactsV *tokenValidator, store *userSt
 }
 
 // authenticate extracts the Authorization: Bearer token and introspects it via
-// the validator, returning the subject. On any failure it writes 401 and reports
-// false so the handler stops. The token itself is never logged.
+// each configured validator, returning the subject from the first that accepts
+// it. Mail and contacts use distinct audiences, so a given bearer validates with
+// exactly one validator; trying both lets a single server front either protocol.
+// On any failure it writes 401 and reports false so the handler stops. The token
+// itself is never logged.
 func (f *jmapFake) authenticate(w http.ResponseWriter, r *http.Request) (sub string, ok bool) {
 	const prefix = "Bearer "
 	h := r.Header.Get("Authorization")
@@ -74,12 +89,23 @@ func (f *jmapFake) authenticate(w http.ResponseWriter, r *http.Request) (sub str
 		http.Error(w, "missing bearer", http.StatusUnauthorized)
 		return "", false
 	}
-	sub, err := f.mailV.validate(strings.TrimSpace(h[len(prefix):]))
-	if err != nil {
-		http.Error(w, "invalid token: "+err.Error(), http.StatusUnauthorized)
-		return "", false
+	tok := strings.TrimSpace(h[len(prefix):])
+	var lastErr error
+	for _, v := range []*tokenValidator{f.mailV, f.contactsV} {
+		if v == nil {
+			continue
+		}
+		if sub, err := v.validate(tok); err == nil {
+			return sub, true
+		} else {
+			lastErr = err
+		}
 	}
-	return sub, true
+	if lastErr == nil {
+		lastErr = errBadJMAPCall
+	}
+	http.Error(w, "invalid token: "+lastErr.Error(), http.StatusUnauthorized)
+	return "", false
 }
 
 func (f *jmapFake) handleSession(w http.ResponseWriter, r *http.Request) {
@@ -87,22 +113,27 @@ func (f *jmapFake) handleSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	base := "http://" + r.Host
+	capabilities := map[string]any{jmapCoreURI: map[string]any{}}
+	primaryAccounts := map[string]any{}
+	if f.mailV != nil {
+		capabilities[jmapMailURI] = map[string]any{}
+		primaryAccounts[jmapMailURI] = jmapFakeAccount
+	}
+	if f.contactsV != nil {
+		capabilities[jmapContactsURI] = map[string]any{}
+		primaryAccounts[jmapContactsURI] = jmapFakeAccount
+	}
 	session := map[string]any{
-		"capabilities": map[string]any{
-			jmapCoreURI: map[string]any{},
-			jmapMailURI: map[string]any{},
-		},
+		"capabilities": capabilities,
 		"accounts": map[string]any{
 			jmapFakeAccount: map[string]any{"name": "Mailbox", "isPersonal": true},
 		},
-		"primaryAccounts": map[string]any{
-			jmapMailURI: jmapFakeAccount,
-		},
-		"username":    "mailbox",
-		"apiUrl":      base + "/api",
-		"downloadUrl": base + "/download/{accountId}/{blobId}/{name}",
-		"uploadUrl":   base + "/upload",
-		"state":       "session-state",
+		"primaryAccounts": primaryAccounts,
+		"username":        "mailbox",
+		"apiUrl":          base + "/api",
+		"downloadUrl":     base + "/download/{accountId}/{blobId}/{name}",
+		"uploadUrl":       base + "/upload",
+		"state":           "session-state",
 	}
 	writeJSONFake(w, session)
 }
@@ -118,9 +149,10 @@ func (f *jmapFake) handleAPI(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	emails := f.emailsFor(sub)
+	cards := f.cardsFor(sub)
 	responses := make([]jmapInvocation, 0, len(req.Calls))
 	for _, call := range req.Calls {
-		name, args := f.dispatch(call, emails)
+		name, args := f.dispatch(call, emails, cards)
 		responses = append(responses, jmapInvocation{name, args, call.CallID})
 	}
 	writeJSONFake(w, map[string]any{
@@ -161,10 +193,73 @@ func (f *jmapFake) emailsFor(sub string) map[string]fakeEmail {
 	return out
 }
 
-// dispatch answers a single method call against the subject's emails, returning
-// the response method name and its args object.
-func (f *jmapFake) dispatch(call jmapFakeCall, emails map[string]fakeEmail) (string, any) {
+// cardsFor synthesises the subject's seeded contacts as JMAP ContactCard objects
+// (JSContact Cards, RFC 9553) in the single address book. Ids are positional
+// ("card-0", …) and stable for one request, which is all the list path (query
+// then get) needs. The display name is carried as the JSContact name.full member,
+// which the server projects to Graph displayName.
+func (f *jmapFake) cardsFor(sub string) map[string]map[string]any {
+	out := map[string]map[string]any{}
+	for i, c := range f.store.contacts(sub) {
+		id := "card-" + strconv.Itoa(i)
+		out[id] = map[string]any{
+			"@type":          "Card",
+			"version":        "1.0",
+			"uid":            "uid-" + id,
+			"id":             id,
+			"addressBookIds": map[string]bool{jmapFakeBook: true},
+			"name":           map[string]any{"full": c.DisplayName},
+		}
+	}
+	return out
+}
+
+// dispatch answers a single method call against the subject's emails or contacts,
+// returning the response method name and its args object.
+func (f *jmapFake) dispatch(call jmapFakeCall, emails map[string]fakeEmail, cards map[string]map[string]any) (string, any) {
 	switch call.Name {
+	case "AddressBook/get":
+		book := map[string]any{
+			"id":          jmapFakeBook,
+			"name":        "Personal",
+			"description": "Default book",
+		}
+		return call.Name, map[string]any{
+			"accountId": jmapFakeAccount,
+			"state":     "ab-state",
+			"list":      []any{book},
+		}
+	case "ContactCard/query":
+		// The list path filters inAddressBook==ab-1; every synthesised card is in
+		// that book, so all of the subject's ids match.
+		ids := make([]string, 0, len(cards))
+		for id := range cards {
+			ids = append(ids, id)
+		}
+		return call.Name, map[string]any{
+			"accountId": jmapFakeAccount,
+			"ids":       ids,
+		}
+	case "ContactCard/get":
+		var m struct {
+			IDs []string `json:"ids"`
+		}
+		_ = json.Unmarshal(call.Args, &m)
+		list := make([]map[string]any, 0, len(m.IDs))
+		notFound := []string{}
+		for _, id := range m.IDs {
+			if c, ok := cards[id]; ok {
+				list = append(list, c)
+			} else {
+				notFound = append(notFound, id)
+			}
+		}
+		return call.Name, map[string]any{
+			"accountId": jmapFakeAccount,
+			"state":     "cc-state",
+			"list":      list,
+			"notFound":  notFound,
+		}
 	case "Mailbox/get":
 		inbox := map[string]any{
 			"id":           jmapFakeInbox,
