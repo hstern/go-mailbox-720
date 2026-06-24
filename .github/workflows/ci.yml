@@ -205,7 +205,30 @@ jobs:
       - name: Impersonation e2e (JMAP Mail)
         run: |
           cd test/e2e-oidc
-          go test -timeout 900s -run TestImpersonationJMAPMail ./...
+          go test -timeout 900s -run 'TestImpersonationJMAPMail$' ./...
+
+  impersonation-requested-token-type-jwt-e2e:
+    # Verifies the requested_token_type=jwt path (MB720-56): mailboxd runs with
+    # -tokenexchange-requested-token-type=...:jwt so Zitadel issues the exchanged
+    # backend token as a JWS JWT, and the JMAP fake validates it OFFLINE against the
+    # issuer's JWKS (no RFC 7662 introspection round-trip). Docker is available on
+    # GitHub-hosted runners.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # The e2e builds mailboxd, which imports the generated package.
+      - name: Generate (fetch upstream spec + ogen)
+        run: go generate ./internal/graph
+
+      - name: Impersonation e2e (requested_token_type=jwt, offline JWKS)
+        run: |
+          cd test/e2e-oidc
+          go test -timeout 900s -run TestImpersonationRequestedTokenTypeJWT ./...
 
   impersonation-contacts-jmap-e2e:
     # Verifies per-identity JMAP contacts impersonation: stands up Zitadel in Docker,
@@ -323,8 +346,10 @@ jobs:
     # Verifies foundational security invariants for the impersonation layer:
     # TestTokenValidatorChecksBackendAudience is the negative proof that a backend
     # introspection validator REJECTS a token exchanged for a different protocol's
-    # audience (boots Zitadel in Docker); TestUserStoreIsolatesSubjects is a fast
-    # no-docker unit test of per-subject store isolation. Docker is available on
+    # audience (boots Zitadel in Docker); TestUserStoreIsolatesSubjects and
+    # TestJWKSValidator are fast no-docker unit tests (per-subject store isolation;
+    # offline RS256/JWKS verification of an exchanged JWT, incl. bad-signature,
+    # wrong-audience, expired and alg:none rejection). Docker is available on
     # GitHub-hosted runners.
     runs-on: ubuntu-latest
     steps:
@@ -341,5 +366,5 @@ jobs:
       - name: Impersonation foundation e2e (token validator audience + user store isolation)
         run: |
           cd test/e2e-oidc
-          go test -timeout 900s -run 'TestTokenValidatorChecksBackendAudience|TestUserStoreIsolatesSubjects' ./...
+          go test -timeout 900s -run 'TestTokenValidatorChecksBackendAudience|TestUserStoreIsolatesSubjects|TestJWKSValidator' ./...
 

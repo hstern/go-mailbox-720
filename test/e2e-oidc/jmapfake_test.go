@@ -54,8 +54,8 @@ const (
 // least one of mailV/contactsV is set; each gates the matching capability,
 // account, and methods. A nil validator means that protocol is not served.
 type jmapFake struct {
-	mailV     *tokenValidator
-	contactsV *tokenValidator
+	mailV     bearerValidator
+	contactsV bearerValidator
 	store     *userStore
 }
 
@@ -64,7 +64,7 @@ type jmapFake struct {
 // capability + methods; contactsV does the same for the JMAP-contacts audience.
 // Either may be nil to leave that protocol unwired. store supplies per-subject
 // seed data.
-func startJMAPFake(t *testing.T, mailV, contactsV *tokenValidator, store *userStore) (sessionURL string) {
+func startJMAPFake(t *testing.T, mailV, contactsV bearerValidator, store *userStore) (sessionURL string) {
 	t.Helper()
 	f := &jmapFake{mailV: mailV, contactsV: contactsV, store: store}
 
@@ -91,7 +91,7 @@ func (f *jmapFake) authenticate(w http.ResponseWriter, r *http.Request) (sub str
 	}
 	tok := strings.TrimSpace(h[len(prefix):])
 	var lastErr error
-	for _, v := range []*tokenValidator{f.mailV, f.contactsV} {
+	for _, v := range []bearerValidator{f.mailV, f.contactsV} {
 		if v == nil {
 			continue
 		}

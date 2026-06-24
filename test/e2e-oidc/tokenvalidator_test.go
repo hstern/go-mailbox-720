@@ -18,6 +18,18 @@ import (
 	"testing"
 )
 
+// bearerValidator resolves the subject of an exchanged backend token, accepting
+// it only when it is valid AND carries the backend's audience. Two
+// implementations exist: tokenValidator (RFC 7662 introspection, for opaque
+// requested_token_type=access_token tokens) and jwksValidator (offline JWKS
+// verification, for requested_token_type=jwt tokens — MB720-56). A backend fake
+// takes this interface so the same serving path covers both exchange modes.
+type bearerValidator interface {
+	// validate returns the token's sub, or an error if it is invalid or lacks the
+	// required backend audience.
+	validate(bearer string) (sub string, err error)
+}
+
 // tokenValidator introspects a bearer token (RFC 7662) and accepts it only if it is
 // active AND carries a specific backend audience (a resolved Zitadel project id).
 // Each backend protocol constructs one for its own audience so it trusts a token
