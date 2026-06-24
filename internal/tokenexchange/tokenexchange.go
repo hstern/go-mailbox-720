@@ -86,6 +86,22 @@ func WithSkew(d time.Duration) Option {
 	}
 }
 
+// WithRequestedTokenType overrides the RFC 8693 requested_token_type sent on the
+// exchange (default urn:ietf:params:oauth:token-type:access_token). It names the
+// token's purpose, not its encoding, and the AS picks the issued format; setting
+// it to ...:jwt lets a deployment whose AS issues an opaque token for
+// :access_token (e.g. Zitadel's JWE) instead obtain a JWS JWT the backend can
+// validate offline via JWKS. An empty value is ignored, keeping the default.
+// Callers are responsible for passing a valid token-type URI (the AS rejects
+// unknown ones).
+func WithRequestedTokenType(uri string) Option {
+	return func(c *cachingExchanger) {
+		if uri != "" {
+			c.requestedTokenType = uri
+		}
+	}
+}
+
 // New returns a caching Exchanger that performs RFC 8693 token exchange against
 // the authorization server at tokenEndpoint. httpClient carries mailboxd's OAuth
 // client authentication to that endpoint (e.g. from go-oauth-client-authn); a nil
@@ -100,9 +116,10 @@ func New(tokenEndpoint string, httpClient *http.Client, opts ...Option) Exchange
 // lifetime, which suits the current deployment; a long-running multi-tenant
 // deployment wants a bounded cache, noted as follow-up (mirrors revocation.Store).
 type cachingExchanger struct {
-	client rfc8693.Client
-	skew   time.Duration
-	now    func() time.Time
+	client             rfc8693.Client
+	skew               time.Duration
+	now                func() time.Time
+	requestedTokenType string
 
 	mu    sync.Mutex
 	cache map[string]Token
@@ -112,10 +129,11 @@ type cachingExchanger struct {
 // the seam tests use to inject a stub Client.
 func newCaching(client rfc8693.Client, opts ...Option) *cachingExchanger {
 	c := &cachingExchanger{
-		client: client,
-		skew:   defaultSkew,
-		now:    time.Now,
-		cache:  make(map[string]Token),
+		client:             client,
+		skew:               defaultSkew,
+		now:                time.Now,
+		requestedTokenType: rfc8693.TokenTypeAccessToken,
+		cache:              make(map[string]Token),
 	}
 	for _, o := range opts {
 		if o != nil {
@@ -145,7 +163,7 @@ func (c *cachingExchanger) Exchange(ctx context.Context, subjectToken, audience 
 		GrantType:          rfc8693.GrantTypeTokenExchange,
 		SubjectToken:       subjectToken,
 		SubjectTokenType:   rfc8693.TokenTypeAccessToken,
-		RequestedTokenType: rfc8693.TokenTypeAccessToken,
+		RequestedTokenType: c.requestedTokenType,
 		Audience:           []string{audience},
 	})
 	if err != nil {

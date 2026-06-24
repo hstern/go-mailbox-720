@@ -74,6 +74,36 @@ func TestExchangeRequestShape(t *testing.T) {
 	}
 }
 
+func TestExchangeRequestedTokenTypeOption(t *testing.T) {
+	stub := &stubClient{resp: okResponse()}
+	ex := newCaching(stub, WithRequestedTokenType(rfc8693.TokenTypeJWT))
+
+	if _, err := ex.Exchange(context.Background(), "user-token", "aud"); err != nil {
+		t.Fatalf("Exchange: %v", err)
+	}
+	if len(stub.reqs) != 1 {
+		t.Fatalf("got %d requests, want 1", len(stub.reqs))
+	}
+	if got := stub.reqs[0].RequestedTokenType; got != rfc8693.TokenTypeJWT {
+		t.Errorf("RequestedTokenType = %q, want %q", got, rfc8693.TokenTypeJWT)
+	}
+}
+
+func TestExchangeRequestedTokenTypeEmptyKeepsDefault(t *testing.T) {
+	// An empty override is ignored, mirroring WithSkew: the RFC 8693-correct
+	// default (:access_token) stands so a misconfigured caller never sends an
+	// empty requested_token_type on the wire.
+	stub := &stubClient{resp: okResponse()}
+	ex := newCaching(stub, WithRequestedTokenType(""))
+
+	if _, err := ex.Exchange(context.Background(), "user-token", "aud"); err != nil {
+		t.Fatalf("Exchange: %v", err)
+	}
+	if got := stub.reqs[0].RequestedTokenType; got != rfc8693.TokenTypeAccessToken {
+		t.Errorf("RequestedTokenType = %q, want %q", got, rfc8693.TokenTypeAccessToken)
+	}
+}
+
 func TestExchangeReturnsToken(t *testing.T) {
 	base := time.Date(2026, 6, 21, 12, 0, 0, 0, time.UTC)
 	stub := &stubClient{resp: okResponse()}
