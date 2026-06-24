@@ -30,6 +30,7 @@ import (
 	clientauthn "github.com/hstern/go-oauth-client-authn"
 	"github.com/hstern/go-ssf/receiver"
 	subjectid "github.com/hstern/go-subjectid"
+	rfc8693 "github.com/hstern/go-token-exchange"
 
 	"github.com/hstern/go-mailbox-720/internal/auth"
 	"github.com/hstern/go-mailbox-720/internal/batch"
@@ -63,6 +64,7 @@ func main() {
 	tokenExchangeEndpoint := flag.String("tokenexchange-endpoint", "", "OAuth2 token endpoint for RFC 8693 token exchange (empty disables). Enables per-identity backends (MB720-41): a backend provider exchanges the authenticated user's token for a backend-audience token preserving the user's sub")
 	tokenExchangeClientID := flag.String("tokenexchange-client-id", "", "OAuth2 client id mailboxd authenticates with at the token-exchange endpoint (required when -tokenexchange-endpoint is set; secret from MAILBOXD_TOKENEXCHANGE_CLIENT_SECRET)")
 	tokenExchangeClientAuth := flag.String("tokenexchange-client-auth", "client_secret_basic", "client-authentication method at the token-exchange endpoint: client_secret_basic or client_secret_post")
+	tokenExchangeRequestedTokenType := flag.String("tokenexchange-requested-token-type", rfc8693.TokenTypeAccessToken, "RFC 8693 requested_token_type for the exchange: "+rfc8693.TokenTypeAccessToken+" (default; AS picks the format) or "+rfc8693.TokenTypeJWT+" (request a JWT so backends can validate offline via JWKS instead of RFC 7662 introspection)")
 	ssfReceiverPath := flag.String("ssf-receiver-path", "/ssf/events", "public path for the Shared Signals SET receiver (CAEP/RISC revocation, MB720-18); served unauthenticated since the SET signature is the gate. Active only when auth is enabled")
 	imapAddr := flag.String("mail-imap-addr", "", "IMAP server address host:port for the mail backend (empty: mail operations return 501; password from MAILBOXD_IMAP_PASSWORD)")
 	imapUser := flag.String("mail-imap-username", "", "IMAP username for the mail backend")
@@ -118,7 +120,7 @@ func main() {
 	// (MB720-42/43/44) use to mint backend-audience tokens from the authenticated
 	// user's token. It is nil when no endpoint is configured — the current default,
 	// where the static single-credential providers below serve every request.
-	exchanger, err := buildExchanger(*tokenExchangeEndpoint, *tokenExchangeClientID, *tokenExchangeClientAuth)
+	exchanger, err := buildExchanger(*tokenExchangeEndpoint, *tokenExchangeClientID, *tokenExchangeClientAuth, *tokenExchangeRequestedTokenType)
 	if err != nil {
 		log.Fatalln("mailboxd:", err)
 	}
@@ -716,8 +718,18 @@ func startScheduler(ctx context.Context, provider server.MailProvider, calProvid
 // the single-credential default. The client secret comes from the environment,
 // never a flag, so it does not appear in the process table; the chosen client-
 // authentication method (go-oauth-client-authn) travels on the http.Client the
-// exchange uses.
-func buildExchanger(endpoint, clientID, clientAuth string) (tokenexchange.Exchanger, error) {
+// exchange uses. reqTokenType is the validated RFC 8693 requested_token_type
+// (see requestedTokenType); it controls whether the AS is asked for an
+// :access_token (default) or a :jwt.
+func buildExchanger(endpoint, clientID, clientAuth, reqTokenType string) (tokenexchange.Exchanger, error) {
+	// Validate the requested-token-type before the endpoint guard: unlike the
+	// other -tokenexchange-* flags (which carry no default and are meaningless
+	// without an endpoint), this one has a behaviour-changing default, so a typo
+	// in an explicit value is caught at startup even when exchange is disabled.
+	rtt, err := requestedTokenType(reqTokenType)
+	if err != nil {
+		return nil, err
+	}
 	if endpoint == "" {
 		return nil, nil
 	}
@@ -737,7 +749,22 @@ func buildExchanger(endpoint, clientID, clientAuth string) (tokenexchange.Exchan
 	default:
 		return nil, fmt.Errorf("token exchange: unsupported -tokenexchange-client-auth %q (want client_secret_basic or client_secret_post)", clientAuth)
 	}
-	return tokenexchange.New(endpoint, clientauthn.NewClient(method, nil)), nil
+	return tokenexchange.New(endpoint, clientauthn.NewClient(method, nil),
+		tokenexchange.WithRequestedTokenType(rtt)), nil
+}
+
+// requestedTokenType validates the -tokenexchange-requested-token-type flag and
+// returns the RFC 8693 token-type URI to send as requested_token_type. Only
+// :access_token (the default; the AS chooses the issued format) and :jwt (request
+// a JWS JWT a backend can validate offline via JWKS) are accepted — the other
+// RFC 8693 §3 URIs name token kinds a mailbox backend cannot consume.
+func requestedTokenType(s string) (string, error) {
+	switch s {
+	case rfc8693.TokenTypeAccessToken, rfc8693.TokenTypeJWT:
+		return s, nil
+	default:
+		return "", fmt.Errorf("token exchange: unsupported -tokenexchange-requested-token-type %q (want %s or %s)", s, rfc8693.TokenTypeAccessToken, rfc8693.TokenTypeJWT)
+	}
 }
 
 // splitList parses a comma-separated flag value into a trimmed, non-empty slice.
