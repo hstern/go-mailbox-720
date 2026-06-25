@@ -19,6 +19,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"strings"
 	"testing"
 	"time"
 )
@@ -42,7 +43,49 @@ type zitadelIDP struct {
 	pat      string
 	clientID string
 	secret   string
+
+	// Impersonation provisioning (provisionImpersonation populates these).
+	//
+	// exchangeApp{ID,Secret} are an OIDC web app with the token-exchange grant —
+	// the exchanging client. Zitadel rejects a machine user as a token-exchange
+	// client ("invalid_client: no active client not found"); only an OIDC app with
+	// OIDC_GRANT_TYPE_TOKEN_EXCHANGE may perform the grant. So unlike the
+	// production peridentity.go (which authenticates as the mailbox machine user),
+	// the e2e authenticates the exchange as this app. The sub-preserving exchange
+	// property is identical; only the client registration differs.
+	exchangeApp    string
+	exchangeAppSec string
+
+	// backendIntrospect maps a backend project id to the Basic creds of an API app
+	// registered IN that project. Zitadel scopes introspection to the introspecting
+	// client's own project: an API app sees a token as active only when the token's
+	// audience is that app's project, and reports active:false for any other
+	// project's token (empirically verified — Task 1). So each backend introspects
+	// with creds rooted in its own project; that per-project scoping IS the backend
+	// audience check (a CalDAV introspector accepts a CalDAV token and rejects a
+	// JMAP-mail one). A single shared introspector cannot validate per-protocol
+	// audiences, so the creds are keyed by project id rather than stored once.
+	backendIntrospect map[string]clientCreds
+
+	// backendAud maps each logical backend audience (the aud* constants) to the
+	// Zitadel project id it was registered as. The exchanged token's aud carries
+	// these numeric project ids (Zitadel only admits project ids — resolved at
+	// provisioning time — into a token's aud, never arbitrary strings).
+	backendAud map[string]string
+
+	// mailboxProjectID is the Zitadel project id for the dedicated "mailbox"
+	// resource project. User tokens carry this id in their aud (via the reserved
+	// project-audience scope) so mailboxd's -auth-audience check passes. It is
+	// distinct from the mailbox machine-user client_id (audience()), which is used
+	// only for the baseline client_credentials token.
+	mailboxProjectID string
+
+	// users maps a username (userA/userB) to its machine-user client credentials.
+	users map[string]clientCreds
 }
+
+// clientCreds is a machine user's client_credentials login.
+type clientCreds struct{ clientID, secret string }
 
 func (z *zitadelIDP) name() string               { return "zitadel" }
 func (z *zitadelIDP) issuer() string             { return zitadelBase }
@@ -204,4 +247,210 @@ func (z *zitadelIDP) mgmtJSON(t *testing.T, method, path string, body, out any) 
 	if err := json.Unmarshal(rb, out); err != nil {
 		t.Fatalf("zitadel %s %s decode: %v (%s)", method, path, err, rb)
 	}
+}
+
+// --- RFC 8693 impersonation provisioning (MB720-52) ---
+
+// backendAudiences are the logical per-protocol backend audiences the e2e
+// exchanges for, in a fixed order so provisioning is deterministic.
+var backendAudiences = []string{
+	audMailJMAP, audContactsJMAP, audCalDAV, audCardDAV, audIMAP, audSMTP,
+}
+
+func (z *zitadelIDP) tokenEndpoint() string         { return zitadelBase + "/oauth/v2/token" }
+func (z *zitadelIDP) introspectionEndpoint() string { return zitadelBase + "/oauth/v2/introspect" }
+func (z *zitadelIDP) exchangeClientID() string      { return z.exchangeApp }
+func (z *zitadelIDP) exchangeSecret() string        { return z.exchangeAppSec }
+
+// mailboxAudience returns the Zitadel project id of the dedicated mailbox
+// resource project. startMailboxdImpersonation passes this as -auth-audience so
+// mailboxd accepts user tokens (which carry this id in their aud via the
+// reserved project-audience scope).
+func (z *zitadelIDP) mailboxAudience() string { return z.mailboxProjectID }
+
+// backendIntrospectClientID/backendIntrospectSecret return the HTTP Basic creds a
+// backend with the given audience (a resolved project id) uses to call RFC 7662
+// introspection. The creds belong to an API app registered in that same project —
+// Zitadel only reports active:true when the introspecting client and the token's
+// audience share a project, so a per-project introspector is required.
+func (z *zitadelIDP) backendIntrospectClientID(t *testing.T, backendAud string) string {
+	return z.introspectCreds(t, backendAud).clientID
+}
+func (z *zitadelIDP) backendIntrospectSecret(t *testing.T, backendAud string) string {
+	return z.introspectCreds(t, backendAud).secret
+}
+
+func (z *zitadelIDP) introspectCreds(t *testing.T, backendAud string) clientCreds {
+	t.Helper()
+	cc, ok := z.backendIntrospect[backendAud]
+	if !ok {
+		t.Fatalf("no introspection credential provisioned for backend audience %q", backendAud)
+	}
+	return cc
+}
+
+// backendAudience resolves a logical backend audience (an aud* constant) to the
+// concrete value the exchanged token will carry — the Zitadel project id it was
+// registered as. The exchange's `audience` param and the resulting `aud` claim use
+// this value, not the symbolic constant, because Zitadel only admits registered
+// project ids into a token's aud (an arbitrary string fails with invalid_target).
+func (z *zitadelIDP) backendAudience(t *testing.T, logical string) string {
+	t.Helper()
+	id, ok := z.backendAud[logical]
+	if !ok {
+		t.Fatalf("backend audience %q was not provisioned", logical)
+	}
+	return id
+}
+
+// provisionImpersonation makes the RFC 8693 sub-preserving exchange work end to
+// end. It (1) registers each backend audience as a Zitadel project so the
+// exchange's audience param resolves to a real aud, (2) creates an OIDC web app
+// with the token-exchange grant as the exchanging client mailboxd authenticates
+// with, (3) creates userA/userB as machine users whose client_credentials tokens
+// carry every backend audience (via the reserved project-audience scope) so the
+// exchange may narrow to any one of them, and (4) registers a dedicated mailbox
+// resource project whose id user tokens also carry — this is the audience
+// mailboxd's -auth-audience flag checks at the front door.
+//
+// Note on roles: a bare exchange that keeps the SAME subject (subject_token = a
+// user's token, no actor_token) is a standard RFC 8693 exchange — it preserves the
+// subject's sub and needs no impersonation role. The IAM_END_USER_IMPERSONATOR
+// role + actor_token are only required to CHANGE the subject (act as a user via a
+// different actor's token), which this path does not do. enableImpersonation is
+// already set in provision(); the role is left for the later actor-token tier.
+func (z *zitadelIDP) provisionImpersonation(t *testing.T) {
+	t.Helper()
+
+	// 1. One project per backend audience; record logical -> project id. Each project
+	//    also gets an API app (client_secret_basic) acting as that backend's resource
+	//    server / introspection client. Two reasons it must live in the project:
+	//    (a) Zitadel only issues an active, introspectable token for an audience whose
+	//    project hosts a registered client; (b) introspection is project-scoped — an
+	//    API app sees a token active only for its own project's audience. So this same
+	//    per-project app both anchors the audience and validates it (verified Task 1).
+	z.backendAud = make(map[string]string, len(backendAudiences))
+	z.backendIntrospect = make(map[string]clientCreds, len(backendAudiences))
+	for _, aud := range backendAudiences {
+		var p struct {
+			ID string `json:"id"`
+		}
+		z.mgmtJSON(t, http.MethodPost, "/management/v1/projects", map[string]any{"name": aud}, &p)
+		z.backendAud[aud] = p.ID
+		var ia struct {
+			ClientID     string `json:"clientId"`
+			ClientSecret string `json:"clientSecret"`
+		}
+		z.mgmtJSON(t, http.MethodPost, "/management/v1/projects/"+p.ID+"/apps/api", map[string]any{
+			"name":           aud + "-rs",
+			"authMethodType": "API_AUTH_METHOD_TYPE_BASIC",
+		}, &ia)
+		z.backendIntrospect[p.ID] = clientCreds{clientID: ia.ClientID, secret: ia.ClientSecret}
+	}
+
+	// 2. The exchanging client: an OIDC web app with the token-exchange grant.
+	//    accessTokenType JWT so the exchanged token is a decodable/JWKS-validatable
+	//    JWT (requested_token_type=jwt). A machine user cannot perform this grant.
+	pid := z.backendAud[audMailJMAP] // any project hosts the app; reuse the first.
+	var app struct {
+		ClientID     string `json:"clientId"`
+		ClientSecret string `json:"clientSecret"`
+	}
+	z.mgmtJSON(t, http.MethodPost, "/management/v1/projects/"+pid+"/apps/oidc", map[string]any{
+		"name":            "mailbox-exchanger",
+		"responseTypes":   []string{"OIDC_RESPONSE_TYPE_CODE"},
+		"grantTypes":      []string{"OIDC_GRANT_TYPE_TOKEN_EXCHANGE", "OIDC_GRANT_TYPE_AUTHORIZATION_CODE"},
+		"appType":         "OIDC_APP_TYPE_WEB",
+		"authMethodType":  "OIDC_AUTH_METHOD_TYPE_BASIC",
+		"accessTokenType": "OIDC_TOKEN_TYPE_JWT",
+	}, &app)
+	z.exchangeApp, z.exchangeAppSec = app.ClientID, app.ClientSecret
+
+	// 3. The subject users.
+	z.users = make(map[string]clientCreds, 2)
+	for _, u := range []string{userA, userB} {
+		z.users[u] = z.createMachineUser(t, u)
+	}
+
+	// 4. The mailbox resource project: the audience mailboxd's -auth-audience flag
+	//    checks when validating user tokens at the front door. Registering a project
+	//    and including its reserved scope in mintUserToken causes Zitadel to embed
+	//    the project id in the user token's aud claim — so startMailboxdImpersonation
+	//    can pass mailboxAudience() as -auth-audience and mailboxd will accept them.
+	var mbp struct {
+		ID string `json:"id"`
+	}
+	z.mgmtJSON(t, http.MethodPost, "/management/v1/projects", map[string]any{"name": "mailbox-resource"}, &mbp)
+	z.mailboxProjectID = mbp.ID
+}
+
+// createMachineUser creates a machine user with JWT access tokens and returns its
+// client_credentials login.
+func (z *zitadelIDP) createMachineUser(t *testing.T, username string) clientCreds {
+	t.Helper()
+	var mu struct {
+		UserID string `json:"userId"`
+	}
+	z.mgmtJSON(t, http.MethodPost, "/management/v1/users/machine", map[string]any{
+		"userName": username, "name": username, "accessTokenType": "ACCESS_TOKEN_TYPE_JWT",
+	}, &mu)
+	var sec struct {
+		ClientID     string `json:"clientId"`
+		ClientSecret string `json:"clientSecret"`
+	}
+	z.mgmtJSON(t, http.MethodPut, "/management/v1/users/"+mu.UserID+"/secret", map[string]any{}, &sec)
+	return clientCreds{clientID: sec.ClientID, secret: sec.ClientSecret}
+}
+
+// mintUserToken returns a subject access token for the named user whose aud carries
+// every backend audience (the reserved project-audience scope adds each project id
+// to the token), so a later exchange may narrow to any one of them. It also
+// includes the mailbox resource project id so mailboxd's -auth-audience check
+// accepts the token at the front door.
+func (z *zitadelIDP) mintUserToken(t *testing.T, user string) string {
+	t.Helper()
+	cc, ok := z.users[user]
+	if !ok {
+		t.Fatalf("user %q was not provisioned", user)
+	}
+	scopes := []string{"openid"}
+	for _, aud := range backendAudiences {
+		scopes = append(scopes, "urn:zitadel:iam:org:project:id:"+z.backendAud[aud]+":aud")
+	}
+	// Include the mailbox resource project so user tokens carry mailboxAudience()
+	// in their aud claim — required by mailboxd's front-door audience validation.
+	if z.mailboxProjectID != "" {
+		scopes = append(scopes, "urn:zitadel:iam:org:project:id:"+z.mailboxProjectID+":aud")
+	}
+	return postToken(t, http.DefaultClient, z.tokenEndpoint(),
+		url.Values{"grant_type": {"client_credentials"}, "scope": {strings.Join(scopes, " ")}},
+		cc.clientID, cc.secret)
+}
+
+// subjectFor mints the named user's token and returns its sub claim — the subject a
+// sub-preserving exchange must keep, and the value a backend's validator must surface
+// after introspecting the exchanged token.
+func (z *zitadelIDP) subjectFor(t *testing.T, user string) string {
+	t.Helper()
+	return subjectOf(t, z.mintUserToken(t, user))
+}
+
+// exchangeForBackend performs the production-shape RFC 8693 exchange: it authenticates
+// as the OIDC exchange app and exchanges userToken for a token scoped to backendAud,
+// with requested_token_type=access_token — the value production mailboxd hardcodes
+// (internal/tokenexchange/tokenexchange.go:148), for which Zitadel returns an opaque
+// (encrypted JWE) access token. The returned token is therefore NOT a decodable JWT;
+// it must be introspected. Used by validator/fake-backend tests to produce a
+// realistic exchanged token without running mailboxd.
+func (z *zitadelIDP) exchangeForBackend(t *testing.T, userToken, backendAud string) string {
+	t.Helper()
+	form := url.Values{
+		"grant_type":           {"urn:ietf:params:oauth:grant-type:token-exchange"},
+		"subject_token":        {userToken},
+		"subject_token_type":   {"urn:ietf:params:oauth:token-type:access_token"},
+		"requested_token_type": {"urn:ietf:params:oauth:token-type:access_token"},
+		"audience":             {backendAud},
+		"scope":                {"openid"},
+	}
+	return postToken(t, httpClientFor(z), z.tokenEndpoint(), form, z.exchangeClientID(), z.exchangeSecret())
 }

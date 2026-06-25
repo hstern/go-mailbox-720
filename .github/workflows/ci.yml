@@ -185,3 +185,186 @@ jobs:
       - name: Native-scheduling gating e2e (Stalwart)
         run: go test -tags dockertest -timeout 300s -run "TestStalwart" ./internal/calendar/caldav/
 
+  impersonation-jmap-mail-e2e:
+    # Verifies per-identity JMAP mail impersonation: stands up Zitadel in Docker,
+    # provisions the impersonator role + token-exchange grant, and asserts that
+    # mailboxd forwards a correctly-audience-scoped token to the IMAP backend so
+    # each user sees only their own mail. Docker is available on GitHub-hosted runners.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # The e2e builds mailboxd, which imports the generated package.
+      - name: Generate (fetch upstream spec + ogen)
+        run: go generate ./internal/graph
+
+      - name: Impersonation e2e (JMAP Mail)
+        run: |
+          cd test/e2e-oidc
+          go test -timeout 900s -run 'TestImpersonationJMAPMail$' ./...
+
+  impersonation-requested-token-type-jwt-e2e:
+    # Verifies the requested_token_type=jwt path (MB720-56): mailboxd runs with
+    # -tokenexchange-requested-token-type=...:jwt so Zitadel issues the exchanged
+    # backend token as a JWS JWT, and the JMAP fake validates it OFFLINE against the
+    # issuer's JWKS (no RFC 7662 introspection round-trip). Docker is available on
+    # GitHub-hosted runners.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # The e2e builds mailboxd, which imports the generated package.
+      - name: Generate (fetch upstream spec + ogen)
+        run: go generate ./internal/graph
+
+      - name: Impersonation e2e (requested_token_type=jwt, offline JWKS)
+        run: |
+          cd test/e2e-oidc
+          go test -timeout 900s -run TestImpersonationRequestedTokenTypeJWT ./...
+
+  impersonation-contacts-jmap-e2e:
+    # Verifies per-identity JMAP contacts impersonation: stands up Zitadel in Docker,
+    # provisions the impersonator role + token-exchange grant, and asserts that
+    # mailboxd forwards a correctly-audience-scoped token to the CardDAV backend so
+    # each user sees only their own contacts. Docker is available on GitHub-hosted runners.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # The e2e builds mailboxd, which imports the generated package.
+      - name: Generate (fetch upstream spec + ogen)
+        run: go generate ./internal/graph
+
+      - name: Impersonation e2e (Contacts JMAP)
+        run: |
+          cd test/e2e-oidc
+          go test -timeout 900s -run TestImpersonationContactsJMAP ./...
+
+  impersonation-caldav-e2e:
+    # Verifies per-identity CalDAV impersonation: stands up Zitadel in Docker,
+    # provisions the impersonator role + token-exchange grant, and asserts that
+    # mailboxd forwards a correctly-audience-scoped token to the CalDAV backend so
+    # each user sees only their own calendar events. Docker is available on GitHub-hosted runners.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # The e2e builds mailboxd, which imports the generated package.
+      - name: Generate (fetch upstream spec + ogen)
+        run: go generate ./internal/graph
+
+      - name: Impersonation e2e (CalDAV)
+        run: |
+          cd test/e2e-oidc
+          go test -timeout 900s -run TestImpersonationCalDAV ./...
+
+  impersonation-carddav-e2e:
+    # Verifies per-identity CardDAV impersonation: stands up Zitadel in Docker,
+    # provisions the impersonator role + token-exchange grant, and asserts that
+    # mailboxd forwards a correctly-audience-scoped token to the CardDAV backend so
+    # each user sees only their own contacts. Docker is available on GitHub-hosted runners.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # The e2e builds mailboxd, which imports the generated package.
+      - name: Generate (fetch upstream spec + ogen)
+        run: go generate ./internal/graph
+
+      - name: Impersonation e2e (CardDAV)
+        run: |
+          cd test/e2e-oidc
+          go test -timeout 900s -run TestImpersonationCardDAV ./...
+
+  impersonation-imap-e2e:
+    # Verifies per-identity IMAP impersonation: stands up Zitadel in Docker,
+    # provisions the impersonator role + token-exchange grant, and asserts that
+    # mailboxd authenticates each IMAP connection with the correct per-user
+    # OAUTHBEARER token so each user sees only their own mail. Docker is available
+    # on GitHub-hosted runners.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # The e2e builds mailboxd, which imports the generated package.
+      - name: Generate (fetch upstream spec + ogen)
+        run: go generate ./internal/graph
+
+      - name: Impersonation e2e (IMAP)
+        run: |
+          cd test/e2e-oidc
+          go test -timeout 900s -run TestImpersonationIMAP ./...
+
+  impersonation-smtp-e2e:
+    # Verifies per-identity SMTP impersonation: stands up Zitadel in Docker,
+    # provisions the impersonator role + token-exchange grant, and asserts that
+    # mailboxd authenticates each SMTP submission with the correct per-user
+    # OAUTHBEARER token so each user can only send as themselves. Docker is available
+    # on GitHub-hosted runners.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # The e2e builds mailboxd, which imports the generated package.
+      - name: Generate (fetch upstream spec + ogen)
+        run: go generate ./internal/graph
+
+      - name: Impersonation e2e (SMTP)
+        run: |
+          cd test/e2e-oidc
+          go test -timeout 900s -run TestImpersonationSMTP ./...
+
+  impersonation-foundation-e2e:
+    # Verifies foundational security invariants for the impersonation layer:
+    # TestTokenValidatorChecksBackendAudience is the negative proof that a backend
+    # introspection validator REJECTS a token exchanged for a different protocol's
+    # audience (boots Zitadel in Docker); TestUserStoreIsolatesSubjects and
+    # TestJWKSValidator are fast no-docker unit tests (per-subject store isolation;
+    # offline RS256/JWKS verification of an exchanged JWT, incl. bad-signature,
+    # wrong-audience, expired and alg:none rejection). Docker is available on
+    # GitHub-hosted runners.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # The e2e builds mailboxd, which imports the generated package.
+      - name: Generate (fetch upstream spec + ogen)
+        run: go generate ./internal/graph
+
+      - name: Impersonation foundation e2e (token validator audience + user store isolation)
+        run: |
+          cd test/e2e-oidc
+          go test -timeout 900s -run 'TestTokenValidatorChecksBackendAudience|TestUserStoreIsolatesSubjects|TestJWKSValidator' ./...
+
