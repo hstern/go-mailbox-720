@@ -86,6 +86,37 @@ func decodeError(t *testing.T, body []byte) (code, message string) {
 	return env.Error.Code, env.Error.Message
 }
 
+func TestHandlerStampsOwnerAndNotifiesWatch(t *testing.T) {
+	srv := echoServer(t)
+	store := NewMemoryStore()
+	h := NewHandler(store, srv.Client(), allowedResources, handlerMaxTTL, func() time.Time { return handlerNow })
+	h.SetOwnerFunc(func(*http.Request) string { return "iss|alice" })
+
+	var gotOwner string
+	var calls int
+	h.SetOnSubscribe(func(_ *http.Request, owner string) { calls++; gotOwner = owner })
+
+	req := httptest.NewRequest(http.MethodPost, "/v1.0/subscriptions", bytes.NewReader(createBody(srv.URL, nil)))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (body=%s)", rec.Code, rec.Body)
+	}
+	subs := store.List()
+	if len(subs) != 1 || subs[0].Owner != "iss|alice" {
+		t.Fatalf("stored owner = %q, want iss|alice (subs=%+v)", func() string {
+			if len(subs) > 0 {
+				return subs[0].Owner
+			}
+			return ""
+		}(), subs)
+	}
+	if calls != 1 || gotOwner != "iss|alice" {
+		t.Fatalf("onSubscribe calls=%d owner=%q, want 1 and iss|alice", calls, gotOwner)
+	}
+}
+
 func TestHandlerCreateValid(t *testing.T) {
 	srv := echoServer(t)
 	store := NewMemoryStore()

@@ -84,6 +84,12 @@ type Subscription struct {
 	ClientState        string
 	ExpirationDateTime time.Time
 	CreatedAt          time.Time
+	// Owner is the opaque key of the principal that created the subscription
+	// (e.g. iss+sub), set by the handler from the authenticated identity. It
+	// scopes delivery: a change for principal P reaches only P's subscriptions.
+	// Empty in single-tenant mode (no per-request identity), where every change
+	// and every subscription share the empty owner and so still match.
+	Owner string
 }
 
 // Validation sentinel errors. Each names exactly one rejection reason so callers

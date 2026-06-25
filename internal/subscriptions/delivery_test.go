@@ -175,6 +175,46 @@ func TestNotifyNoMatches(t *testing.T) {
 	}
 }
 
+func TestNotifyScopesByOwner(t *testing.T) {
+	now := time.Date(2026, 6, 19, 12, 0, 0, 0, time.UTC)
+	future := now.Add(time.Hour)
+
+	alice := newRecorder(t, http.StatusOK)
+	bob := newRecorder(t, http.StatusOK)
+	unowned := newRecorder(t, http.StatusOK)
+
+	store := NewMemoryStore()
+	for _, s := range []Subscription{
+		{ID: "alice", Owner: "iss|alice", Resource: "/me/messages", ChangeType: "updated", NotificationURL: alice.srv.URL, ExpirationDateTime: future},
+		{ID: "bob", Owner: "iss|bob", Resource: "/me/messages", ChangeType: "updated", NotificationURL: bob.srv.URL, ExpirationDateTime: future},
+		{ID: "unowned", Resource: "/me/messages", ChangeType: "updated", NotificationURL: unowned.srv.URL, ExpirationDateTime: future},
+	} {
+		if _, err := store.Create(s); err != nil {
+			t.Fatalf("Create(%s): %v", s.ID, err)
+		}
+	}
+
+	// A change owned by alice reaches only alice's subscription — not bob's, not
+	// the unowned one.
+	res := Notify(context.Background(), http.DefaultClient, store, Change{
+		Owner: "iss|alice", Resource: "/me/messages", ChangeType: ChangeUpdated, ResourceIDs: []string{"m1"},
+	}, now)
+	if res.Matched != 1 || res.Delivered != 1 {
+		t.Fatalf("alice change: Matched=%d Delivered=%d, want 1/1", res.Matched, res.Delivered)
+	}
+	if alice.count() != 1 || bob.count() != 0 || unowned.count() != 0 {
+		t.Fatalf("POST counts alice=%d bob=%d unowned=%d, want 1/0/0", alice.count(), bob.count(), unowned.count())
+	}
+
+	// An unowned (single-tenant) change reaches only the unowned subscription.
+	res = Notify(context.Background(), http.DefaultClient, store, Change{
+		Resource: "/me/messages", ChangeType: ChangeUpdated, ResourceIDs: []string{"m2"},
+	}, now)
+	if res.Matched != 1 || unowned.count() != 1 || alice.count() != 1 {
+		t.Fatalf("unowned change: Matched=%d unowned=%d alice=%d, want 1, unowned+1, alice unchanged", res.Matched, unowned.count(), alice.count())
+	}
+}
+
 func TestNotifyResourceMatchCaseInsensitive(t *testing.T) {
 	now := time.Date(2026, 6, 19, 12, 0, 0, 0, time.UTC)
 	store := NewMemoryStore()

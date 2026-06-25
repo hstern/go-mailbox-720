@@ -157,7 +157,7 @@ func TestRunResourceDeliversForArbitraryResource(t *testing.T) {
 	defer cancel()
 	reports := make(chan subscriptions.Result, 4)
 	go func() {
-		_ = RunResource(ctx, EventsResource, watch, sync, store, recv.Client(), time.Now, func(r subscriptions.Result) { reports <- r })
+		_ = RunResource(ctx, "", EventsResource, watch, sync, store, recv.Client(), time.Now, func(r subscriptions.Result) { reports <- r })
 	}()
 
 	select {

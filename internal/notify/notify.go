@@ -77,17 +77,20 @@ func Run(
 		}
 		return ids, next, nil
 	}
-	return RunResource(ctx, MessagesResource, watch, sync, store, client, now, report)
+	return RunResource(ctx, "", MessagesResource, watch, sync, store, client, now, report)
 }
 
 // RunResource watches one Graph resource collection and delivers a "created"
 // change notification to its matching subscriptions whenever the backing
 // collection changes, until ctx is cancelled. resource is the Graph collection
 // path (e.g. "/me/events"); watch and sync are the collection's adapted Watcher
-// and DeltaReader. The remaining parameters match Run. It returns nil on ctx
+// and DeltaReader. owner scopes delivery to one principal's subscriptions (empty
+// in single-tenant mode); the per-principal watch manager passes the principal
+// key here. The remaining parameters match Run. It returns nil on ctx
 // cancellation, or an error if the baseline sync or the watch fails.
 func RunResource(
 	ctx context.Context,
+	owner string,
 	resource string,
 	watch WatchFunc,
 	sync SyncFunc,
@@ -128,6 +131,7 @@ func RunResource(
 			Resource:    resource,
 			ChangeType:  subscriptions.ChangeCreated,
 			ResourceIDs: ids,
+			Owner:       owner,
 		}, now())
 		if report != nil {
 			report(res)

@@ -689,7 +689,7 @@ func startCalendarNotifier(ctx context.Context, provider server.CalendarProvider
 	go func() {
 		defer func() { _ = backend.Close() }()
 		log.Println("notifications(events): delivery loop watching the primary calendar")
-		if err := notify.RunResource(ctx, notify.EventsResource, watch, sync, store, subscriptions.GuardedClient(), time.Now, resourceReport("events")); err != nil {
+		if err := notify.RunResource(ctx, "", notify.EventsResource, watch, sync, store, subscriptions.GuardedClient(), time.Now, resourceReport("events")); err != nil {
 			log.Println("notifications(events): delivery loop stopped:", err)
 		}
 	}()
@@ -754,7 +754,7 @@ func startContactsNotifier(ctx context.Context, provider server.ContactsProvider
 	go func() {
 		defer func() { _ = backend.Close() }()
 		log.Println("notifications(contacts): delivery loop watching the default address book")
-		if err := notify.RunResource(ctx, notify.ContactsResource, watch, sync, store, subscriptions.GuardedClient(), time.Now, resourceReport("contacts")); err != nil {
+		if err := notify.RunResource(ctx, "", notify.ContactsResource, watch, sync, store, subscriptions.GuardedClient(), time.Now, resourceReport("contacts")); err != nil {
 			log.Println("notifications(contacts): delivery loop stopped:", err)
 		}
 	}()

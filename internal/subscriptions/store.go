@@ -28,6 +28,10 @@ type Store interface {
 	Get(id string) (Subscription, error)
 	// List returns all stored subscriptions, ordered by CreatedAt.
 	List() []Subscription
+	// ListByOwner returns the stored subscriptions owned by owner, ordered by
+	// CreatedAt. It is how the per-principal watch manager learns which resources
+	// a principal subscribes to.
+	ListByOwner(owner string) []Subscription
 	// Delete removes the subscription with the given id, or returns ErrNotFound.
 	Delete(id string) error
 	// DeleteExpired removes every subscription whose ExpirationDateTime is at or
@@ -109,6 +113,26 @@ func (s *MemoryStore) List() []Subscription {
 	out := make([]Subscription, 0, len(s.subs))
 	for _, sub := range s.subs {
 		out = append(out, sub)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].CreatedAt.Equal(out[j].CreatedAt) {
+			return out[i].ID < out[j].ID
+		}
+		return out[i].CreatedAt.Before(out[j].CreatedAt)
+	})
+	return out
+}
+
+// ListByOwner returns the subscriptions owned by owner, ordered like List.
+func (s *MemoryStore) ListByOwner(owner string) []Subscription {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	out := make([]Subscription, 0)
+	for _, sub := range s.subs {
+		if sub.Owner == owner {
+			out = append(out, sub)
+		}
 	}
 	sort.Slice(out, func(i, j int) bool {
 		if out[i].CreatedAt.Equal(out[j].CreatedAt) {
