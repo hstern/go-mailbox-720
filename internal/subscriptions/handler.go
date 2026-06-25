@@ -109,24 +109,26 @@ func (h *Handler) notifyWatch(r *http.Request, owner string) {
 // subscriptionWire is the JSON shape of a Graph subscription on the wire. The
 // @odata.* envelope fields are omitted for now; expirationDateTime is RFC3339.
 type subscriptionWire struct {
-	ID                 string `json:"id,omitempty"`
-	ChangeType         string `json:"changeType"`
-	NotificationURL    string `json:"notificationUrl"`
-	Resource           string `json:"resource"`
-	ExpirationDateTime string `json:"expirationDateTime"`
-	ClientState        string `json:"clientState,omitempty"`
+	ID                       string `json:"id,omitempty"`
+	ChangeType               string `json:"changeType"`
+	NotificationURL          string `json:"notificationUrl"`
+	LifecycleNotificationURL string `json:"lifecycleNotificationUrl,omitempty"`
+	Resource                 string `json:"resource"`
+	ExpirationDateTime       string `json:"expirationDateTime"`
+	ClientState              string `json:"clientState,omitempty"`
 }
 
 // toWire renders a stored Subscription as its wire shape. clientState IS echoed
 // back: Graph returns it on create so the subscriber can confirm what was stored.
 func toWire(sub Subscription) subscriptionWire {
 	return subscriptionWire{
-		ID:                 sub.ID,
-		ChangeType:         string(sub.ChangeType),
-		NotificationURL:    sub.NotificationURL,
-		Resource:           sub.Resource,
-		ExpirationDateTime: sub.ExpirationDateTime.UTC().Format(time.RFC3339),
-		ClientState:        sub.ClientState,
+		ID:                       sub.ID,
+		ChangeType:               string(sub.ChangeType),
+		NotificationURL:          sub.NotificationURL,
+		LifecycleNotificationURL: sub.LifecycleNotificationURL,
+		Resource:                 sub.Resource,
+		ExpirationDateTime:       sub.ExpirationDateTime.UTC().Format(time.RFC3339),
+		ClientState:              sub.ClientState,
 	}
 }
 
@@ -222,11 +224,12 @@ func (h *Handler) create(w http.ResponseWriter, r *http.Request) {
 	}
 
 	sub := Subscription{
-		Resource:        wire.Resource,
-		ChangeType:      ChangeType(wire.ChangeType),
-		NotificationURL: wire.NotificationURL,
-		ClientState:     wire.ClientState,
-		Owner:           owner,
+		Resource:                 wire.Resource,
+		ChangeType:               ChangeType(wire.ChangeType),
+		NotificationURL:          wire.NotificationURL,
+		LifecycleNotificationURL: wire.LifecycleNotificationURL,
+		ClientState:              wire.ClientState,
+		Owner:                    owner,
 	}
 	if wire.ExpirationDateTime != "" {
 		exp, err := time.Parse(time.RFC3339, wire.ExpirationDateTime)
@@ -250,6 +253,23 @@ func (h *Handler) create(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalidRequest",
 			"The notificationUrl did not pass the validation handshake.")
 		return
+	}
+
+	// A lifecycleNotificationUrl is optional, but when present it must be https
+	// and pass the same ownership handshake — it receives reauthorizationRequired
+	// and missed events, so an unverified URL is the same exposure as an
+	// unverified notificationUrl.
+	if sub.LifecycleNotificationURL != "" {
+		if !strings.HasPrefix(sub.LifecycleNotificationURL, "https://") {
+			writeError(w, http.StatusBadRequest, "invalidRequest",
+				"lifecycleNotificationUrl must be an https URL.")
+			return
+		}
+		if err := VerifyNotificationURL(r.Context(), h.client, sub.LifecycleNotificationURL); err != nil {
+			writeError(w, http.StatusBadRequest, "invalidRequest",
+				"The lifecycleNotificationUrl did not pass the validation handshake.")
+			return
+		}
 	}
 
 	stored, err := h.store.Create(sub)

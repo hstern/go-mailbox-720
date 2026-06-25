@@ -41,6 +41,16 @@ func (rec *recorder) count() int {
 	return len(rec.bodies)
 }
 
+func (rec *recorder) lastBody(t *testing.T) []byte {
+	t.Helper()
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	if len(rec.bodies) == 0 {
+		t.Fatal("recorder received no POSTs")
+	}
+	return rec.bodies[len(rec.bodies)-1]
+}
+
 func (rec *recorder) lastEnvelope(t *testing.T) notificationEnvelope {
 	t.Helper()
 	rec.mu.Lock()

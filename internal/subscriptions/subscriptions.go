@@ -84,6 +84,11 @@ type Subscription struct {
 	ClientState        string
 	ExpirationDateTime time.Time
 	CreatedAt          time.Time
+	// LifecycleNotificationURL is where lifecycle notifications
+	// (reauthorizationRequired, missed, subscriptionRemoved) are POSTed, distinct
+	// from NotificationURL which carries data changes. Empty when the subscriber
+	// did not ask for lifecycle events.
+	LifecycleNotificationURL string
 	// Owner is the opaque key of the principal that created the subscription
 	// (e.g. iss+sub), set by the handler from the authenticated identity. It
 	// scopes delivery: a change for principal P reaches only P's subscriptions.

@@ -250,6 +250,38 @@ func TestHandlerCreateRejectsUnmappedIdentity(t *testing.T) {
 	}
 }
 
+func TestHandlerCreateAcceptsLifecycleURL(t *testing.T) {
+	srv := echoServer(t) // echoes the validation token for any URL POSTed to it
+	store := NewMemoryStore()
+	h := newTestHandler(t, store, srv.Client())
+
+	body := createBody(srv.URL, map[string]any{"lifecycleNotificationUrl": srv.URL})
+	req := httptest.NewRequest(http.MethodPost, "/v1.0/subscriptions", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (body=%s)", rec.Code, rec.Body)
+	}
+	if got := store.List()[0].LifecycleNotificationURL; got != srv.URL {
+		t.Fatalf("stored lifecycleNotificationUrl = %q, want %q", got, srv.URL)
+	}
+}
+
+func TestHandlerCreateRejectsNonHTTPSLifecycleURL(t *testing.T) {
+	srv := echoServer(t)
+	h := newTestHandler(t, NewMemoryStore(), srv.Client())
+
+	body := createBody(srv.URL, map[string]any{"lifecycleNotificationUrl": "http://insecure.example/lifecycle"})
+	req := httptest.NewRequest(http.MethodPost, "/v1.0/subscriptions", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 for a non-https lifecycleNotificationUrl", rec.Code)
+	}
+}
+
 func TestHandlerCreateValid(t *testing.T) {
 	srv := echoServer(t)
 	store := NewMemoryStore()
