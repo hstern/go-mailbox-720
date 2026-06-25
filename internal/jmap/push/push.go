@@ -26,6 +26,7 @@ import (
 	"fmt"
 	"net/http"
 	"sort"
+	"time"
 
 	gojmap "git.sr.ht/~rockorager/go-jmap"
 	"github.com/coder/websocket"
@@ -149,6 +150,55 @@ func (c *Consumer) Run(ctx context.Context) error {
 		}
 		if err := c.dispatch(data); err != nil {
 			return err
+		}
+	}
+}
+
+// Backoff bounds the reconnect interval Serve uses between a dropped socket and
+// the next dial attempt: it starts at Min and doubles up to Max.
+type Backoff struct {
+	Min time.Duration
+	Max time.Duration
+}
+
+// defaultBackoff is used when Serve is called with a zero Backoff.
+var defaultBackoff = Backoff{Min: time.Second, Max: 30 * time.Second}
+
+// Serve runs the consumer with automatic reconnect until ctx is cancelled. Each
+// time the socket drops with an error it waits a backoff interval (growing from
+// b.Min to b.Max), fires every subscribed handler once so changes missed while
+// disconnected are caught by the caller's next re-sync, then reconnects. A zero
+// b uses a sane default. Serve returns nil when ctx is cancelled; it does not
+// return on transient connection errors — those are the point of reconnect.
+func (c *Consumer) Serve(ctx context.Context, b Backoff) error {
+	if b.Min <= 0 || b.Max < b.Min {
+		b = defaultBackoff
+	}
+	wait := b.Min
+	for {
+		if err := c.Run(ctx); ctx.Err() != nil || err == nil {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-time.After(wait):
+		}
+		// Reconnecting after a gap: force a re-sync so changes that occurred
+		// while the socket was down are not lost (push has no replay here).
+		c.fireAll()
+		if wait *= 2; wait > b.Max {
+			wait = b.Max
+		}
+	}
+}
+
+// fireAll invokes every subscribed handler once. It is the reconnect re-sync
+// trigger: handlers are coalesced signals, so firing them is safe and idempotent.
+func (c *Consumer) fireAll() {
+	for _, fns := range c.handlers {
+		for _, fn := range fns {
+			fn()
 		}
 	}
 }

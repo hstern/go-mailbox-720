@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -208,6 +209,77 @@ func TestConsumerHandlesLargeStateChange(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("Run did not return after cancel")
+	}
+}
+
+func TestConsumerServeReconnects(t *testing.T) {
+	// The first connection delivers one Email StateChange then drops; Serve must
+	// reconnect and, on reconnect, fire the handler again to force a catch-up
+	// re-sync for changes missed while the socket was down.
+	var conns int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, err := websocket.Accept(w, r, &websocket.AcceptOptions{Subprotocols: []string{"jmap"}})
+		if err != nil {
+			return
+		}
+		defer c.CloseNow()
+		n := atomic.AddInt32(&conns, 1)
+		ctx := r.Context()
+		if _, _, err := c.Read(ctx); err != nil { // WebSocketPushEnable
+			return
+		}
+		if n == 1 {
+			b, _ := json.Marshal(stateChange("acc1", map[string]string{"Email": "s2"}))
+			if err := c.Write(ctx, websocket.MessageText, b); err != nil {
+				return
+			}
+			c.Close(websocket.StatusNormalClosure, "drop") // force a reconnect
+			return
+		}
+		<-ctx.Done() // keep later connections open
+	}))
+	t.Cleanup(srv.Close)
+
+	signal := make(chan struct{}, 16)
+	c := New(wsURL(srv.URL), "tok", nil)
+	c.Subscribe("Email", func() { signal <- struct{}{} })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- c.Serve(ctx, Backoff{Min: 10 * time.Millisecond, Max: 20 * time.Millisecond}) }()
+
+	// First signal: the StateChange on connection #1.
+	select {
+	case <-signal:
+	case <-time.After(2 * time.Second):
+		t.Fatal("no signal from the first connection's StateChange")
+	}
+	// Second signal: the fireAll forced re-sync after the drop.
+	select {
+	case <-signal:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Serve did not fire handlers on reconnect")
+	}
+
+	// The reconnect dial follows the re-sync; wait for the server to see it.
+	deadline := time.After(2 * time.Second)
+	for atomic.LoadInt32(&conns) < 2 {
+		select {
+		case <-deadline:
+			t.Fatalf("server saw %d connections, want >= 2 (reconnect)", atomic.LoadInt32(&conns))
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+
+	cancel()
+	select {
+	case err := <-serveErr:
+		if err != nil {
+			t.Fatalf("Serve returned %v on cancel, want nil", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Serve did not return after cancel")
 	}
 }
 
