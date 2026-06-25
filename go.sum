@@ -21,8 +21,6 @@ github.com/emersion/go-smtp v0.24.0/go.mod h1:ZtRRkbTyp2XTHCA+BmyTFTrj8xY4I+b4Mc
 github.com/emersion/go-vcard v0.0.0-20241024213814-c9703dde27ff/go.mod h1:HMJKR5wlh/ziNp+sHEDV2ltblO4JD2+IdDOWtGcQBTM=
 github.com/emersion/go-vcard v0.0.0-20260618161152-d854b7e0e2d3 h1:B9YK+Tck5mTccyDhtxBzWyqGYcFxLyB6+noMNW4/VgI=
 github.com/emersion/go-vcard v0.0.0-20260618161152-d854b7e0e2d3/go.mod h1:HMJKR5wlh/ziNp+sHEDV2ltblO4JD2+IdDOWtGcQBTM=
-github.com/emersion/go-webdav v0.7.1-0.20260411103855-046391163625 h1:ovZXFrv4Whu+L8kjnypHArBcj8Hgg7Xr8P1+jMo1Fto=
-github.com/emersion/go-webdav v0.7.1-0.20260411103855-046391163625/go.mod h1:/CletBm2Vo0CX6I20VQsoRkkX1CzzNCK1PNCqKW//iQ=
 github.com/fatih/color v1.19.0 h1:Zp3PiM21/9Ld6FzSKyL5c/BULoe/ONr9KlbYVOfG8+w=
 github.com/fatih/color v1.19.0/go.mod h1:zNk67I0ZUT1bEGsSGyCZYZNrHuTkJJB+r6Q9VuMi0LE=
 github.com/ghodss/yaml v1.0.0 h1:wQHKEahhL6wmXdzwWG11gIVCkOv05bNOh+Rxn0yngAk=
@@ -76,6 +74,8 @@ github.com/hstern/go-token-exchange v0.1.1 h1:9Xrt4nts0DGGM7xpw8hlaomIFFbnJdgZOT
 github.com/hstern/go-token-exchange v0.1.1/go.mod h1:LunRGsoUYqkUAp4phB1yTZzxY/JJCHIxxAgPSxpNeEs=
 github.com/hstern/go-token-introspection v0.1.0 h1:Q4CkhEtYRoMkBb0S+lytvn94+BoTj81hwgM3/5/jCOg=
 github.com/hstern/go-token-introspection v0.1.0/go.mod h1:JS0m/iCfUqyU/R85fKfRgdQ+H0fICFVSCQ4u55xAahU=
+github.com/hstern/go-webdav v0.7.1-0.20260625191323-6c7cfde5c0a0 h1:I+eCx4Pi5Mr+MsjhrK0pQKpmFskpjfPOMybrrgtI6/0=
+github.com/hstern/go-webdav v0.7.1-0.20260625191323-6c7cfde5c0a0/go.mod h1:/CletBm2Vo0CX6I20VQsoRkkX1CzzNCK1PNCqKW//iQ=
 github.com/kr/pretty v0.3.1 h1:flRD4NNwYAUpkphVc1HcthR4KEIFJ65n8Mw5qdRn3LE=
 github.com/kr/pretty v0.3.1/go.mod h1:hoEshYVHaxMs3cyo3Yncou5ZscifuDolrwPKZanG3xk=
 github.com/kr/text v0.2.0 h1:5Nx0Ya0ZqY2ygV366QzturHI13Jq95ApcVaJBhpS+AY=

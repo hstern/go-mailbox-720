@@ -371,6 +371,45 @@ func TestInjectDeltaTokenParams(t *testing.T) {
 	}
 }
 
+// TestInjectIfMatchParams checks that an If-Match header param is added to a
+// patch operation, that a patch already declaring one is left alone, and that a
+// path with no patch is untouched.
+func TestInjectIfMatchParams(t *testing.T) {
+	kept := map[string]any{
+		"/me/messages/{message-id}": map[string]any{
+			"patch": map[string]any{
+				"parameters": []any{map[string]any{"name": "message-id", "in": "path"}},
+			},
+			"delete": map[string]any{"parameters": []any{}},
+		},
+		"/me/events/{event-id}": map[string]any{
+			"patch": map[string]any{
+				"parameters": []any{map[string]any{"name": "if-match", "in": "header"}},
+			},
+		},
+		"/me/messages": map[string]any{
+			"get": map[string]any{"parameters": []any{}},
+		},
+	}
+	injectIfMatchParams(kept)
+
+	msgPatch := kept["/me/messages/{message-id}"].(map[string]any)["patch"].(map[string]any)["parameters"].([]any)
+	if !hasHeaderParam(msgPatch, "If-Match") {
+		t.Errorf("message patch missing If-Match header param; got %v", msgPatch)
+	}
+
+	// A patch already declaring If-Match (case-insensitively) is not duplicated.
+	evtPatch := kept["/me/events/{event-id}"].(map[string]any)["patch"].(map[string]any)["parameters"].([]any)
+	if n := len(evtPatch); n != 1 {
+		t.Errorf("event patch param count = %d, want 1 (no duplicate If-Match)", n)
+	}
+
+	// A path with no patch operation is untouched.
+	if get := kept["/me/messages"].(map[string]any)["get"].(map[string]any)["parameters"].([]any); len(get) != 0 {
+		t.Errorf("non-patch path params modified: %v", get)
+	}
+}
+
 func TestStripSendResponseDefault(t *testing.T) {
 	props := map[string]any{
 		"SendResponse": map[string]any{"type": "boolean", "default": false},

@@ -5,10 +5,13 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"net/http"
 	"path"
 	"strings"
 
 	"github.com/emersion/go-vcard"
+	"github.com/emersion/go-webdav"
+	gocarddav "github.com/emersion/go-webdav/carddav"
 	"github.com/hstern/go-jscontact"
 	jsvcard "github.com/hstern/go-jscontact/vcard"
 
@@ -37,7 +40,7 @@ func (cl *Client) CreateContact(ctx context.Context, abID string, c contacts.Con
 	objectPath := path.Join(abPath, name)
 	// path.Join strips a trailing slash; CardDAV object resources are addressed
 	// by their full href, which has no trailing slash, so this is correct.
-	if err := cl.putContact(ctx, objectPath, c); err != nil {
+	if err := cl.putContact(ctx, objectPath, c, nil); err != nil {
 		return contacts.Contact{}, fmt.Errorf("carddav: create contact in %q: %w", abPath, err)
 	}
 	c.ID = contactID(objectPath)
@@ -54,8 +57,35 @@ func (cl *Client) UpdateContact(ctx context.Context, c contacts.Contact) (contac
 	if err != nil {
 		return contacts.Contact{}, err
 	}
-	if err := cl.putContact(ctx, objectPath, c); err != nil {
+	if err := cl.putContact(ctx, objectPath, c, nil); err != nil {
 		return contacts.Contact{}, fmt.Errorf("carddav: update contact %q: %w", objectPath, err)
+	}
+	c.AddressBookID = addressBookIDForObject(objectPath)
+	return c, nil
+}
+
+var _ contacts.ConditionalWriter = (*Client)(nil)
+
+// UpdateContactIfMatch overwrites the address object resource identified by c.ID
+// with a vCard built from c, but only if the resource's current ETag matches
+// ifMatch. It issues a conditional PUT (If-Match: ifMatch) so the CardDAV server
+// enforces the precondition atomically — there is no read-modify-write window. A
+// failed precondition (the server's 412 Precondition Failed) is translated to
+// contacts.ErrPreconditionFailed; the HTTP layer maps that to 412.
+func (cl *Client) UpdateContactIfMatch(ctx context.Context, c contacts.Contact, ifMatch string) (contacts.Contact, error) {
+	if ifMatch == "" {
+		return contacts.Contact{}, fmt.Errorf("carddav: UpdateContactIfMatch requires a non-empty If-Match ETag")
+	}
+	objectPath, err := decodeContactID(c.ID)
+	if err != nil {
+		return contacts.Contact{}, err
+	}
+	opts := &gocarddav.PutAddressObjectOptions{IfMatch: webdav.ConditionalMatch(ifMatch)}
+	if err := cl.putContact(ctx, objectPath, c, opts); err != nil {
+		if code, ok := webdav.HTTPErrorCode(err); ok && code == http.StatusPreconditionFailed {
+			return contacts.Contact{}, contacts.ErrPreconditionFailed
+		}
+		return contacts.Contact{}, fmt.Errorf("carddav: conditional update contact %q: %w", objectPath, err)
 	}
 	c.AddressBookID = addressBookIDForObject(objectPath)
 	return c, nil
@@ -77,13 +107,15 @@ func (cl *Client) DeleteContact(ctx context.Context, id string) error {
 	return nil
 }
 
-// putContact encodes c as a vCard and PUTs it at objectPath.
-func (cl *Client) putContact(ctx context.Context, objectPath string, c contacts.Contact) error {
+// putContact encodes c as a vCard and PUTs it at objectPath. A nil opts performs
+// an unconditional PUT; a non-nil opts carries an If-Match precondition (see
+// UpdateContactIfMatch).
+func (cl *Client) putContact(ctx context.Context, objectPath string, c contacts.Contact, opts *gocarddav.PutAddressObjectOptions) error {
 	card, err := contactToCard(c)
 	if err != nil {
 		return err
 	}
-	if _, err := cl.c.PutAddressObject(ctx, objectPath, card); err != nil {
+	if _, err := cl.c.PutAddressObject(ctx, objectPath, card, opts); err != nil {
 		return fmt.Errorf("put address object: %w", err)
 	}
 	return nil

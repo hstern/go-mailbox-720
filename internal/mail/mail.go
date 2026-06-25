@@ -59,6 +59,17 @@ type Message struct {
 	Body           Body
 	IsRead         bool
 	HasAttachments bool
+	// ETag is an opaque optimistic-concurrency token for the message, backing
+	// Graph's @odata.etag and the If-Match a conditional read-state change
+	// (ConditionalWriter) sends back. NOTE: the JMAP backend has no per-message
+	// version — this is the ACCOUNT-LEVEL Email state (RFC 8620 §1.6.2), the same
+	// value for every message in a response, so it is coarse: any change to any
+	// email in the account invalidates it, yielding false 412 conflicts on
+	// unrelated concurrent changes. It is best-effort until the per-object JMAP
+	// conditional draft (draft-gondwana-jmap-conditional, MB720-39) lands in the
+	// library and the server. Empty when the backend exposes no state — notably the
+	// IMAP adapter, which has no equivalent and ignores If-Match.
+	ETag string
 }
 
 // MailFolder is a mailbox folder (an IMAP mailbox).
@@ -121,6 +132,36 @@ type Writer interface {
 	// DeleteMessage removes the message with the given opaque id, the backing for
 	// Graph's DELETE.
 	DeleteMessage(ctx context.Context, id string) error
+}
+
+// ErrPreconditionFailed is returned by a ConditionalWriter when an If-Match
+// precondition fails: the mailbox state no longer matches the ETag the caller
+// supplied. The HTTP layer maps it to 412 Precondition Failed.
+var ErrPreconditionFailed = errors.New("mail: precondition failed (state mismatch)")
+
+// ConditionalWriter is the optional capability to change a message's read state
+// only if the mailbox's state still matches a caller-supplied ETag — optimistic
+// concurrency, the backing for Microsoft Graph's PATCH /me/messages/{id} (isRead)
+// carrying an If-Match header. Like the other capabilities it is type-asserted:
+//
+//	if cw, ok := backend.(mail.ConditionalWriter); ok {
+//		err := cw.SetReadIfMatch(ctx, id, true, ifMatch)
+//	}
+//
+// CAVEAT: on the JMAP backend the precondition is ACCOUNT-LEVEL (Email/set
+// ifInState), not per-message (see Message.ETag) — coarse and best-effort, so an
+// unrelated concurrent change can spuriously fail it. The IMAP adapter has no
+// equivalent and does not implement this capability at all; the server then falls
+// back to the unconditional Writer.SetRead, silently ignoring If-Match. A
+// ConditionalWriter is bound to the same authenticated mailbox identity as its
+// Backend.
+type ConditionalWriter interface {
+	// SetReadIfMatch sets (read=true) or clears (read=false) the message's read
+	// state, but only if the mailbox's current ETag equals ifMatch, returning
+	// ErrPreconditionFailed on mismatch. ifMatch is the opaque ETag the caller last
+	// observed (Graph's If-Match); an empty ifMatch is an error — callers with no
+	// precondition use Writer.SetRead instead.
+	SetReadIfMatch(ctx context.Context, id string, read bool, ifMatch string) error
 }
 
 // DeltaReader is the optional incremental-sync capability: report the messages

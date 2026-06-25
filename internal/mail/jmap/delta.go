@@ -77,13 +77,15 @@ func (cl *Client) Delta(ctx context.Context, folderID, token string) (changed []
 	// drops out of changed — Graph re-syncs the folder it moved to separately.
 	changedIDs := append(append([]gojmap.ID{}, chResp.Created...), chResp.Updated...)
 	if len(changedIDs) > 0 {
-		emails, err := cl.fetchEmails(ctx, changedIDs, false)
+		emails, state, err := cl.fetchEmails(ctx, changedIDs, false)
 		if err != nil {
 			return nil, nil, "", err
 		}
 		for _, e := range emails {
 			if e.MailboxIDs[mailboxID] {
-				changed = append(changed, mapEmail(e, false))
+				m := mapEmail(e, false)
+				m.ETag = state
+				changed = append(changed, m)
 			}
 		}
 	}

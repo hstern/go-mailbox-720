@@ -73,7 +73,7 @@ func (cl *Client) Delta(ctx context.Context, calID string, token string) (change
 		if o.Data == nil {
 			continue
 		}
-		if e, ok := eventFromObject(calID, o.Path, o.Data); ok {
+		if e, ok := eventFromObject(calID, o.Path, o.ETag, o.Data); ok {
 			changed = append(changed, e)
 		}
 	}

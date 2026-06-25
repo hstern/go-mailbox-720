@@ -70,3 +70,7 @@ require (
 // Fork adds QRESYNC VANISHED client support (the mail delta uses it for deletion
 // tombstones); drop this once upstream PR emersion/go-imap#757 merges and ships.
 replace github.com/emersion/go-imap/v2 => github.com/hstern/go-imap/v2 v2.0.0-beta.8.0.20260620025710-a2d23bc67297
+
+// Fork adds client-side If-Match on caldav/carddav PUT + webdav.HTTPErrorCode (MB720-39);
+// PR'd upstream, drop the replace once merged.
+replace github.com/emersion/go-webdav => github.com/hstern/go-webdav v0.7.1-0.20260625191323-6c7cfde5c0a0

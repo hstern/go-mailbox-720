@@ -381,14 +381,36 @@ func (h Handler) MeUpdateEvents(ctx context.Context, req *api.MicrosoftGraphEven
 	// bumped SEQUENCE) so attendees see the update — gated by the capability switch.
 	merged = h.reinviteOnUpdate(ctx, b, current, merged)
 
-	updated, err := w.UpdateEvent(ctx, merged)
+	updated, err := h.updateEvent(ctx, b, w, merged, params.IfMatch)
 	if err != nil {
-		return nil, fmt.Errorf("update event: %w", err)
+		return nil, err
 	}
 	return &api.MicrosoftGraphEventStatusCode{
 		StatusCode: http.StatusOK,
 		Response:   toGraphEvent(updated),
 	}, nil
+}
+
+// updateEvent writes merged, honouring an inbound If-Match precondition when one
+// is supplied and the backend supports conditional writes (CalDAV via a
+// conditional PUT). A failed precondition surfaces calendar.ErrPreconditionFailed,
+// which the error handler maps to 412. With no If-Match, or a backend that only
+// implements the unconditional Writer, it writes unconditionally.
+func (h Handler) updateEvent(ctx context.Context, b calendar.Backend, w calendar.Writer, merged calendar.Event, ifMatch api.OptString) (calendar.Event, error) {
+	if etag, conditional := ifMatchOf(ifMatch); conditional {
+		if cw, ok := b.(calendar.ConditionalWriter); ok {
+			updated, err := cw.UpdateEventIfMatch(ctx, merged, etag)
+			if err != nil {
+				return calendar.Event{}, fmt.Errorf("update event (conditional): %w", err)
+			}
+			return updated, nil
+		}
+	}
+	updated, err := w.UpdateEvent(ctx, merged)
+	if err != nil {
+		return calendar.Event{}, fmt.Errorf("update event: %w", err)
+	}
+	return updated, nil
 }
 
 // MeDeleteEvents implements DELETE /me/events/{event-id}. It type-asserts the

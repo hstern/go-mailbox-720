@@ -108,6 +108,13 @@ func Subset(full []byte, cfg Config) (*Result, error) {
 	// not give the handler a way to read them. Add them as inline query params.
 	injectDeltaTokenParams(kept)
 
+	// Surface the If-Match precondition header on update (PATCH) operations.
+	// Microsoft Graph honours If-Match for optimistic concurrency on PATCH, but its
+	// OpenAPI metadata only declares it on DELETE, so ogen would not give the
+	// handler a way to read it. Add it as an inline header param (matching the
+	// shape Graph already uses on DELETE).
+	injectIfMatchParams(kept)
+
 	// Prune the kept path items before computing the closure.
 	for _, pi := range kept {
 		stripXMS(pi)
@@ -160,6 +167,13 @@ func Subset(full []byte, cfg Config) (*Result, error) {
 			}
 		}
 	}
+
+	// Surface the @odata.etag concurrency annotation on entities. Graph emits it on
+	// every read, but the subset (like the full spec) does not declare it as a
+	// property — it is an OData control annotation — so ogen would give the handler
+	// no field to populate. Add it to the entity base schema (the root of every
+	// allOf chain), modelled like the @odata.type tag already declared there.
+	injectODataEtag(out["schemas"])
 
 	// 4. Assemble the minimal spec.
 	components := map[string]any{}
@@ -261,6 +275,76 @@ func injectDeltaTokenParams(kept map[string]any) {
 			})
 		}
 		op["parameters"] = params
+	}
+}
+
+// injectIfMatchParams adds an "If-Match" header parameter to the patch operation
+// of every kept path that has one (and does not already declare it). It is added
+// as an inline optional string param (no $ref), so it pulls in no extra
+// components and rides along in the kept path item. ogen surfaces it on the
+// params struct (as IfMatch OptString) so the update handler can read the ETag a
+// client supplies for optimistic concurrency — the backing for a conditional
+// update (the ConditionalWriter capabilities). It mirrors the shape Graph already
+// declares for If-Match on the DELETE operations.
+func injectIfMatchParams(kept map[string]any) {
+	for _, pi := range kept {
+		item, ok := pi.(map[string]any)
+		if !ok {
+			continue
+		}
+		op, ok := item["patch"].(map[string]any)
+		if !ok {
+			continue
+		}
+		params, _ := op["parameters"].([]any)
+		if hasHeaderParam(params, "If-Match") {
+			continue
+		}
+		params = append(params, map[string]any{
+			"name":     "If-Match",
+			"in":       "header",
+			"required": false,
+			"schema":   map[string]any{"type": "string"},
+		})
+		op["parameters"] = params
+	}
+}
+
+// hasHeaderParam reports whether params already declares a header parameter with
+// the given name (case-insensitive, per RFC 9110 header semantics).
+func hasHeaderParam(params []any, name string) bool {
+	for _, p := range params {
+		pm, ok := p.(map[string]any)
+		if !ok {
+			continue
+		}
+		in, _ := pm["in"].(string)
+		pn, _ := pm["name"].(string)
+		if in == "header" && strings.EqualFold(pn, name) {
+			return true
+		}
+	}
+	return false
+}
+
+// injectODataEtag adds an optional "@odata.etag" string property to the entity
+// base schema, so every entity DTO ogen generates carries the OData
+// optimistic-concurrency annotation Graph emits on reads. The subset drops it
+// because it is an OData control annotation rather than a declared property;
+// without this the handler would have no field to surface the ETag that backs a
+// client's later If-Match. Modelled like the @odata.type tag the spec already
+// declares on entity, and left optional (not added to required).
+func injectODataEtag(schemas map[string]any) {
+	ent, ok := schemas["microsoft.graph.entity"].(map[string]any)
+	if !ok {
+		return
+	}
+	props, ok := ent["properties"].(map[string]any)
+	if !ok {
+		return
+	}
+	if _, exists := props["@odata.etag"]; !exists {
+		props["@odata.etag"] = map[string]any{"type": "string"}
 	}
 }
 

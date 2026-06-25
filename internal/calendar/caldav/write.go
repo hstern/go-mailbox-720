@@ -5,11 +5,14 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"net/http"
 	"path"
 	"strings"
 	"time"
 
 	"github.com/emersion/go-ical"
+	"github.com/emersion/go-webdav"
+	gocaldav "github.com/emersion/go-webdav/caldav"
 	"github.com/hstern/go-jscalendar"
 	jsical "github.com/hstern/go-jscalendar/ical"
 
@@ -43,7 +46,7 @@ func (cl *Client) CreateEvent(ctx context.Context, calID string, e calendar.Even
 	objectPath := path.Join(calPath, name)
 	// path.Join strips a trailing slash; CalDAV object resources are addressed
 	// by their full href, which has no trailing slash, so this is correct.
-	if err := cl.putEvent(ctx, objectPath, e); err != nil {
+	if err := cl.putEvent(ctx, objectPath, e, nil); err != nil {
 		return calendar.Event{}, fmt.Errorf("caldav: create event in %q: %w", calPath, err)
 	}
 	e.ID = eventID(objectPath)
@@ -60,7 +63,7 @@ func (cl *Client) UpdateEvent(ctx context.Context, e calendar.Event) (calendar.E
 	if err != nil {
 		return calendar.Event{}, err
 	}
-	if err := cl.putEvent(ctx, objectPath, e); err != nil {
+	if err := cl.putEvent(ctx, objectPath, e, nil); err != nil {
 		return calendar.Event{}, fmt.Errorf("caldav: update event %q: %w", objectPath, err)
 	}
 	e.CalendarID = calendarIDForObject(objectPath)
@@ -83,13 +86,42 @@ func (cl *Client) DeleteEvent(ctx context.Context, id string) error {
 	return nil
 }
 
-// putEvent encodes e as a single-VEVENT VCALENDAR and PUTs it at objectPath.
-func (cl *Client) putEvent(ctx context.Context, objectPath string, e calendar.Event) error {
+// putEvent encodes e as a single-VEVENT VCALENDAR and PUTs it at objectPath. A
+// nil opts performs an unconditional PUT; a non-nil opts carries an If-Match
+// precondition (see UpdateEventIfMatch).
+func (cl *Client) putEvent(ctx context.Context, objectPath string, e calendar.Event, opts *gocaldav.PutCalendarObjectOptions) error {
 	cal := eventToICal(e)
-	if _, err := cl.c.PutCalendarObject(ctx, objectPath, cal); err != nil {
+	if _, err := cl.c.PutCalendarObject(ctx, objectPath, cal, opts); err != nil {
 		return fmt.Errorf("put calendar object: %w", err)
 	}
 	return nil
+}
+
+var _ calendar.ConditionalWriter = (*Client)(nil)
+
+// UpdateEventIfMatch overwrites the calendar object resource identified by e.ID
+// with a VCALENDAR/VEVENT built from e, but only if the resource's current ETag
+// matches ifMatch. It issues a conditional PUT (If-Match: ifMatch) so the CalDAV
+// server enforces the precondition atomically — there is no read-modify-write
+// window. A failed precondition (the server's 412 Precondition Failed) is
+// translated to calendar.ErrPreconditionFailed; the HTTP layer maps that to 412.
+func (cl *Client) UpdateEventIfMatch(ctx context.Context, e calendar.Event, ifMatch string) (calendar.Event, error) {
+	if ifMatch == "" {
+		return calendar.Event{}, fmt.Errorf("caldav: UpdateEventIfMatch requires a non-empty If-Match ETag")
+	}
+	objectPath, err := decodeEventID(e.ID)
+	if err != nil {
+		return calendar.Event{}, err
+	}
+	opts := &gocaldav.PutCalendarObjectOptions{IfMatch: webdav.ConditionalMatch(ifMatch)}
+	if err := cl.putEvent(ctx, objectPath, e, opts); err != nil {
+		if code, ok := webdav.HTTPErrorCode(err); ok && code == http.StatusPreconditionFailed {
+			return calendar.Event{}, calendar.ErrPreconditionFailed
+		}
+		return calendar.Event{}, fmt.Errorf("caldav: conditional update event %q: %w", objectPath, err)
+	}
+	e.CalendarID = calendarIDForObject(objectPath)
+	return e, nil
 }
 
 var _ calendar.InstanceWriter = (*Client)(nil)
@@ -142,7 +174,7 @@ func (cl *Client) WriteInstanceOverride(ctx context.Context, masterID string, ov
 	}
 	cal.Children = append(children, overrideEvent.Component)
 
-	if _, err := cl.c.PutCalendarObject(ctx, objectPath, cal); err != nil {
+	if _, err := cl.c.PutCalendarObject(ctx, objectPath, cal, nil); err != nil {
 		return calendar.Event{}, fmt.Errorf("caldav: put override into %q: %w", objectPath, err)
 	}
 
