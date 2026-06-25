@@ -255,16 +255,12 @@ func (h *Handler) create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// A lifecycleNotificationUrl is optional, but when present it must be https
-	// and pass the same ownership handshake — it receives reauthorizationRequired
-	// and missed events, so an unverified URL is the same exposure as an
-	// unverified notificationUrl.
+	// A lifecycleNotificationUrl is optional. Its https scheme is checked in
+	// Validate above (alongside notificationUrl); when present it must also pass
+	// the same ownership handshake — it receives reauthorizationRequired and
+	// missed events, so an unverified URL is the same exposure as an unverified
+	// notificationUrl.
 	if sub.LifecycleNotificationURL != "" {
-		if !strings.HasPrefix(sub.LifecycleNotificationURL, "https://") {
-			writeError(w, http.StatusBadRequest, "invalidRequest",
-				"lifecycleNotificationUrl must be an https URL.")
-			return
-		}
 		if err := VerifyNotificationURL(r.Context(), h.client, sub.LifecycleNotificationURL); err != nil {
 			writeError(w, http.StatusBadRequest, "invalidRequest",
 				"The lifecycleNotificationUrl did not pass the validation handshake.")
@@ -382,7 +378,8 @@ func (h *Handler) delete(w http.ResponseWriter, id string) {
 func validationCode(err error) string {
 	switch {
 	case errors.Is(err, ErrNotificationURLRequired),
-		errors.Is(err, ErrNotificationURLNotHTTPS):
+		errors.Is(err, ErrNotificationURLNotHTTPS),
+		errors.Is(err, ErrLifecycleNotificationURLNotHTTPS):
 		return "invalidRequest"
 	case errors.Is(err, ErrInvalidChangeType):
 		return "invalidRequest"

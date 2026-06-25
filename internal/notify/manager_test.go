@@ -155,6 +155,33 @@ func nextLifecycleEvent(t *testing.T, ch <-chan []byte) string {
 	}
 }
 
+func TestManagerExpiredTokenEmitsMissedNotReauth(t *testing.T) {
+	// A Builder that hands back an already-expired token: the watch is dead on
+	// arrival, so the manager must signal missed (gap) and NOT also fire
+	// reauthorizationRequired.
+	data := newBodyRecorder(t)
+	lc := newBodyRecorder(t)
+	store := subscriptions.NewMemoryStore()
+	if _, err := store.Create(subscriptions.Subscription{
+		Owner: "alice", Resource: EventsResource, ChangeType: "created",
+		NotificationURL: data.srv.URL, LifecycleNotificationURL: lc.srv.URL,
+		ExpirationDateTime: mgrFuture,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	m := NewManager(ctx, []ResourceBuilder{fixedBuilder(EventsResource, []string{"e1"}, mgrNow.Add(-time.Minute), nil)},
+		store, lc.srv.Client(), func() time.Time { return mgrNow }, nil)
+
+	m.OnSubscribe("alice", "tok")
+
+	if ev := nextLifecycleEvent(t, lc.got); ev != "missed" {
+		t.Fatalf("first lifecycle event = %q, want missed (no reauth for an already-expired token)", ev)
+	}
+}
+
 func TestManagerNoWatchWithoutSubscriptions(t *testing.T) {
 	rec := newBodyRecorder(t)
 	store := subscriptions.NewMemoryStore() // no subscriptions for bob

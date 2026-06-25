@@ -153,6 +153,19 @@ func (m *Manager) scheduleLifecycle(ctx context.Context, owner string, expiresAt
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
+		// Token already expired at scheduling time (a Builder handed back a stale
+		// expiry): the watch is dead on arrival, so signal the gap with missed but
+		// do NOT also fire reauthorizationRequired — there is nothing left to
+		// reauthorize in time, and firing both back-to-back is noise.
+		if !expiresAt.After(m.now()) {
+			if ctx.Err() == nil {
+				m.emitLifecycle(ctx, owner, subscriptions.LifecycleMissed)
+			}
+			return
+		}
+		// sleepUntil returns immediately when the reauth point is already past
+		// (token within reauthLead of expiry), so the client still gets one
+		// prompt, then missed at expiry — never two events with no gap between.
 		if !m.sleepUntil(ctx, expiresAt.Add(-m.reauthLead)) {
 			return
 		}

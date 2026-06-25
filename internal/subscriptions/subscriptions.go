@@ -105,6 +105,9 @@ var (
 	ErrNotificationURLRequired = errors.New("subscriptions: notificationUrl is required")
 	// ErrNotificationURLNotHTTPS is returned when notificationUrl is not https.
 	ErrNotificationURLNotHTTPS = errors.New("subscriptions: notificationUrl must be https")
+	// ErrLifecycleNotificationURLNotHTTPS is returned when a non-empty
+	// lifecycleNotificationUrl is not https.
+	ErrLifecycleNotificationURLNotHTTPS = errors.New("subscriptions: lifecycleNotificationUrl must be https")
 	// ErrInvalidChangeType is returned when changeType is empty or names an
 	// unknown change kind.
 	ErrInvalidChangeType = errors.New("subscriptions: changeType is invalid")
@@ -138,6 +141,20 @@ func Validate(req Subscription, now time.Time, maxTTL time.Duration, allowedReso
 	}
 	if !strings.EqualFold(u.Scheme, "https") {
 		return fmt.Errorf("%w: scheme %q", ErrNotificationURLNotHTTPS, u.Scheme)
+	}
+
+	// lifecycleNotificationUrl is optional, but when present it carries
+	// reauthorizationRequired/missed events and so must be https just like the
+	// data notificationUrl. Validated here (not just in the handler) so every
+	// caller of Validate gets the same SSRF-relevant scheme gate.
+	if req.LifecycleNotificationURL != "" {
+		lu, err := url.Parse(req.LifecycleNotificationURL)
+		if err != nil {
+			return fmt.Errorf("%w: %v", ErrLifecycleNotificationURLNotHTTPS, err)
+		}
+		if !strings.EqualFold(lu.Scheme, "https") {
+			return fmt.Errorf("%w: scheme %q", ErrLifecycleNotificationURLNotHTTPS, lu.Scheme)
+		}
 	}
 
 	if err := validateChangeType(req.ChangeType); err != nil {
