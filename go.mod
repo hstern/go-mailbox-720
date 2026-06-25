@@ -25,6 +25,7 @@ require (
 
 require (
 	git.sr.ht/~rockorager/go-jmap v0.5.3
+	github.com/coder/websocket v1.8.15
 	github.com/hstern/go-access-tokens v0.3.0
 	github.com/hstern/go-bearer-token v0.2.0
 	github.com/hstern/go-caep v0.1.0
