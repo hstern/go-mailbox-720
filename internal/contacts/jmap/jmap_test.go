@@ -23,6 +23,12 @@ type fakeServer struct {
 	addressBooks []*addressBook
 	cardIDs      []gojmap.ID
 	cards        map[gojmap.ID]json.RawMessage // JMAP ContactCard wire JSON, keyed by id
+
+	// ContactCard/changes canned response (delta tests populate these).
+	changesNewState  string
+	changesCreated   []gojmap.ID
+	changesUpdated   []gojmap.ID
+	changesDestroyed []gojmap.ID
 }
 
 func (f *fakeServer) start(t *testing.T) *Client {
@@ -93,6 +99,11 @@ func (f *fakeServer) dispatch(call rawCall) any {
 			}
 		}
 		return map[string]any{"accountId": testAccount, "state": "s0", "list": list}
+	case "ContactCard/changes":
+		return map[string]any{
+			"accountId": testAccount, "oldState": "old", "newState": f.changesNewState,
+			"created": f.changesCreated, "updated": f.changesUpdated, "destroyed": f.changesDestroyed,
+		}
 	}
 	return &gojmap.MethodError{Type: "unknownMethod"}
 }

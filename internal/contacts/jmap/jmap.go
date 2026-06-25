@@ -21,6 +21,9 @@ type Options struct {
 type Client struct {
 	c         *gojmap.Client
 	accountID gojmap.ID
+	// token is the bearer access token that authenticated the session, retained
+	// so the RFC 8887 WebSocket watch (watch.go) can authenticate its own socket.
+	token string
 }
 
 var _ contacts.Backend = (*Client)(nil)
@@ -46,7 +49,7 @@ func Dial(sessionURL, accessToken string, o *Options) (*Client, error) {
 	if !ok || accountID == "" {
 		return nil, fmt.Errorf("jmap: session advertises no primary contacts account (%s)", contactsURI)
 	}
-	return &Client{c: c, accountID: accountID}, nil
+	return &Client{c: c, accountID: accountID, token: accessToken}, nil
 }
 
 // newClient wraps an already-configured go-jmap client and account id — the seam
