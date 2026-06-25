@@ -62,7 +62,7 @@ func (cl *Client) Delta(ctx context.Context, addressBookID string, token string)
 
 	gargs, err := cl.do(ctx, &cardGet{Account: cl.accountID, IDs: toFetch})
 	if err != nil {
-		return nil, nil, "", err
+		return nil, nil, "", fmt.Errorf("jmap: ContactCard/get: %w", err)
 	}
 	gresp, ok := gargs.(*cardGetResponse)
 	if !ok {

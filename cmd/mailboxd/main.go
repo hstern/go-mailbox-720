@@ -660,9 +660,14 @@ func startCalendarNotifier(ctx context.Context, provider server.CalendarProvider
 		return
 	}
 	cals, err := backend.ListCalendars(ctx)
-	if err != nil || len(cals) == 0 {
+	if err != nil {
 		_ = backend.Close()
-		log.Println("notifications(events): disabled (no calendar to watch):", err)
+		log.Println("notifications(events): disabled (list calendars failed):", err)
+		return
+	}
+	if len(cals) == 0 {
+		_ = backend.Close()
+		log.Println("notifications(events): disabled (no calendars configured)")
 		return
 	}
 	calendarID := cals[0].ID
@@ -720,9 +725,14 @@ func startContactsNotifier(ctx context.Context, provider server.ContactsProvider
 		return
 	}
 	books, err := backend.ListAddressBooks(ctx)
-	if err != nil || len(books) == 0 {
+	if err != nil {
 		_ = backend.Close()
-		log.Println("notifications(contacts): disabled (no address book to watch):", err)
+		log.Println("notifications(contacts): disabled (list address books failed):", err)
+		return
+	}
+	if len(books) == 0 {
+		_ = backend.Close()
+		log.Println("notifications(contacts): disabled (no address books configured)")
 		return
 	}
 	addressBookID := books[0].ID
