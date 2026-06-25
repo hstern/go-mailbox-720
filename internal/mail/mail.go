@@ -59,6 +59,19 @@ type Message struct {
 	Body           Body
 	IsRead         bool
 	HasAttachments bool
+	// Flagged reports the message is flagged for follow-up — the IMAP \Flagged
+	// system flag / JMAP $flagged keyword. It maps onto Graph's flag.flagStatus.
+	Flagged bool
+	// IsDraft reports the message is a draft — the IMAP \Draft system flag / JMAP
+	// $draft keyword. It maps onto Graph's isDraft.
+	IsDraft bool
+	// Categories are the message's user-assigned labels: IMAP keywords / JMAP
+	// keywords that are not system flags (no leading "\" or "$"). They map onto
+	// Graph's categories. The system flags with a dedicated Graph field (\Seen,
+	// \Flagged, \Draft) are surfaced through IsRead/Flagged/IsDraft instead; other
+	// $-namespaced system keywords ($Forwarded, $MDNSent, $Junk, …) have no Graph
+	// surface and are dropped. Sorted, for a deterministic order.
+	Categories []string
 }
 
 // MailFolder is a mailbox folder (an IMAP mailbox).
@@ -67,6 +80,23 @@ type MailFolder struct {
 	DisplayName string
 	Total       int
 	Unread      int
+	// WellKnownName is the Graph well-known folder name for a special-use folder
+	// ("inbox", "sentitems", "drafts", "deleteditems", "junkemail", "archive"),
+	// derived from the IMAP RFC 6154 SPECIAL-USE attribute or the JMAP mailbox
+	// role. Empty for an ordinary folder. The server uses it to resolve Graph's
+	// well-known folder path aliases (GET /me/mailFolders/{inbox|sentitems|…}) to
+	// this folder; it is not part of the Graph folder response body, since the
+	// spec subset's mailFolder type carries no wellKnownName property.
+	WellKnownName string
+}
+
+// IsUserKeyword reports whether an IMAP flag / JMAP keyword is a user-defined
+// label — a Graph category — rather than a system flag. System flags carry a
+// leading "\" (IMAP, e.g. \Seen) or "$" (the IANA IMAP/JMAP keyword namespace,
+// e.g. $Forwarded, $Junk); everything else is a user keyword. Both mail adapters
+// share this rule so Categories means the same thing regardless of backend.
+func IsUserKeyword(s string) bool {
+	return s != "" && s[0] != '\\' && s[0] != '$'
 }
 
 // Page bounds a listing. Top is the maximum number of messages to return (0 =

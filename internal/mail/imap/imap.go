@@ -221,9 +221,16 @@ func (cl *Client) Close() error {
 	return cl.c.Close()
 }
 
-// ListMailFolders enumerates the mailbox's folders with message counts.
+// ListMailFolders enumerates the mailbox's folders with message counts. When the
+// server advertises SPECIAL-USE (RFC 6154) the LIST asks it to return the
+// special-use attributes, so each folder's WellKnownName is populated for the
+// server's Graph well-known folder path aliases.
 func (cl *Client) ListMailFolders(_ context.Context) ([]mail.MailFolder, error) {
-	items, err := cl.c.List("", "*", nil).Collect()
+	var listOpts *goimap.ListOptions
+	if cl.c.Caps().Has(goimap.CapSpecialUse) {
+		listOpts = &goimap.ListOptions{ReturnSpecialUse: true}
+	}
+	items, err := cl.c.List("", "*", listOpts).Collect()
 	if err != nil {
 		return nil, fmt.Errorf("imap: list: %w", err)
 	}
@@ -232,7 +239,11 @@ func (cl *Client) ListMailFolders(_ context.Context) ([]mail.MailFolder, error) 
 		if it.Mailbox == "" || slices.Contains(it.Attrs, goimap.MailboxAttrNonExistent) {
 			continue
 		}
-		f := mail.MailFolder{ID: folderID(it.Mailbox), DisplayName: displayName(it.Mailbox, it.Delim)}
+		f := mail.MailFolder{
+			ID:            folderID(it.Mailbox),
+			DisplayName:   displayName(it.Mailbox, it.Delim),
+			WellKnownName: wellKnownName(it.Mailbox, it.Attrs),
+		}
 		// A STATUS failure on one folder degrades to zero counts rather than
 		// failing the whole listing.
 		if st, err := cl.c.Status(it.Mailbox, &goimap.StatusOptions{NumMessages: true, NumUnseen: true}).Wait(); err == nil && st != nil {
@@ -395,11 +406,15 @@ func (cl *Client) GetMessage(_ context.Context, id string) (mail.Message, error)
 
 // envelopeMessage maps a FETCH buffer's envelope-level data to a mail.Message.
 func envelopeMessage(mailbox string, uidValidity uint32, b *imapclient.FetchMessageBuffer) mail.Message {
+	flagged, draft, categories := mapFlags(b.Flags)
 	m := mail.Message{
 		ID:         messageID(mailbox, uidValidity, uint32(b.UID)),
 		FolderID:   folderID(mailbox),
 		ReceivedAt: b.InternalDate,
 		IsRead:     slices.Contains(b.Flags, goimap.FlagSeen),
+		Flagged:    flagged,
+		IsDraft:    draft,
+		Categories: categories,
 	}
 	if env := b.Envelope; env != nil {
 		m.Subject = env.Subject

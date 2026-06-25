@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"strings"
 
 	ht "github.com/ogen-go/ogen/http"
 
@@ -109,4 +110,32 @@ func (h Handler) MeListMailFolders(ctx context.Context, _ api.MeListMailFoldersP
 		StatusCode: http.StatusOK,
 		Response:   api.MicrosoftGraphMailFolderCollectionResponse{Value: value},
 	}, nil
+}
+
+// MeGetMailFolders implements GET /me/mailFolders/{mailFolder-id}. The id may be
+// an opaque folder id or one of Graph's well-known folder name aliases (inbox,
+// sentitems, drafts, deleteditems, junkemail, archive), which resolves to the
+// backend's special-use folder of that role (case-insensitively, as Graph
+// treats these aliases). It returns 404 when no folder matches.
+func (h Handler) MeGetMailFolders(ctx context.Context, params api.MeGetMailFoldersParams) (api.MeGetMailFoldersRes, error) {
+	b, err := h.backend(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = b.Close() }()
+
+	folders, err := b.ListMailFolders(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("get mail folder: %w", err)
+	}
+	id := params.MailFolderID
+	for _, f := range folders {
+		if f.ID == id || (f.WellKnownName != "" && strings.EqualFold(f.WellKnownName, id)) {
+			return &api.MicrosoftGraphMailFolderStatusCode{
+				StatusCode: http.StatusOK,
+				Response:   toGraphFolder(f),
+			}, nil
+		}
+	}
+	return notFound("mail folder not found"), nil
 }
