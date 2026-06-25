@@ -116,6 +116,75 @@ func TestRunDeliversOnInboxChange(t *testing.T) {
 	}
 }
 
+// RunResource serves a non-mail collection (here /me/events): the baseline
+// items are not notified, only those reported on the change signal, and the
+// notification targets the requested resource.
+func TestRunResourceDeliversForArbitraryResource(t *testing.T) {
+	bodies := make(chan []byte, 4)
+	recv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		bodies <- b
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer recv.Close()
+
+	store := subscriptions.NewMemoryStore()
+	if _, err := store.Create(subscriptions.Subscription{
+		Resource:           EventsResource,
+		ChangeType:         subscriptions.ChangeCreated,
+		NotificationURL:    recv.URL,
+		ClientState:        "secret",
+		ExpirationDateTime: time.Date(2999, 1, 1, 0, 0, 0, 0, time.UTC),
+	}); err != nil {
+		t.Fatalf("seed subscription: %v", err)
+	}
+
+	var calls int
+	sync := func(_ context.Context, _ string) ([]string, string, error) {
+		calls++
+		if calls == 1 {
+			return []string{"old-event"}, "tok1", nil // baseline: not notified
+		}
+		return []string{"event-9"}, "tok2", nil
+	}
+	watch := func(ctx context.Context, onChange func()) error {
+		onChange()
+		<-ctx.Done()
+		return nil
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	reports := make(chan subscriptions.Result, 4)
+	go func() {
+		_ = RunResource(ctx, EventsResource, watch, sync, store, recv.Client(), time.Now, func(r subscriptions.Result) { reports <- r })
+	}()
+
+	select {
+	case r := <-reports:
+		if r.Matched != 1 || r.Delivered != 1 || len(r.Errors) != 0 {
+			t.Errorf("Result = %+v, want Matched=1 Delivered=1 no errors", r)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("no delivery reported")
+	}
+
+	select {
+	case b := <-bodies:
+		if !bytes.Contains(b, []byte("event-9")) {
+			t.Errorf("body = %s, want it to reference event-9", b)
+		}
+		if !bytes.Contains(b, []byte(EventsResource)) {
+			t.Errorf("body = %s, want it to reference %s", b, EventsResource)
+		}
+		if bytes.Contains(b, []byte("old-event")) {
+			t.Errorf("body referenced the pre-existing baseline item: %s", b)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("no notification POST received")
+	}
+}
+
 // A baseline sync failure aborts Run before watching.
 func TestRunBaselineError(t *testing.T) {
 	w := &fakeWatcher{fires: 1}
