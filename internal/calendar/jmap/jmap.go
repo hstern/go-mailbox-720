@@ -47,6 +47,11 @@ type BasicAuthCredentials struct {
 type Client struct {
 	c         *gojmap.Client
 	accountID gojmap.ID
+	// token is the bearer access token that authenticated the session, retained
+	// so the RFC 8887 WebSocket watch (watch.go) can authenticate its own socket.
+	// It is empty when the session uses HTTP Basic auth, in which case watching
+	// is unavailable (the push consumer is bearer-only).
+	token string
 }
 
 // Dial authenticates to the JMAP server, fetches the Session, and resolves the
@@ -82,7 +87,14 @@ func Dial(sessionURL, accessToken string, o *Options) (*Client, error) {
 	if !ok || accountID == "" {
 		return nil, fmt.Errorf("jmap: session advertises no primary calendars account (%s)", calendarsURI)
 	}
-	return &Client{c: c, accountID: accountID}, nil
+	// The bearer token is only retained for the WebSocket watch; under Basic auth
+	// there is no bearer to reuse, so token stays empty and Watch reports that
+	// push is unavailable.
+	var token string
+	if o.BasicAuth == nil {
+		token = accessToken
+	}
+	return &Client{c: c, accountID: accountID, token: token}, nil
 }
 
 // Close releases the backend. The JMAP client is stateless over HTTP, so there is
