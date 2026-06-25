@@ -122,10 +122,11 @@ func (cl *Client) ListMailFolders(ctx context.Context) ([]port.MailFolder, error
 	folders := make([]port.MailFolder, 0, len(resp.List))
 	for _, mbox := range resp.List {
 		folders = append(folders, port.MailFolder{
-			ID:          folderID(mbox.ID),
-			DisplayName: mbox.Name,
-			Total:       int(mbox.TotalEmails),
-			Unread:      int(mbox.UnreadEmails),
+			ID:            folderID(mbox.ID),
+			DisplayName:   mbox.Name,
+			Total:         int(mbox.TotalEmails),
+			Unread:        int(mbox.UnreadEmails),
+			WellKnownName: wellKnownName(mbox.Role),
 		})
 	}
 	return folders, nil
@@ -291,6 +292,7 @@ func (cl *Client) inboxID(ctx context.Context) (gojmap.ID, error) {
 // withBody is set (the GetMessage path). For listings the JMAP server's own
 // preview is used.
 func mapEmail(e *email.Email, withBody bool) port.Message {
+	flagged, draft, categories := mapKeywords(e.Keywords)
 	m := port.Message{
 		ID:             messageID(e.ID),
 		FolderID:       primaryFolderID(e.MailboxIDs),
@@ -301,6 +303,9 @@ func mapEmail(e *email.Email, withBody bool) port.Message {
 		Bcc:            addresses(e.BCC),
 		Preview:        e.Preview,
 		IsRead:         e.Keywords[keywordSeen],
+		Flagged:        flagged,
+		IsDraft:        draft,
+		Categories:     categories,
 		HasAttachments: e.HasAttachment,
 	}
 	if e.SentAt != nil {
