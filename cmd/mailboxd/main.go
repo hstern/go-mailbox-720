@@ -80,6 +80,7 @@ func main() {
 	jmapCalSession := flag.String("cal-jmap-session-url", "", "JMAP session resource URL for the calendar backend (empty: use CalDAV, or return 501 if neither set; access token from MAILBOXD_CALENDAR_JMAP_TOKEN). Takes precedence over the CalDAV flags when set")
 	jmapCalUsername := flag.String("cal-jmap-username", "", "JMAP calendar username for HTTP Basic auth (empty: use bearer token from MAILBOXD_CALENDAR_JMAP_TOKEN; password from MAILBOXD_CALENDAR_JMAP_PASSWORD)")
 	jmapCalAPIURL := flag.String("cal-jmap-api-url", "", "override the apiUrl advertised in the JMAP session document (for servers advertising an unreachable internal apiUrl)")
+	jmapCalAudience := flag.String("cal-jmap-audience", "", "RFC 8693 audience to request for the JMAP calendar backend. When set together with -cal-jmap-session-url and -tokenexchange-endpoint, the per-principal watch manager (MB720-27) exchanges each user's token for a calendar-audience token to drive /me/events push")
 	carddavURL := flag.String("contacts-carddav-url", "", "CardDAV base URL for the contacts backend (empty: contacts operations return 501; password from MAILBOXD_CARDDAV_PASSWORD). Use an https:// URL for TLS")
 	carddavUser := flag.String("contacts-carddav-username", "", "CardDAV username for the contacts backend")
 	carddavAudience := flag.String("contacts-carddav-audience", "", "RFC 8693 audience to request for the CardDAV contacts backend (MB720-44). When set together with -tokenexchange-endpoint, CardDAV authenticates per-identity with an Authorization: Bearer exchanged token instead of -contacts-carddav-username/MAILBOXD_CARDDAV_PASSWORD")
@@ -275,7 +276,17 @@ func main() {
 			mailbox:  *mailboxEmail,
 		}
 	}
-	if err := run(*addr, cfg, revStore, *ssfReceiverPath, provider, calProvider, contactsProvider, schedProvider, *enableScheduling, poolHooks); err != nil {
+	watchCfg := watchManagerConfig{
+		exchanger:          exchanger,
+		mailSessionURL:     *jmapSession,
+		mailAudience:       *mailJMAPAudience,
+		calSessionURL:      *jmapCalSession,
+		calAudience:        *jmapCalAudience,
+		calAPIURL:          *jmapCalAPIURL,
+		contactsSessionURL: *contactsJMAP,
+		contactsAudience:   *contactsJMAPAudience,
+	}
+	if err := run(*addr, cfg, revStore, *ssfReceiverPath, provider, calProvider, contactsProvider, schedProvider, *enableScheduling, poolHooks, watchCfg); err != nil {
 		log.Fatalln("mailboxd:", err)
 	}
 }
@@ -382,7 +393,7 @@ func (p staticSchedulingProvider) MailboxAddress(_ context.Context) (string, err
 	return p.mailbox, nil
 }
 
-func run(addr string, authCfg auth.Config, revSink receiver.Sink, ssfReceiverPath string, provider server.MailProvider, calProvider server.CalendarProvider, contactsProvider server.ContactsProvider, schedProvider server.SchedulingProvider, enableScheduling bool, poolHooks []connPoolHook) error {
+func run(addr string, authCfg auth.Config, revSink receiver.Sink, ssfReceiverPath string, provider server.MailProvider, calProvider server.CalendarProvider, contactsProvider server.ContactsProvider, schedProvider server.SchedulingProvider, enableScheduling bool, poolHooks []connPoolHook, watchCfg watchManagerConfig) error {
 	h, err := server.New(provider, calProvider, contactsProvider, schedProvider)
 	if err != nil {
 		return err
@@ -548,6 +559,12 @@ func run(addr string, authCfg auth.Config, revSink receiver.Sink, ssfReceiverPat
 	// backend (CalDAV/CardDAV, or a per-identity provider) cannot watch.
 	startCalendarNotifier(ctx, calProvider, subStore)
 	startContactsNotifier(ctx, contactsProvider, subStore)
+
+	// Multi-tenant push: when token exchange is configured, a per-principal watch
+	// manager (re)armed by each subscription create/renewal supersedes the static
+	// notifiers above (which are single-tenant no-ops in that mode). It stamps
+	// subscriptions with their owner and scopes delivery per principal.
+	startWatchManager(ctx, watchCfg, subHandler, subStore)
 
 	// Opt-in: turn inbound mail invitations into tentative calendar events.
 	if enableScheduling {
