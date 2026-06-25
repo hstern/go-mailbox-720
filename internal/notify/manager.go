@@ -130,12 +130,28 @@ func (m *Manager) OnSubscribe(owner, token string) {
 
 // Reap stops the watch of every principal that no longer has an unexpired
 // subscription. Call it periodically (the store does not notify on expiry).
+//
+// It snapshots the watched principals under m.mu, then queries the store WITHOUT
+// holding m.mu: subscribedResources takes the store's lock, and OnSubscribe takes
+// the store lock before m.mu (via swap), so holding m.mu across a store call here
+// would invert that order and could deadlock.
 func (m *Manager) Reap() {
 	m.mu.Lock()
-	defer m.mu.Unlock()
-	for owner, pw := range m.watches {
-		if len(m.subscribedResources(owner)) == 0 {
-			delete(m.watches, owner)
+	owners := make([]string, 0, len(m.watches))
+	for owner := range m.watches {
+		owners = append(owners, owner)
+	}
+	m.mu.Unlock()
+
+	for _, owner := range owners {
+		if len(m.subscribedResources(owner)) != 0 {
+			continue
+		}
+		m.mu.Lock()
+		pw := m.watches[owner]
+		delete(m.watches, owner)
+		m.mu.Unlock()
+		if pw != nil {
 			go teardown(pw)
 		}
 	}

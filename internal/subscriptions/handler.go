@@ -155,7 +155,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusNotFound, "notFound", "The requested resource does not exist.")
 			return
 		}
-		h.list(w)
+		h.list(w, r)
 	case http.MethodPatch:
 		if id == "" {
 			writeError(w, http.StatusNotFound, "notFound", "A subscription id is required.")
@@ -210,12 +210,23 @@ func (h *Handler) create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	owner := h.ownerOf(r)
+	// In multi-tenant mode (an owner extractor is installed) refuse to store a
+	// subscription we cannot attribute to a principal: an empty owner would land
+	// it in the single-tenant bucket, where single-tenant delivery could leak
+	// other principals' notifications to it. Fail closed.
+	if h.owner != nil && owner == "" {
+		writeError(w, http.StatusForbidden, "accessDenied",
+			"The authenticated identity cannot be mapped to a subscription owner.")
+		return
+	}
+
 	sub := Subscription{
 		Resource:        wire.Resource,
 		ChangeType:      ChangeType(wire.ChangeType),
 		NotificationURL: wire.NotificationURL,
 		ClientState:     wire.ClientState,
-		Owner:           h.ownerOf(r),
+		Owner:           owner,
 	}
 	if wire.ExpirationDateTime != "" {
 		exp, err := time.Parse(time.RFC3339, wire.ExpirationDateTime)
@@ -313,9 +324,17 @@ func (h *Handler) renew(w http.ResponseWriter, r *http.Request, id string) {
 	writeJSON(w, http.StatusOK, toWire(updated))
 }
 
-// list handles GET {base}: render every stored subscription as {"value":[...]}.
-func (h *Handler) list(w http.ResponseWriter) {
-	subs := h.store.List()
+// list handles GET {base}: render the caller's subscriptions as {"value":[...]}.
+// In multi-tenant mode (an owner extractor is installed) it returns only the
+// requesting principal's subscriptions, so one principal cannot enumerate
+// another's; in single-tenant mode it returns the whole (unowned) store.
+func (h *Handler) list(w http.ResponseWriter, r *http.Request) {
+	var subs []Subscription
+	if h.owner != nil {
+		subs = h.store.ListByOwner(h.ownerOf(r))
+	} else {
+		subs = h.store.List()
+	}
 	out := listEnvelope{Value: make([]subscriptionWire, 0, len(subs))}
 	for _, sub := range subs {
 		out.Value = append(out.Value, toWire(sub))

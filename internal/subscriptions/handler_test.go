@@ -199,6 +199,57 @@ func TestHandlerRenewRejectsExpiryInPast(t *testing.T) {
 	}
 }
 
+func TestHandlerListScopesToOwnerInMultiTenant(t *testing.T) {
+	srv := echoServer(t)
+	store := NewMemoryStore()
+	for _, s := range []Subscription{
+		{Owner: "iss|alice", Resource: "/me/messages", ChangeType: "updated", NotificationURL: srv.URL, ExpirationDateTime: handlerNow.Add(time.Hour)},
+		{Owner: "iss|bob", Resource: "/me/messages", ChangeType: "updated", NotificationURL: srv.URL, ExpirationDateTime: handlerNow.Add(time.Hour)},
+	} {
+		if _, err := store.Create(s); err != nil {
+			t.Fatal(err)
+		}
+	}
+	h := NewHandler(store, srv.Client(), allowedResources, handlerMaxTTL, func() time.Time { return handlerNow })
+	h.SetOwnerFunc(func(*http.Request) string { return "iss|alice" })
+
+	req := httptest.NewRequest(http.MethodGet, "/v1.0/subscriptions", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	var env struct {
+		Value []struct {
+			Resource string `json:"resource"`
+		} `json:"value"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &env); err != nil {
+		t.Fatalf("decode list: %v", err)
+	}
+	if len(env.Value) != 1 {
+		t.Fatalf("list returned %d subscriptions, want 1 (only alice's)", len(env.Value))
+	}
+}
+
+func TestHandlerCreateRejectsUnmappedIdentity(t *testing.T) {
+	srv := echoServer(t)
+	store := NewMemoryStore()
+	h := NewHandler(store, srv.Client(), allowedResources, handlerMaxTTL, func() time.Time { return handlerNow })
+	// Multi-tenant mode is active (owner extractor set) but the identity maps to
+	// no principal key: the request must be refused, not stored unowned.
+	h.SetOwnerFunc(func(*http.Request) string { return "" })
+
+	req := httptest.NewRequest(http.MethodPost, "/v1.0/subscriptions", bytes.NewReader(createBody(srv.URL, nil)))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403 for an unmappable identity (body=%s)", rec.Code, rec.Body)
+	}
+	if len(store.List()) != 0 {
+		t.Fatalf("a subscription was stored despite the unmappable identity")
+	}
+}
+
 func TestHandlerCreateValid(t *testing.T) {
 	srv := echoServer(t)
 	store := NewMemoryStore()
