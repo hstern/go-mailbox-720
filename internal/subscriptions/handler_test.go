@@ -117,6 +117,88 @@ func TestHandlerStampsOwnerAndNotifiesWatch(t *testing.T) {
 	}
 }
 
+func TestHandlerRenewExtendsAndRefreshesWatch(t *testing.T) {
+	srv := echoServer(t)
+	store := NewMemoryStore()
+	h := NewHandler(store, srv.Client(), allowedResources, handlerMaxTTL, func() time.Time { return handlerNow })
+	h.SetOwnerFunc(func(*http.Request) string { return "iss|alice" })
+	var watchCalls int
+	h.SetOnSubscribe(func(_ *http.Request, _ string) { watchCalls++ })
+
+	// Create, then renew.
+	create := httptest.NewRequest(http.MethodPost, "/v1.0/subscriptions", bytes.NewReader(createBody(srv.URL, nil)))
+	crec := httptest.NewRecorder()
+	h.ServeHTTP(crec, create)
+	if crec.Code != http.StatusCreated {
+		t.Fatalf("create status = %d (body=%s)", crec.Code, crec.Body)
+	}
+	id := store.List()[0].ID
+
+	newExp := handlerNow.Add(48 * time.Hour)
+	body, _ := json.Marshal(map[string]any{"expirationDateTime": newExp.Format(time.RFC3339)})
+	patch := httptest.NewRequest(http.MethodPatch, "/v1.0/subscriptions/"+id, bytes.NewReader(body))
+	prec := httptest.NewRecorder()
+	h.ServeHTTP(prec, patch)
+
+	if prec.Code != http.StatusOK {
+		t.Fatalf("renew status = %d, want 200 (body=%s)", prec.Code, prec.Body)
+	}
+	got, _ := store.Get(id)
+	if !got.ExpirationDateTime.Equal(newExp) {
+		t.Errorf("expiry = %v, want %v", got.ExpirationDateTime, newExp)
+	}
+	// One watch refresh per subscription-presenting request: create + renew.
+	if watchCalls != 2 {
+		t.Errorf("watch callback fired %d times, want 2 (create + renew)", watchCalls)
+	}
+}
+
+func TestHandlerRenewRejectsOtherOwner(t *testing.T) {
+	srv := echoServer(t)
+	store := NewMemoryStore()
+	// Seed a subscription owned by alice directly.
+	if _, err := store.Create(Subscription{Owner: "iss|alice", Resource: "/me/messages", ChangeType: "updated", NotificationURL: srv.URL, ExpirationDateTime: handlerNow.Add(time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+	id := store.List()[0].ID
+
+	h := NewHandler(store, srv.Client(), allowedResources, handlerMaxTTL, func() time.Time { return handlerNow })
+	h.SetOwnerFunc(func(*http.Request) string { return "iss|mallory" }) // a different principal
+
+	body, _ := json.Marshal(map[string]any{"expirationDateTime": handlerNow.Add(2 * time.Hour).Format(time.RFC3339)})
+	patch := httptest.NewRequest(http.MethodPatch, "/v1.0/subscriptions/"+id, bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, patch)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("renew by non-owner status = %d, want 404", rec.Code)
+	}
+	// Expiry must be unchanged.
+	got, _ := store.Get(id)
+	if !got.ExpirationDateTime.Equal(handlerNow.Add(time.Hour)) {
+		t.Errorf("expiry changed by non-owner renew: %v", got.ExpirationDateTime)
+	}
+}
+
+func TestHandlerRenewRejectsExpiryInPast(t *testing.T) {
+	srv := echoServer(t)
+	store := NewMemoryStore()
+	if _, err := store.Create(Subscription{Resource: "/me/messages", ChangeType: "updated", NotificationURL: srv.URL, ExpirationDateTime: handlerNow.Add(time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+	id := store.List()[0].ID
+	h := NewHandler(store, srv.Client(), allowedResources, handlerMaxTTL, func() time.Time { return handlerNow })
+
+	body, _ := json.Marshal(map[string]any{"expirationDateTime": handlerNow.Add(-time.Hour).Format(time.RFC3339)})
+	patch := httptest.NewRequest(http.MethodPatch, "/v1.0/subscriptions/"+id, bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, patch)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("renew with past expiry status = %d, want 400", rec.Code)
+	}
+}
+
 func TestHandlerCreateValid(t *testing.T) {
 	srv := echoServer(t)
 	store := NewMemoryStore()

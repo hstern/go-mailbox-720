@@ -156,6 +156,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		h.list(w)
+	case http.MethodPatch:
+		if id == "" {
+			writeError(w, http.StatusNotFound, "notFound", "A subscription id is required.")
+			return
+		}
+		h.renew(w, r, id)
 	case http.MethodDelete:
 		if id == "" {
 			writeError(w, http.StatusNotFound, "notFound", "A subscription id is required.")
@@ -248,6 +254,63 @@ func (h *Handler) create(w http.ResponseWriter, r *http.Request) {
 	h.notifyWatch(r, stored.Owner)
 
 	writeJSON(w, http.StatusCreated, toWire(stored))
+}
+
+// renew handles PATCH {base}/{id}: extend a subscription's expirationDateTime,
+// the Graph renewal operation. It enforces ownership (a principal may only renew
+// its own subscription — a mismatch is reported as not-found so the handler does
+// not reveal another principal's subscription), validates the new expiry against
+// the same bounds as create, updates the store, and re-runs the watch callback
+// so the manager refreshes the principal's watch with this request's fresh token.
+func (h *Handler) renew(w http.ResponseWriter, r *http.Request, id string) {
+	existing, err := h.store.Get(id)
+	if err != nil {
+		writeError(w, http.StatusNotFound, "notFound", "The requested subscription does not exist.")
+		return
+	}
+	if existing.Owner != h.ownerOf(r) {
+		// Not the owner: hide the subscription's existence.
+		writeError(w, http.StatusNotFound, "notFound", "The requested subscription does not exist.")
+		return
+	}
+
+	r.Body = http.MaxBytesReader(w, r.Body, maxSubscriptionBody)
+	var wire subscriptionWire
+	if err := json.NewDecoder(r.Body).Decode(&wire); err != nil {
+		writeError(w, http.StatusBadRequest, "invalidRequest", "The subscription request body is not valid JSON.")
+		return
+	}
+	if wire.ExpirationDateTime == "" {
+		writeError(w, http.StatusBadRequest, "invalidRequest", "expirationDateTime is required to renew a subscription.")
+		return
+	}
+	exp, err := time.Parse(time.RFC3339, wire.ExpirationDateTime)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalidRequest", "expirationDateTime must be an RFC3339 date-time.")
+		return
+	}
+
+	now := h.now()
+	if !exp.After(now) {
+		writeError(w, http.StatusBadRequest, "invalidRequest", ErrExpirationInPast.Error())
+		return
+	}
+	if exp.After(now.Add(h.maxTTL)) {
+		writeError(w, http.StatusBadRequest, "invalidRequest", ErrExpirationTooFar.Error())
+		return
+	}
+
+	updated, err := h.store.Renew(id, exp)
+	if err != nil {
+		writeError(w, http.StatusNotFound, "notFound", "The requested subscription does not exist.")
+		return
+	}
+
+	// Refresh the principal's watch with this request's bearer token — the whole
+	// point of renewal-driven push: each renewal re-arms the watch.
+	h.notifyWatch(r, updated.Owner)
+
+	writeJSON(w, http.StatusOK, toWire(updated))
 }
 
 // list handles GET {base}: render every stored subscription as {"value":[...]}.
