@@ -34,6 +34,16 @@ type Handler struct {
 	allowedResources []string
 	maxTTL           time.Duration
 	now              func() time.Time
+	// owner returns the opaque principal key for a request's authenticated
+	// identity, stamped onto each created subscription to scope delivery. It is
+	// injected (rather than importing internal/auth here) so the package stays
+	// decoupled; a nil owner means single-tenant mode — every subscription gets
+	// the empty owner. Set via SetOwnerFunc.
+	owner func(*http.Request) string
+	// onChange, when set, is told the principal key and bearer token whenever a
+	// subscription is created or renewed, so the per-principal watch manager can
+	// (re)start that principal's watch with a fresh token. Set via OnSubscribe.
+	onChange func(r *http.Request, owner string)
 }
 
 // NewHandler builds the subscriptions [Handler].
@@ -47,8 +57,11 @@ type Handler struct {
 // the clock, injected so expiry validation is deterministic in tests; a nil now
 // defaults to time.Now.
 //
-// The returned http.Handler is safe for concurrent use (the [Store] is).
-func NewHandler(store Store, client *http.Client, allowedResources []string, maxTTL time.Duration, now func() time.Time) http.Handler {
+// The returned *Handler is safe for concurrent use (the [Store] is) and
+// implements http.Handler. Multi-tenant scoping is opt-in via SetOwnerFunc and
+// SetOnSubscribe; without them the handler runs in single-tenant mode (empty
+// owner, no watch-manager callback).
+func NewHandler(store Store, client *http.Client, allowedResources []string, maxTTL time.Duration, now func() time.Time) *Handler {
 	if now == nil {
 		now = time.Now
 	}
@@ -61,27 +74,61 @@ func NewHandler(store Store, client *http.Client, allowedResources []string, max
 	}
 }
 
+// SetOwnerFunc installs the principal-key extractor used to stamp each created
+// subscription's Owner (scoping delivery to that principal). owner is called per
+// create/renew request; returning "" leaves the subscription unowned. Call
+// before serving. A nil owner restores single-tenant mode.
+func (h *Handler) SetOwnerFunc(owner func(*http.Request) string) {
+	h.owner = owner
+}
+
+// SetOnSubscribe installs the callback invoked after a subscription is created
+// or renewed, with the request (carrying the principal's bearer token) and the
+// owner key, so the per-principal watch manager can (re)start that principal's
+// watch with the fresh token. Call before serving.
+func (h *Handler) SetOnSubscribe(fn func(r *http.Request, owner string)) {
+	h.onChange = fn
+}
+
+// ownerOf returns the principal key for r, or "" in single-tenant mode.
+func (h *Handler) ownerOf(r *http.Request) string {
+	if h.owner == nil {
+		return ""
+	}
+	return h.owner(r)
+}
+
+// notifyWatch tells the watch manager (if installed) that owner created or
+// renewed a subscription on r, so it can refresh that principal's watch.
+func (h *Handler) notifyWatch(r *http.Request, owner string) {
+	if h.onChange != nil {
+		h.onChange(r, owner)
+	}
+}
+
 // subscriptionWire is the JSON shape of a Graph subscription on the wire. The
 // @odata.* envelope fields are omitted for now; expirationDateTime is RFC3339.
 type subscriptionWire struct {
-	ID                 string `json:"id,omitempty"`
-	ChangeType         string `json:"changeType"`
-	NotificationURL    string `json:"notificationUrl"`
-	Resource           string `json:"resource"`
-	ExpirationDateTime string `json:"expirationDateTime"`
-	ClientState        string `json:"clientState,omitempty"`
+	ID                       string `json:"id,omitempty"`
+	ChangeType               string `json:"changeType"`
+	NotificationURL          string `json:"notificationUrl"`
+	LifecycleNotificationURL string `json:"lifecycleNotificationUrl,omitempty"`
+	Resource                 string `json:"resource"`
+	ExpirationDateTime       string `json:"expirationDateTime"`
+	ClientState              string `json:"clientState,omitempty"`
 }
 
 // toWire renders a stored Subscription as its wire shape. clientState IS echoed
 // back: Graph returns it on create so the subscriber can confirm what was stored.
 func toWire(sub Subscription) subscriptionWire {
 	return subscriptionWire{
-		ID:                 sub.ID,
-		ChangeType:         string(sub.ChangeType),
-		NotificationURL:    sub.NotificationURL,
-		Resource:           sub.Resource,
-		ExpirationDateTime: sub.ExpirationDateTime.UTC().Format(time.RFC3339),
-		ClientState:        sub.ClientState,
+		ID:                       sub.ID,
+		ChangeType:               string(sub.ChangeType),
+		NotificationURL:          sub.NotificationURL,
+		LifecycleNotificationURL: sub.LifecycleNotificationURL,
+		Resource:                 sub.Resource,
+		ExpirationDateTime:       sub.ExpirationDateTime.UTC().Format(time.RFC3339),
+		ClientState:              sub.ClientState,
 	}
 }
 
@@ -110,7 +157,13 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusNotFound, "notFound", "The requested resource does not exist.")
 			return
 		}
-		h.list(w)
+		h.list(w, r)
+	case http.MethodPatch:
+		if id == "" {
+			writeError(w, http.StatusNotFound, "notFound", "A subscription id is required.")
+			return
+		}
+		h.renew(w, r, id)
 	case http.MethodDelete:
 		if id == "" {
 			writeError(w, http.StatusNotFound, "notFound", "A subscription id is required.")
@@ -159,11 +212,24 @@ func (h *Handler) create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	owner := h.ownerOf(r)
+	// In multi-tenant mode (an owner extractor is installed) refuse to store a
+	// subscription we cannot attribute to a principal: an empty owner would land
+	// it in the single-tenant bucket, where single-tenant delivery could leak
+	// other principals' notifications to it. Fail closed.
+	if h.owner != nil && owner == "" {
+		writeError(w, http.StatusForbidden, "accessDenied",
+			"The authenticated identity cannot be mapped to a subscription owner.")
+		return
+	}
+
 	sub := Subscription{
-		Resource:        wire.Resource,
-		ChangeType:      ChangeType(wire.ChangeType),
-		NotificationURL: wire.NotificationURL,
-		ClientState:     wire.ClientState,
+		Resource:                 wire.Resource,
+		ChangeType:               ChangeType(wire.ChangeType),
+		NotificationURL:          wire.NotificationURL,
+		LifecycleNotificationURL: wire.LifecycleNotificationURL,
+		ClientState:              wire.ClientState,
+		Owner:                    owner,
 	}
 	if wire.ExpirationDateTime != "" {
 		exp, err := time.Parse(time.RFC3339, wire.ExpirationDateTime)
@@ -189,6 +255,19 @@ func (h *Handler) create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// A lifecycleNotificationUrl is optional. Its https scheme is checked in
+	// Validate above (alongside notificationUrl); when present it must also pass
+	// the same ownership handshake — it receives reauthorizationRequired and
+	// missed events, so an unverified URL is the same exposure as an unverified
+	// notificationUrl.
+	if sub.LifecycleNotificationURL != "" {
+		if err := VerifyNotificationURL(r.Context(), h.client, sub.LifecycleNotificationURL); err != nil {
+			writeError(w, http.StatusBadRequest, "invalidRequest",
+				"The lifecycleNotificationUrl did not pass the validation handshake.")
+			return
+		}
+	}
+
 	stored, err := h.store.Create(sub)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "generalException",
@@ -196,12 +275,82 @@ func (h *Handler) create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Hand the manager the principal + this request's bearer token so it can
+	// start (or refresh) the principal's watch. Done after a successful store so
+	// a watch is only started for a subscription that exists.
+	h.notifyWatch(r, stored.Owner)
+
 	writeJSON(w, http.StatusCreated, toWire(stored))
 }
 
-// list handles GET {base}: render every stored subscription as {"value":[...]}.
-func (h *Handler) list(w http.ResponseWriter) {
-	subs := h.store.List()
+// renew handles PATCH {base}/{id}: extend a subscription's expirationDateTime,
+// the Graph renewal operation. It enforces ownership (a principal may only renew
+// its own subscription — a mismatch is reported as not-found so the handler does
+// not reveal another principal's subscription), validates the new expiry against
+// the same bounds as create, updates the store, and re-runs the watch callback
+// so the manager refreshes the principal's watch with this request's fresh token.
+func (h *Handler) renew(w http.ResponseWriter, r *http.Request, id string) {
+	existing, err := h.store.Get(id)
+	if err != nil {
+		writeError(w, http.StatusNotFound, "notFound", "The requested subscription does not exist.")
+		return
+	}
+	if existing.Owner != h.ownerOf(r) {
+		// Not the owner: hide the subscription's existence.
+		writeError(w, http.StatusNotFound, "notFound", "The requested subscription does not exist.")
+		return
+	}
+
+	r.Body = http.MaxBytesReader(w, r.Body, maxSubscriptionBody)
+	var wire subscriptionWire
+	if err := json.NewDecoder(r.Body).Decode(&wire); err != nil {
+		writeError(w, http.StatusBadRequest, "invalidRequest", "The subscription request body is not valid JSON.")
+		return
+	}
+	if wire.ExpirationDateTime == "" {
+		writeError(w, http.StatusBadRequest, "invalidRequest", "expirationDateTime is required to renew a subscription.")
+		return
+	}
+	exp, err := time.Parse(time.RFC3339, wire.ExpirationDateTime)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalidRequest", "expirationDateTime must be an RFC3339 date-time.")
+		return
+	}
+
+	now := h.now()
+	if !exp.After(now) {
+		writeError(w, http.StatusBadRequest, "invalidRequest", ErrExpirationInPast.Error())
+		return
+	}
+	if exp.After(now.Add(h.maxTTL)) {
+		writeError(w, http.StatusBadRequest, "invalidRequest", ErrExpirationTooFar.Error())
+		return
+	}
+
+	updated, err := h.store.Renew(id, exp)
+	if err != nil {
+		writeError(w, http.StatusNotFound, "notFound", "The requested subscription does not exist.")
+		return
+	}
+
+	// Refresh the principal's watch with this request's bearer token — the whole
+	// point of renewal-driven push: each renewal re-arms the watch.
+	h.notifyWatch(r, updated.Owner)
+
+	writeJSON(w, http.StatusOK, toWire(updated))
+}
+
+// list handles GET {base}: render the caller's subscriptions as {"value":[...]}.
+// In multi-tenant mode (an owner extractor is installed) it returns only the
+// requesting principal's subscriptions, so one principal cannot enumerate
+// another's; in single-tenant mode it returns the whole (unowned) store.
+func (h *Handler) list(w http.ResponseWriter, r *http.Request) {
+	var subs []Subscription
+	if h.owner != nil {
+		subs = h.store.ListByOwner(h.ownerOf(r))
+	} else {
+		subs = h.store.List()
+	}
 	out := listEnvelope{Value: make([]subscriptionWire, 0, len(subs))}
 	for _, sub := range subs {
 		out.Value = append(out.Value, toWire(sub))
@@ -229,7 +378,8 @@ func (h *Handler) delete(w http.ResponseWriter, id string) {
 func validationCode(err error) string {
 	switch {
 	case errors.Is(err, ErrNotificationURLRequired),
-		errors.Is(err, ErrNotificationURLNotHTTPS):
+		errors.Is(err, ErrNotificationURLNotHTTPS),
+		errors.Is(err, ErrLifecycleNotificationURLNotHTTPS):
 		return "invalidRequest"
 	case errors.Is(err, ErrInvalidChangeType):
 		return "invalidRequest"

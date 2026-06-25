@@ -28,6 +28,14 @@ type Store interface {
 	Get(id string) (Subscription, error)
 	// List returns all stored subscriptions, ordered by CreatedAt.
 	List() []Subscription
+	// ListByOwner returns the stored subscriptions owned by owner, ordered by
+	// CreatedAt. It is how the per-principal watch manager learns which resources
+	// a principal subscribes to.
+	ListByOwner(owner string) []Subscription
+	// Renew sets the subscription's ExpirationDateTime to exp and returns the
+	// updated subscription, or ErrNotFound. It is the store side of a Graph PATCH
+	// renewal; expiry bounds are validated by the caller.
+	Renew(id string, exp time.Time) (Subscription, error)
 	// Delete removes the subscription with the given id, or returns ErrNotFound.
 	Delete(id string) error
 	// DeleteExpired removes every subscription whose ExpirationDateTime is at or
@@ -117,6 +125,40 @@ func (s *MemoryStore) List() []Subscription {
 		return out[i].CreatedAt.Before(out[j].CreatedAt)
 	})
 	return out
+}
+
+// ListByOwner returns the subscriptions owned by owner, ordered like List.
+func (s *MemoryStore) ListByOwner(owner string) []Subscription {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	out := make([]Subscription, 0)
+	for _, sub := range s.subs {
+		if sub.Owner == owner {
+			out = append(out, sub)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].CreatedAt.Equal(out[j].CreatedAt) {
+			return out[i].ID < out[j].ID
+		}
+		return out[i].CreatedAt.Before(out[j].CreatedAt)
+	})
+	return out
+}
+
+// Renew sets the subscription's expiry to exp and returns it, or ErrNotFound.
+func (s *MemoryStore) Renew(id string, exp time.Time) (Subscription, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	sub, ok := s.subs[id]
+	if !ok {
+		return Subscription{}, fmt.Errorf("%w: %q", ErrNotFound, id)
+	}
+	sub.ExpirationDateTime = exp
+	s.subs[id] = sub
+	return sub, nil
 }
 
 // Delete removes the subscription with id, or returns ErrNotFound.

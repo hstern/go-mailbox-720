@@ -26,6 +26,10 @@ type Change struct {
 	Resource    string
 	ChangeType  ChangeType
 	ResourceIDs []string
+	// Owner scopes the change to one principal's subscriptions: only
+	// subscriptions whose Owner equals it are notified. Empty in single-tenant
+	// mode, where it matches the empty-owner subscriptions.
+	Owner string
 }
 
 // Result reports the outcome of a [Notify] fan-out. Matched counts the
@@ -82,6 +86,9 @@ func Notify(ctx context.Context, client *http.Client, store Store, change Change
 // resource matches, the change kind is one the subscription asked for, and the
 // subscription has not expired.
 func subscriptionMatches(sub Subscription, change Change, now time.Time) bool {
+	if sub.Owner != change.Owner {
+		return false
+	}
 	if !strings.EqualFold(sub.Resource, change.Resource) {
 		return false
 	}

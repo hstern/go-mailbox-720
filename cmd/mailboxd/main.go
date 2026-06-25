@@ -80,6 +80,7 @@ func main() {
 	jmapCalSession := flag.String("cal-jmap-session-url", "", "JMAP session resource URL for the calendar backend (empty: use CalDAV, or return 501 if neither set; access token from MAILBOXD_CALENDAR_JMAP_TOKEN). Takes precedence over the CalDAV flags when set")
 	jmapCalUsername := flag.String("cal-jmap-username", "", "JMAP calendar username for HTTP Basic auth (empty: use bearer token from MAILBOXD_CALENDAR_JMAP_TOKEN; password from MAILBOXD_CALENDAR_JMAP_PASSWORD)")
 	jmapCalAPIURL := flag.String("cal-jmap-api-url", "", "override the apiUrl advertised in the JMAP session document (for servers advertising an unreachable internal apiUrl)")
+	jmapCalAudience := flag.String("cal-jmap-audience", "", "RFC 8693 audience to request for the JMAP calendar backend. When set together with -cal-jmap-session-url and -tokenexchange-endpoint, the per-principal watch manager (MB720-27) exchanges each user's token for a calendar-audience token to drive /me/events push")
 	carddavURL := flag.String("contacts-carddav-url", "", "CardDAV base URL for the contacts backend (empty: contacts operations return 501; password from MAILBOXD_CARDDAV_PASSWORD). Use an https:// URL for TLS")
 	carddavUser := flag.String("contacts-carddav-username", "", "CardDAV username for the contacts backend")
 	carddavAudience := flag.String("contacts-carddav-audience", "", "RFC 8693 audience to request for the CardDAV contacts backend (MB720-44). When set together with -tokenexchange-endpoint, CardDAV authenticates per-identity with an Authorization: Bearer exchanged token instead of -contacts-carddav-username/MAILBOXD_CARDDAV_PASSWORD")
@@ -275,7 +276,17 @@ func main() {
 			mailbox:  *mailboxEmail,
 		}
 	}
-	if err := run(*addr, cfg, revStore, *ssfReceiverPath, provider, calProvider, contactsProvider, schedProvider, *enableScheduling, poolHooks); err != nil {
+	watchCfg := watchManagerConfig{
+		exchanger:          exchanger,
+		mailSessionURL:     *jmapSession,
+		mailAudience:       *mailJMAPAudience,
+		calSessionURL:      *jmapCalSession,
+		calAudience:        *jmapCalAudience,
+		calAPIURL:          *jmapCalAPIURL,
+		contactsSessionURL: *contactsJMAP,
+		contactsAudience:   *contactsJMAPAudience,
+	}
+	if err := run(*addr, cfg, revStore, *ssfReceiverPath, provider, calProvider, contactsProvider, schedProvider, *enableScheduling, poolHooks, watchCfg); err != nil {
 		log.Fatalln("mailboxd:", err)
 	}
 }
@@ -382,7 +393,7 @@ func (p staticSchedulingProvider) MailboxAddress(_ context.Context) (string, err
 	return p.mailbox, nil
 }
 
-func run(addr string, authCfg auth.Config, revSink receiver.Sink, ssfReceiverPath string, provider server.MailProvider, calProvider server.CalendarProvider, contactsProvider server.ContactsProvider, schedProvider server.SchedulingProvider, enableScheduling bool, poolHooks []connPoolHook) error {
+func run(addr string, authCfg auth.Config, revSink receiver.Sink, ssfReceiverPath string, provider server.MailProvider, calProvider server.CalendarProvider, contactsProvider server.ContactsProvider, schedProvider server.SchedulingProvider, enableScheduling bool, poolHooks []connPoolHook, watchCfg watchManagerConfig) error {
 	h, err := server.New(provider, calProvider, contactsProvider, schedProvider)
 	if err != nil {
 		return err
@@ -542,6 +553,19 @@ func run(addr string, authCfg auth.Config, revSink receiver.Sink, ssfReceiverPat
 	// supports IDLE + delta. It runs until ctx is cancelled (shutdown).
 	startNotifier(ctx, provider, subStore)
 
+	// Drive /me/events and /me/contacts delivery off the backend's JMAP
+	// WebSocket push (RFC 8887) when the calendar/contacts backend supports
+	// Watcher + delta. Like the mail notifier these are logged no-ops when the
+	// backend (CalDAV/CardDAV, or a per-identity provider) cannot watch.
+	startCalendarNotifier(ctx, calProvider, subStore)
+	startContactsNotifier(ctx, contactsProvider, subStore)
+
+	// Multi-tenant push: when token exchange is configured, a per-principal watch
+	// manager (re)armed by each subscription create/renewal supersedes the static
+	// notifiers above (which are single-tenant no-ops in that mode). It stamps
+	// subscriptions with their owner and scopes delivery per principal.
+	startWatchManager(ctx, watchCfg, subHandler, subStore)
+
 	// Opt-in: turn inbound mail invitations into tentative calendar events.
 	if enableScheduling {
 		startScheduler(ctx, provider, calProvider)
@@ -620,6 +644,147 @@ func startNotifier(ctx context.Context, provider server.MailProvider, store subs
 			log.Println("notifications: delivery loop stopped:", err)
 		}
 	}()
+}
+
+// startCalendarNotifier launches the /me/events change-notification delivery
+// loop in a goroutine when the calendar backend supports watching (JMAP
+// WebSocket push, calendar.Watcher) and delta sync (calendar.DeltaReader). It
+// watches the principal's primary calendar (the first the backend reports, the
+// same collection /me/events reads) and POSTs notifications to subscriptions on
+// /me/events. Unlike the IMAP IDLE notifier the JMAP watch uses its own socket,
+// so one backend serves both the watch and the delta sync. A missing provider or
+// capability is a logged no-op (subscriptions are still accepted, just not
+// delivered).
+func startCalendarNotifier(ctx context.Context, provider server.CalendarProvider, store subscriptions.Store) {
+	if provider == nil {
+		return
+	}
+	backend, err := provider.Calendar(ctx)
+	if err != nil {
+		log.Println("notifications(events): disabled (backend connection failed):", err)
+		return
+	}
+	watcher, ok := backend.(calendar.Watcher)
+	if !ok {
+		_ = backend.Close()
+		log.Println("notifications(events): disabled (calendar backend does not support push)")
+		return
+	}
+	syncer, ok := backend.(calendar.DeltaReader)
+	if !ok {
+		_ = backend.Close()
+		log.Println("notifications(events): disabled (calendar backend does not support delta)")
+		return
+	}
+	cals, err := backend.ListCalendars(ctx)
+	if err != nil {
+		_ = backend.Close()
+		log.Println("notifications(events): disabled (list calendars failed):", err)
+		return
+	}
+	if len(cals) == 0 {
+		_ = backend.Close()
+		log.Println("notifications(events): disabled (no calendars configured)")
+		return
+	}
+	calendarID := cals[0].ID
+
+	watch := func(ctx context.Context, onChange func()) error {
+		return watcher.Watch(ctx, calendarID, onChange)
+	}
+	sync := func(ctx context.Context, token string) ([]string, string, error) {
+		changed, _, next, err := syncer.Delta(ctx, calendarID, token)
+		if err != nil {
+			return nil, "", err
+		}
+		ids := make([]string, len(changed))
+		for i, e := range changed {
+			ids[i] = e.ID
+		}
+		return ids, next, nil
+	}
+	go func() {
+		defer func() { _ = backend.Close() }()
+		log.Println("notifications(events): delivery loop watching the primary calendar")
+		if err := notify.RunResource(ctx, "", notify.EventsResource, watch, sync, store, subscriptions.GuardedClient(), time.Now, resourceReport("events")); err != nil {
+			log.Println("notifications(events): delivery loop stopped:", err)
+		}
+	}()
+}
+
+// startContactsNotifier launches the /me/contacts change-notification delivery
+// loop in a goroutine when the contacts backend supports watching (JMAP
+// WebSocket push, contacts.Watcher) and delta sync (contacts.DeltaReader). It
+// watches the principal's default address book (the first the backend reports,
+// the same collection /me/contacts reads) and POSTs notifications to
+// subscriptions on /me/contacts. As with the calendar notifier the JMAP watch
+// uses its own socket, so one backend serves both watch and sync; a missing
+// provider or capability is a logged no-op.
+func startContactsNotifier(ctx context.Context, provider server.ContactsProvider, store subscriptions.Store) {
+	if provider == nil {
+		return
+	}
+	backend, err := provider.Contacts(ctx)
+	if err != nil {
+		log.Println("notifications(contacts): disabled (backend connection failed):", err)
+		return
+	}
+	watcher, ok := backend.(contacts.Watcher)
+	if !ok {
+		_ = backend.Close()
+		log.Println("notifications(contacts): disabled (contacts backend does not support push)")
+		return
+	}
+	syncer, ok := backend.(contacts.DeltaReader)
+	if !ok {
+		_ = backend.Close()
+		log.Println("notifications(contacts): disabled (contacts backend does not support delta)")
+		return
+	}
+	books, err := backend.ListAddressBooks(ctx)
+	if err != nil {
+		_ = backend.Close()
+		log.Println("notifications(contacts): disabled (list address books failed):", err)
+		return
+	}
+	if len(books) == 0 {
+		_ = backend.Close()
+		log.Println("notifications(contacts): disabled (no address books configured)")
+		return
+	}
+	addressBookID := books[0].ID
+
+	watch := func(ctx context.Context, onChange func()) error {
+		return watcher.Watch(ctx, addressBookID, onChange)
+	}
+	sync := func(ctx context.Context, token string) ([]string, string, error) {
+		changed, _, next, err := syncer.Delta(ctx, addressBookID, token)
+		if err != nil {
+			return nil, "", err
+		}
+		ids := make([]string, len(changed))
+		for i, c := range changed {
+			ids[i] = c.ID
+		}
+		return ids, next, nil
+	}
+	go func() {
+		defer func() { _ = backend.Close() }()
+		log.Println("notifications(contacts): delivery loop watching the default address book")
+		if err := notify.RunResource(ctx, "", notify.ContactsResource, watch, sync, store, subscriptions.GuardedClient(), time.Now, resourceReport("contacts")); err != nil {
+			log.Println("notifications(contacts): delivery loop stopped:", err)
+		}
+	}()
+}
+
+// resourceReport returns a delivery-result logger tagged with the resource kind,
+// matching the mail notifier's reporting.
+func resourceReport(kind string) func(subscriptions.Result) {
+	return func(r subscriptions.Result) {
+		if r.Delivered > 0 || len(r.Errors) > 0 {
+			log.Printf("notifications(%s): delivered %d/%d (errors=%d)", kind, r.Delivered, r.Matched, len(r.Errors))
+		}
+	}
 }
 
 // startScheduler launches the iTIP scheduling trigger in a goroutine when both a

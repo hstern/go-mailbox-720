@@ -86,6 +86,202 @@ func decodeError(t *testing.T, body []byte) (code, message string) {
 	return env.Error.Code, env.Error.Message
 }
 
+func TestHandlerStampsOwnerAndNotifiesWatch(t *testing.T) {
+	srv := echoServer(t)
+	store := NewMemoryStore()
+	h := NewHandler(store, srv.Client(), allowedResources, handlerMaxTTL, func() time.Time { return handlerNow })
+	h.SetOwnerFunc(func(*http.Request) string { return "iss|alice" })
+
+	var gotOwner string
+	var calls int
+	h.SetOnSubscribe(func(_ *http.Request, owner string) { calls++; gotOwner = owner })
+
+	req := httptest.NewRequest(http.MethodPost, "/v1.0/subscriptions", bytes.NewReader(createBody(srv.URL, nil)))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (body=%s)", rec.Code, rec.Body)
+	}
+	subs := store.List()
+	if len(subs) != 1 || subs[0].Owner != "iss|alice" {
+		t.Fatalf("stored owner = %q, want iss|alice (subs=%+v)", func() string {
+			if len(subs) > 0 {
+				return subs[0].Owner
+			}
+			return ""
+		}(), subs)
+	}
+	if calls != 1 || gotOwner != "iss|alice" {
+		t.Fatalf("onSubscribe calls=%d owner=%q, want 1 and iss|alice", calls, gotOwner)
+	}
+}
+
+func TestHandlerRenewExtendsAndRefreshesWatch(t *testing.T) {
+	srv := echoServer(t)
+	store := NewMemoryStore()
+	h := NewHandler(store, srv.Client(), allowedResources, handlerMaxTTL, func() time.Time { return handlerNow })
+	h.SetOwnerFunc(func(*http.Request) string { return "iss|alice" })
+	var watchCalls int
+	h.SetOnSubscribe(func(_ *http.Request, _ string) { watchCalls++ })
+
+	// Create, then renew.
+	create := httptest.NewRequest(http.MethodPost, "/v1.0/subscriptions", bytes.NewReader(createBody(srv.URL, nil)))
+	crec := httptest.NewRecorder()
+	h.ServeHTTP(crec, create)
+	if crec.Code != http.StatusCreated {
+		t.Fatalf("create status = %d (body=%s)", crec.Code, crec.Body)
+	}
+	id := store.List()[0].ID
+
+	newExp := handlerNow.Add(48 * time.Hour)
+	body, _ := json.Marshal(map[string]any{"expirationDateTime": newExp.Format(time.RFC3339)})
+	patch := httptest.NewRequest(http.MethodPatch, "/v1.0/subscriptions/"+id, bytes.NewReader(body))
+	prec := httptest.NewRecorder()
+	h.ServeHTTP(prec, patch)
+
+	if prec.Code != http.StatusOK {
+		t.Fatalf("renew status = %d, want 200 (body=%s)", prec.Code, prec.Body)
+	}
+	got, _ := store.Get(id)
+	if !got.ExpirationDateTime.Equal(newExp) {
+		t.Errorf("expiry = %v, want %v", got.ExpirationDateTime, newExp)
+	}
+	// One watch refresh per subscription-presenting request: create + renew.
+	if watchCalls != 2 {
+		t.Errorf("watch callback fired %d times, want 2 (create + renew)", watchCalls)
+	}
+}
+
+func TestHandlerRenewRejectsOtherOwner(t *testing.T) {
+	srv := echoServer(t)
+	store := NewMemoryStore()
+	// Seed a subscription owned by alice directly.
+	if _, err := store.Create(Subscription{Owner: "iss|alice", Resource: "/me/messages", ChangeType: "updated", NotificationURL: srv.URL, ExpirationDateTime: handlerNow.Add(time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+	id := store.List()[0].ID
+
+	h := NewHandler(store, srv.Client(), allowedResources, handlerMaxTTL, func() time.Time { return handlerNow })
+	h.SetOwnerFunc(func(*http.Request) string { return "iss|mallory" }) // a different principal
+
+	body, _ := json.Marshal(map[string]any{"expirationDateTime": handlerNow.Add(2 * time.Hour).Format(time.RFC3339)})
+	patch := httptest.NewRequest(http.MethodPatch, "/v1.0/subscriptions/"+id, bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, patch)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("renew by non-owner status = %d, want 404", rec.Code)
+	}
+	// Expiry must be unchanged.
+	got, _ := store.Get(id)
+	if !got.ExpirationDateTime.Equal(handlerNow.Add(time.Hour)) {
+		t.Errorf("expiry changed by non-owner renew: %v", got.ExpirationDateTime)
+	}
+}
+
+func TestHandlerRenewRejectsExpiryInPast(t *testing.T) {
+	srv := echoServer(t)
+	store := NewMemoryStore()
+	if _, err := store.Create(Subscription{Resource: "/me/messages", ChangeType: "updated", NotificationURL: srv.URL, ExpirationDateTime: handlerNow.Add(time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+	id := store.List()[0].ID
+	h := NewHandler(store, srv.Client(), allowedResources, handlerMaxTTL, func() time.Time { return handlerNow })
+
+	body, _ := json.Marshal(map[string]any{"expirationDateTime": handlerNow.Add(-time.Hour).Format(time.RFC3339)})
+	patch := httptest.NewRequest(http.MethodPatch, "/v1.0/subscriptions/"+id, bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, patch)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("renew with past expiry status = %d, want 400", rec.Code)
+	}
+}
+
+func TestHandlerListScopesToOwnerInMultiTenant(t *testing.T) {
+	srv := echoServer(t)
+	store := NewMemoryStore()
+	for _, s := range []Subscription{
+		{Owner: "iss|alice", Resource: "/me/messages", ChangeType: "updated", NotificationURL: srv.URL, ExpirationDateTime: handlerNow.Add(time.Hour)},
+		{Owner: "iss|bob", Resource: "/me/messages", ChangeType: "updated", NotificationURL: srv.URL, ExpirationDateTime: handlerNow.Add(time.Hour)},
+	} {
+		if _, err := store.Create(s); err != nil {
+			t.Fatal(err)
+		}
+	}
+	h := NewHandler(store, srv.Client(), allowedResources, handlerMaxTTL, func() time.Time { return handlerNow })
+	h.SetOwnerFunc(func(*http.Request) string { return "iss|alice" })
+
+	req := httptest.NewRequest(http.MethodGet, "/v1.0/subscriptions", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	var env struct {
+		Value []struct {
+			Resource string `json:"resource"`
+		} `json:"value"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &env); err != nil {
+		t.Fatalf("decode list: %v", err)
+	}
+	if len(env.Value) != 1 {
+		t.Fatalf("list returned %d subscriptions, want 1 (only alice's)", len(env.Value))
+	}
+}
+
+func TestHandlerCreateRejectsUnmappedIdentity(t *testing.T) {
+	srv := echoServer(t)
+	store := NewMemoryStore()
+	h := NewHandler(store, srv.Client(), allowedResources, handlerMaxTTL, func() time.Time { return handlerNow })
+	// Multi-tenant mode is active (owner extractor set) but the identity maps to
+	// no principal key: the request must be refused, not stored unowned.
+	h.SetOwnerFunc(func(*http.Request) string { return "" })
+
+	req := httptest.NewRequest(http.MethodPost, "/v1.0/subscriptions", bytes.NewReader(createBody(srv.URL, nil)))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403 for an unmappable identity (body=%s)", rec.Code, rec.Body)
+	}
+	if len(store.List()) != 0 {
+		t.Fatalf("a subscription was stored despite the unmappable identity")
+	}
+}
+
+func TestHandlerCreateAcceptsLifecycleURL(t *testing.T) {
+	srv := echoServer(t) // echoes the validation token for any URL POSTed to it
+	store := NewMemoryStore()
+	h := newTestHandler(t, store, srv.Client())
+
+	body := createBody(srv.URL, map[string]any{"lifecycleNotificationUrl": srv.URL})
+	req := httptest.NewRequest(http.MethodPost, "/v1.0/subscriptions", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (body=%s)", rec.Code, rec.Body)
+	}
+	if got := store.List()[0].LifecycleNotificationURL; got != srv.URL {
+		t.Fatalf("stored lifecycleNotificationUrl = %q, want %q", got, srv.URL)
+	}
+}
+
+func TestHandlerCreateRejectsNonHTTPSLifecycleURL(t *testing.T) {
+	srv := echoServer(t)
+	h := newTestHandler(t, NewMemoryStore(), srv.Client())
+
+	body := createBody(srv.URL, map[string]any{"lifecycleNotificationUrl": "http://insecure.example/lifecycle"})
+	req := httptest.NewRequest(http.MethodPost, "/v1.0/subscriptions", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 for a non-https lifecycleNotificationUrl", rec.Code)
+	}
+}
+
 func TestHandlerCreateValid(t *testing.T) {
 	srv := echoServer(t)
 	store := NewMemoryStore()
