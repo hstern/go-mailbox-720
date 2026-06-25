@@ -47,6 +47,21 @@ type idp interface {
 	caps() idpCaps
 }
 
+// impersonator is the optional capability the impersonation e2e needs from an IdP:
+// it provisions RFC 8693 end-user impersonation, mints a named user's (subject)
+// token, and exposes the token endpoint + the OAuth client mailboxd authenticates
+// the exchange with.
+type impersonator interface {
+	provisionImpersonation(t *testing.T)
+	mintUserToken(t *testing.T, user string) string
+	tokenEndpoint() string
+	exchangeClientID() string
+	exchangeSecret() string
+}
+
+// Zitadel is the impersonation-capable IdP.
+var _ impersonator = (*zitadelIDP)(nil)
+
 // idps is the IdP matrix. Baseline vertical-slice tests run against every entry.
 func idps() []idp {
 	return []idp{

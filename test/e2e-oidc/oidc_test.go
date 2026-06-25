@@ -30,9 +30,7 @@ import (
 )
 
 func TestOIDCEndToEnd(t *testing.T) {
-	if _, err := exec.LookPath("docker"); err != nil {
-		t.Skip("docker not available")
-	}
+	requireDocker(t)
 	for _, p := range idps() {
 		t.Run(p.name(), func(t *testing.T) {
 			p.start(t)
@@ -318,6 +316,14 @@ func waitFor(t *testing.T, what string, timeout time.Duration, ready func() bool
 		time.Sleep(250 * time.Millisecond)
 	}
 	t.Fatalf("%s did not become ready within %s", what, timeout)
+}
+
+// requireDocker skips the test when the docker CLI is unavailable.
+func requireDocker(t *testing.T) {
+	t.Helper()
+	if _, err := exec.LookPath("docker"); err != nil {
+		t.Skip("docker not available")
+	}
 }
 
 // run executes a command, failing the test (with output) on error.
