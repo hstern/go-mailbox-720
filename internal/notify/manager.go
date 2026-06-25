@@ -41,10 +41,18 @@ type Manager struct {
 	client   *http.Client
 	now      func() time.Time
 	logf     func(format string, args ...any)
+	// reauthLead is how long before a watch's token expires the manager emits a
+	// reauthorizationRequired lifecycle notification, prompting the client to
+	// renew (re-present a fresh token) before push lapses.
+	reauthLead time.Duration
 
 	mu      sync.Mutex
 	watches map[string]*principalWatch
 }
+
+// defaultReauthLead is the lead time for reauthorizationRequired: far enough
+// ahead of token expiry for a client to refresh its token and PATCH-renew.
+const defaultReauthLead = 5 * time.Minute
 
 // principalWatch is one principal's running watch: a cancel for its context and a
 // WaitGroup over its per-resource loops.
@@ -65,13 +73,14 @@ func NewManager(base context.Context, builders []ResourceBuilder, store subscrip
 		logf = func(string, ...any) {}
 	}
 	return &Manager{
-		base:     base,
-		builders: builders,
-		store:    store,
-		client:   client,
-		now:      now,
-		logf:     logf,
-		watches:  make(map[string]*principalWatch),
+		base:       base,
+		builders:   builders,
+		store:      store,
+		client:     client,
+		now:        now,
+		logf:       logf,
+		reauthLead: defaultReauthLead,
+		watches:    make(map[string]*principalWatch),
 	}
 }
 
@@ -93,6 +102,7 @@ func (m *Manager) OnSubscribe(owner, token string) {
 	pctx, cancel := context.WithCancel(m.base)
 	wg := &sync.WaitGroup{}
 	started := 0
+	var earliest time.Time // soonest token expiry across this principal's resources
 	for _, rb := range m.builders {
 		if !resources[rb.Resource] {
 			continue
@@ -109,6 +119,7 @@ func (m *Manager) OnSubscribe(owner, token string) {
 		if !expiresAt.IsZero() {
 			// Bound the loop by the token's expiry; a renewal re-arms it.
 			loopCtx, loopCancel = context.WithDeadline(pctx, expiresAt)
+			earliest = earlier(earliest, expiresAt)
 		}
 		started++
 		wg.Add(1)
@@ -125,7 +136,72 @@ func (m *Manager) OnSubscribe(owner, token string) {
 		cancel()
 		return
 	}
+	// One lifecycle clock per principal, keyed to the soonest token expiry: prompt
+	// the client to renew before it lapses, then signal a gap if it does not. A
+	// renewal supersedes this watch (swap cancels pctx), so the timers fire only
+	// when the principal did NOT renew in time.
+	if !earliest.IsZero() {
+		m.scheduleLifecycle(pctx, owner, earliest, wg)
+	}
 	m.swap(owner, &principalWatch{cancel: cancel, wg: wg})
+}
+
+// scheduleLifecycle emits, on pctx, a reauthorizationRequired notification
+// reauthLead before expiresAt and a missed notification at expiresAt — unless
+// the watch is torn down first (a renewal, reap, or shutdown cancels pctx).
+func (m *Manager) scheduleLifecycle(ctx context.Context, owner string, expiresAt time.Time, wg *sync.WaitGroup) {
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if !m.sleepUntil(ctx, expiresAt.Add(-m.reauthLead)) {
+			return
+		}
+		m.emitLifecycle(ctx, owner, subscriptions.LifecycleReauthorizationRequired)
+		if !m.sleepUntil(ctx, expiresAt) {
+			return
+		}
+		m.emitLifecycle(ctx, owner, subscriptions.LifecycleMissed)
+	}()
+}
+
+// sleepUntil blocks until t (measured against m.now) or until ctx is cancelled.
+// It returns true if t was reached, false if ctx ended first.
+func (m *Manager) sleepUntil(ctx context.Context, t time.Time) bool {
+	d := t.Sub(m.now())
+	if d <= 0 {
+		return ctx.Err() == nil
+	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
+// emitLifecycle POSTs a lifecycle event to the principal's subscriptions and logs
+// the outcome.
+func (m *Manager) emitLifecycle(ctx context.Context, owner string, event subscriptions.LifecycleEvent) {
+	res := subscriptions.NotifyLifecycle(ctx, m.client, m.store, owner, event, m.now())
+	if res.Matched > 0 {
+		m.logf("notify(manager): %s emitted to %d/%d subscription(s) (errors=%d)", event, res.Delivered, res.Matched, len(res.Errors))
+	}
+}
+
+// earlier returns the soonest of a and b, treating the zero time as "unset".
+func earlier(a, b time.Time) time.Time {
+	switch {
+	case a.IsZero():
+		return b
+	case b.IsZero():
+		return a
+	case b.Before(a):
+		return b
+	default:
+		return a
+	}
 }
 
 // Reap stops the watch of every principal that no longer has an unexpired

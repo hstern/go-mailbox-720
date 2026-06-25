@@ -3,6 +3,7 @@ package notify
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -100,6 +101,60 @@ func TestManagerDeliversForPrincipalOnChange(t *testing.T) {
 	}
 }
 
+func TestManagerEmitsReauthThenMissed(t *testing.T) {
+	data := newBodyRecorder(t)
+	lc := newBodyRecorder(t)
+	store := subscriptions.NewMemoryStore()
+	if _, err := store.Create(subscriptions.Subscription{
+		Owner: "alice", Resource: EventsResource, ChangeType: "created",
+		NotificationURL: data.srv.URL, LifecycleNotificationURL: lc.srv.URL,
+		ExpirationDateTime: mgrFuture,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	tokenExpiry := mgrNow.Add(120 * time.Millisecond)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	m := NewManager(ctx, []ResourceBuilder{fixedBuilder(EventsResource, []string{"e1"}, tokenExpiry, nil)},
+		store, lc.srv.Client(), func() time.Time { return mgrNow }, nil)
+	m.reauthLead = 60 * time.Millisecond // reauth at +60ms, missed at the expiry clock
+
+	m.OnSubscribe("alice", "tok")
+
+	if first := nextLifecycleEvent(t, lc.got); first != "reauthorizationRequired" {
+		t.Fatalf("first lifecycle event = %q, want reauthorizationRequired", first)
+	}
+	if second := nextLifecycleEvent(t, lc.got); second != "missed" {
+		t.Fatalf("second lifecycle event = %q, want missed", second)
+	}
+}
+
+// nextLifecycleEvent returns the lifecycleEvent of the next well-formed lifecycle
+// notification on ch, skipping any stray/empty body (httptest connection reuse
+// under concurrent tests can deliver one). It fails on timeout.
+func nextLifecycleEvent(t *testing.T, ch <-chan []byte) string {
+	t.Helper()
+	deadline := time.After(2 * time.Second)
+	for {
+		select {
+		case body := <-ch:
+			var env struct {
+				Value []struct {
+					LifecycleEvent string `json:"lifecycleEvent"`
+				} `json:"value"`
+			}
+			if err := json.Unmarshal(body, &env); err != nil || len(env.Value) != 1 {
+				continue // stray/empty POST, not a lifecycle notification
+			}
+			return env.Value[0].LifecycleEvent
+		case <-deadline:
+			t.Fatal("timed out waiting for a lifecycle notification")
+			return ""
+		}
+	}
+}
+
 func TestManagerNoWatchWithoutSubscriptions(t *testing.T) {
 	rec := newBodyRecorder(t)
 	store := subscriptions.NewMemoryStore() // no subscriptions for bob
@@ -151,7 +206,10 @@ func TestManagerReapStopsWatchWhenSubscriptionsExpire(t *testing.T) {
 	closed := make(chan struct{})
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	m := NewManager(ctx, []ResourceBuilder{fixedBuilder(EventsResource, []string{"evt-1"}, mgrFuture, closed)},
+	// Zero token expiry: an unbounded watch with no lifecycle timer, so this test
+	// of Reap (driven by subscription expiry) has no goroutine reading the clock
+	// concurrently with the `now` mutation below.
+	m := NewManager(ctx, []ResourceBuilder{fixedBuilder(EventsResource, []string{"evt-1"}, time.Time{}, closed)},
 		store, rec.srv.Client(), func() time.Time { return now }, nil)
 
 	m.OnSubscribe("alice", "tok")
