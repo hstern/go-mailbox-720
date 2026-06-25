@@ -44,9 +44,9 @@ func newPushServer(t *testing.T, authWant string, enabled chan<- pushEnableSeen,
 		if err != nil {
 			return
 		}
-		defer c.CloseNow()
+		defer func() { _ = c.CloseNow() }()
 		if c.Subprotocol() != "jmap" {
-			c.Close(websocket.StatusPolicyViolation, "expected jmap subprotocol")
+			_ = c.Close(websocket.StatusPolicyViolation, "expected jmap subprotocol")
 			return
 		}
 		ctx := r.Context()
@@ -222,7 +222,7 @@ func TestConsumerServeReconnects(t *testing.T) {
 		if err != nil {
 			return
 		}
-		defer c.CloseNow()
+		defer func() { _ = c.CloseNow() }()
 		n := atomic.AddInt32(&conns, 1)
 		ctx := r.Context()
 		if _, _, err := c.Read(ctx); err != nil { // WebSocketPushEnable
@@ -233,7 +233,7 @@ func TestConsumerServeReconnects(t *testing.T) {
 			if err := c.Write(ctx, websocket.MessageText, b); err != nil {
 				return
 			}
-			c.Close(websocket.StatusNormalClosure, "drop") // force a reconnect
+			_ = c.Close(websocket.StatusNormalClosure, "drop") // force a reconnect
 			return
 		}
 		<-ctx.Done() // keep later connections open
@@ -291,7 +291,7 @@ func TestConsumerRejectsBadSubprotocol(t *testing.T) {
 		if err != nil {
 			return
 		}
-		defer c.CloseNow()
+		defer func() { _ = c.CloseNow() }()
 		<-r.Context().Done()
 	}))
 	t.Cleanup(srv.Close)

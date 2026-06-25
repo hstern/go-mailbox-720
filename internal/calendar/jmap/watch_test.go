@@ -34,7 +34,7 @@ func eventPushServer(t *testing.T) string {
 		if err != nil {
 			return
 		}
-		defer c.CloseNow()
+		defer func() { _ = c.CloseNow() }()
 		ctx := r.Context()
 		if _, _, err := c.Read(ctx); err != nil { // WebSocketPushEnable
 			return

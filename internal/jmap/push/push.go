@@ -116,9 +116,9 @@ func (c *Consumer) Run(ctx context.Context) error {
 		return fmt.Errorf("jmap/push: dial: %w", err)
 	}
 	if resp != nil && resp.Body != nil {
-		resp.Body.Close()
+		_ = resp.Body.Close()
 	}
-	defer conn.CloseNow()
+	defer func() { _ = conn.CloseNow() }()
 
 	if got := conn.Subprotocol(); got != Subprotocol {
 		// A server that ignored the subprotocol requirement is misbehaving; the
