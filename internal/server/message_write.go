@@ -33,7 +33,19 @@ func (h Handler) MeUpdateMessages(ctx context.Context, req *api.MicrosoftGraphMe
 	}
 
 	if read, ok := req.IsRead.Get(); ok {
-		if err := w.SetRead(ctx, params.MessageID, read); err != nil {
+		if ifMatch, conditional := ifMatchOf(params.IfMatch); conditional {
+			// Conditional update (Graph If-Match): honour the precondition when the
+			// backend can (JMAP via ifInState). A backend without the capability (IMAP)
+			// has no per-mailbox concurrency token, so it falls through to an
+			// unconditional write, ignoring If-Match — see mail.ConditionalWriter.
+			if cw, ok := b.(mail.ConditionalWriter); ok {
+				if err := cw.SetReadIfMatch(ctx, params.MessageID, read, ifMatch); err != nil {
+					return nil, fmt.Errorf("set read (conditional): %w", err)
+				}
+			} else if err := w.SetRead(ctx, params.MessageID, read); err != nil {
+				return nil, fmt.Errorf("set read: %w", err)
+			}
+		} else if err := w.SetRead(ctx, params.MessageID, read); err != nil {
 			return nil, fmt.Errorf("set read: %w", err)
 		}
 	}

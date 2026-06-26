@@ -85,7 +85,7 @@ func TestRecurrenceFromEventNonRecurring(t *testing.T) {
 // master as the collection-level representation while preserving the rules.
 func TestMapEventCarriesRecurrence(t *testing.T) {
 	cal := decodeCalendar(t, weeklySeries)
-	e, ok := eventFromObject("cal", "/c/standup.ics", cal)
+	e, ok := eventFromObject("cal", "/c/standup.ics", "", cal)
 	if !ok {
 		t.Fatal("eventFromObject ok=false")
 	}
@@ -216,7 +216,7 @@ func TestInstanceFromObjectOverride(t *testing.T) {
 	cal := decodeCalendar(t, weeklySeriesWithException)
 	rid := time.Date(2026, 6, 22, 9, 0, 0, 0, time.UTC)
 
-	e, ok := instanceFromObject("cal", "/c/standup.ics", cal, rid)
+	e, ok := instanceFromObject("cal", "/c/standup.ics", "", cal, rid)
 	if !ok {
 		t.Fatal("instanceFromObject ok=false")
 	}
@@ -235,7 +235,7 @@ func TestInstanceFromObjectSynthesized(t *testing.T) {
 	cal := decodeCalendar(t, weeklySeries)
 	rid := time.Date(2026, 6, 8, 9, 0, 0, 0, time.UTC)
 
-	e, ok := instanceFromObject("cal", "/c/standup.ics", cal, rid)
+	e, ok := instanceFromObject("cal", "/c/standup.ics", "", cal, rid)
 	if !ok {
 		t.Fatal("instanceFromObject ok=false")
 	}

@@ -143,7 +143,7 @@ func (cl *Client) ListEvents(ctx context.Context, calID string, r calendar.Range
 	}
 	var events []calendar.Event
 	for _, obj := range objs {
-		if e, ok := eventFromObject(calID, obj.Path, obj.Data); ok {
+		if e, ok := eventFromObject(calID, obj.Path, obj.ETag, obj.Data); ok {
 			events = append(events, e)
 		}
 	}
@@ -181,7 +181,7 @@ func (cl *Client) FindEventByUID(ctx context.Context, calID, uid string) (calend
 	for _, obj := range objs {
 		// A server with no UID-property filtering may return every object; confirm
 		// the UID rather than trusting the server narrowed it.
-		if e, ok := eventFromObject(calID, obj.Path, obj.Data); ok && e.UID == uid {
+		if e, ok := eventFromObject(calID, obj.Path, obj.ETag, obj.Data); ok && e.UID == uid {
 			return e, true, nil
 		}
 	}
@@ -204,13 +204,13 @@ func (cl *Client) GetEvent(ctx context.Context, id string) (calendar.Event, erro
 	}
 	calID := calendarIDForObject(objectPath)
 	if isInstance {
-		e, ok := instanceFromObject(calID, objectPath, obj.Data, recurrenceID)
+		e, ok := instanceFromObject(calID, objectPath, obj.ETag, obj.Data, recurrenceID)
 		if !ok {
 			return calendar.Event{}, fmt.Errorf("caldav: event %s has no such occurrence", id)
 		}
 		return e, nil
 	}
-	e, ok := eventFromObject(calID, objectPath, obj.Data)
+	e, ok := eventFromObject(calID, objectPath, obj.ETag, obj.Data)
 	if !ok {
 		return calendar.Event{}, fmt.Errorf("caldav: event %s has no VEVENT", id)
 	}
@@ -222,7 +222,7 @@ func (cl *Client) GetEvent(ctx context.Context, id string) (calendar.Event, erro
 // for that instant; failing that it synthesizes the occurrence from the master
 // (start = recurrenceID, end shifted by the master's duration). Reports false when
 // the object holds no master VEVENT.
-func instanceFromObject(calID, objectPath string, cal *ical.Calendar, recurrenceID time.Time) (calendar.Event, bool) {
+func instanceFromObject(calID, objectPath, etag string, cal *ical.Calendar, recurrenceID time.Time) (calendar.Event, bool) {
 	if cal == nil {
 		return calendar.Event{}, false
 	}
@@ -237,6 +237,7 @@ func instanceFromObject(calID, objectPath string, cal *ical.Calendar, recurrence
 				e.ID = instanceEventID(objectPath, recurrenceID)
 				e.CalendarID = calID
 				e.SeriesMasterID = eventID(objectPath)
+				e.ETag = etag
 				return e, true
 			}
 			continue
@@ -262,6 +263,7 @@ func instanceFromObject(calID, objectPath string, cal *ical.Calendar, recurrence
 	e.ID = instanceEventID(objectPath, recurrenceID)
 	e.CalendarID = calID
 	e.SeriesMasterID = eventID(objectPath)
+	e.ETag = etag
 	return e, true
 }
 
@@ -276,7 +278,7 @@ const propRecurrenceID = "RECURRENCE-ID"
 // master, which carries the recurrence pattern (RRULE/EXDATE). The individual
 // occurrences and overrides are surfaced separately, addressed by instance IDs,
 // via ListInstances / GetEvent. Reports false when the object holds no VEVENT.
-func eventFromObject(calID, objectPath string, cal *ical.Calendar) (calendar.Event, bool) {
+func eventFromObject(calID, objectPath, etag string, cal *ical.Calendar) (calendar.Event, bool) {
 	if cal == nil {
 		return calendar.Event{}, false
 	}
@@ -301,6 +303,7 @@ func eventFromObject(calID, objectPath string, cal *ical.Calendar) (calendar.Eve
 	e := mapEvent(&events[master])
 	e.ID = eventID(objectPath)
 	e.CalendarID = calID
+	e.ETag = etag
 	return e, true
 }
 

@@ -40,7 +40,7 @@ END:VCARD
 // can assert the Graph-shaped projections.
 func mapCard(t *testing.T, s string) contacts.Contact {
 	t.Helper()
-	c, ok := contactFromObject("ab", "/p.vcf", decodeCard(t, s))
+	c, ok := contactFromObject("ab", "/p.vcf", "", decodeCard(t, s))
 	if !ok {
 		t.Fatal("contactFromObject returned ok=false")
 	}
@@ -179,7 +179,7 @@ func TestContactFromObjectSetsIDs(t *testing.T) {
 	objectPath := "/addressbooks/alice/contacts/alice.vcf"
 	abID := addressBookID("/addressbooks/alice/contacts/")
 
-	c, ok := contactFromObject(abID, objectPath, card)
+	c, ok := contactFromObject(abID, objectPath, `"etag-123"`, card)
 	if !ok {
 		t.Fatal("contactFromObject returned ok=false")
 	}
@@ -189,13 +189,16 @@ func TestContactFromObjectSetsIDs(t *testing.T) {
 	if c.AddressBookID != abID {
 		t.Errorf("AddressBookID = %q, want %q", c.AddressBookID, abID)
 	}
+	if c.ETag != `"etag-123"` {
+		t.Errorf("ETag = %q, want %q", c.ETag, `"etag-123"`)
+	}
 }
 
 func TestContactFromObjectEmptyCard(t *testing.T) {
-	if _, ok := contactFromObject("ab", "/p.vcf", nil); ok {
+	if _, ok := contactFromObject("ab", "/p.vcf", "", nil); ok {
 		t.Error("contactFromObject(nil card) ok = true, want false")
 	}
-	if _, ok := contactFromObject("ab", "/p.vcf", vcard.Card{}); ok {
+	if _, ok := contactFromObject("ab", "/p.vcf", "", vcard.Card{}); ok {
 		t.Error("contactFromObject(empty card) ok = true, want false")
 	}
 }

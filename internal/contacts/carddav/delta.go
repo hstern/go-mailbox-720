@@ -46,15 +46,18 @@ func (cl *Client) Delta(ctx context.Context, abID string, token string) (changed
 	}
 	for _, obj := range res.Updated {
 		card := obj.Card
+		etag := obj.ETag
 		if len(card) == 0 {
-			// The sync response listed the href but not its card; fetch it.
+			// The sync response listed the href but not its card; fetch it (and take
+			// its fresher ETag).
 			full, gerr := cl.c.GetAddressObject(ctx, obj.Path)
 			if gerr != nil {
 				return nil, nil, "", fmt.Errorf("carddav: delta: get %q: %w", obj.Path, gerr)
 			}
 			card = full.Card
+			etag = full.ETag
 		}
-		if c, ok := contactFromObject(abID, obj.Path, card); ok {
+		if c, ok := contactFromObject(abID, obj.Path, etag, card); ok {
 			changed = append(changed, c)
 		}
 	}

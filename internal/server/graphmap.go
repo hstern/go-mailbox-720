@@ -5,6 +5,18 @@ import (
 	"github.com/hstern/go-mailbox-720/internal/mail"
 )
 
+// ifMatchOf returns the inbound If-Match precondition ETag and whether the client
+// supplied one. An absent or empty header means no precondition, so the update
+// handler performs an unconditional write. Used by the message/event/contact
+// PATCH handlers to drive their ConditionalWriter paths.
+func ifMatchOf(opt api.OptString) (string, bool) {
+	v, ok := opt.Get()
+	if !ok || v == "" {
+		return "", false
+	}
+	return v, true
+}
+
 // toGraphMessage maps the neutral mail.Message onto the generated Graph type.
 func toGraphMessage(m mail.Message) api.MicrosoftGraphMessage {
 	gm := api.MicrosoftGraphMessage{
@@ -39,6 +51,9 @@ func toGraphMessage(m mail.Message) api.MicrosoftGraphMessage {
 			Content:     api.NewOptNilString(m.Body.Content),
 			ContentType: api.NewOptMicrosoftGraphBodyType(graphBodyType(m.Body.ContentType)),
 		})
+	}
+	if m.ETag != "" {
+		gm.OdataDotEtag = api.NewOptString(m.ETag)
 	}
 	return gm
 }

@@ -206,13 +206,18 @@ func (cl *Client) queryEmailIDs(ctx context.Context, query *email.Query) ([]gojm
 // derived preview are populated (the GetMessage path); otherwise only
 // envelope-level fields are.
 func (cl *Client) getEmails(ctx context.Context, ids []gojmap.ID, withBody bool) ([]port.Message, error) {
-	emails, err := cl.fetchEmails(ctx, ids, withBody)
+	emails, state, err := cl.fetchEmails(ctx, ids, withBody)
 	if err != nil {
 		return nil, err
 	}
 	msgs := make([]port.Message, 0, len(emails))
 	for _, e := range emails {
-		msgs = append(msgs, mapEmail(e, withBody))
+		m := mapEmail(e, withBody)
+		// The Email/get response state is account-level (RFC 8620), so every message
+		// in this batch shares it — coarse, but the only optimistic-concurrency token
+		// base JMAP offers (see port.Message.ETag).
+		m.ETag = state
+		msgs = append(msgs, m)
 	}
 	return msgs, nil
 }
@@ -220,7 +225,7 @@ func (cl *Client) getEmails(ctx context.Context, ids []gojmap.ID, withBody bool)
 // fetchEmails runs an Email/get for ids and returns the raw Email objects in the
 // order of ids (Email/get may return them in any order, so they are reindexed).
 // withBody adds the body-value properties so a caller can read the message body.
-func (cl *Client) fetchEmails(ctx context.Context, ids []gojmap.ID, withBody bool) ([]*email.Email, error) {
+func (cl *Client) fetchEmails(ctx context.Context, ids []gojmap.ID, withBody bool) ([]*email.Email, string, error) {
 	get := &email.Get{
 		Account:    cl.accountID,
 		IDs:        ids,
@@ -233,11 +238,11 @@ func (cl *Client) fetchEmails(ctx context.Context, ids []gojmap.ID, withBody boo
 	}
 	args, err := cl.do(ctx, get)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	resp, ok := args.(*email.GetResponse)
 	if !ok {
-		return nil, fmt.Errorf("jmap: unexpected response to Email/get: %T", args)
+		return nil, "", fmt.Errorf("jmap: unexpected response to Email/get: %T", args)
 	}
 	byID := make(map[gojmap.ID]*email.Email, len(resp.List))
 	for _, e := range resp.List {
@@ -249,7 +254,9 @@ func (cl *Client) fetchEmails(ctx context.Context, ids []gojmap.ID, withBody boo
 			out = append(out, e)
 		}
 	}
-	return out, nil
+	// resp.State is the account-level Email state; the caller surfaces it as each
+	// message's coarse ETag (see port.Message.ETag).
+	return out, resp.State, nil
 }
 
 // GetMessage fetches a single message, including its parsed body, by opaque ID.

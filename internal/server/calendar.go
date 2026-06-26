@@ -184,6 +184,9 @@ func toGraphEvent(e calendar.Event) api.MicrosoftGraphEvent {
 		ge.SeriesMasterId = api.NewOptNilString(e.SeriesMasterID)
 	}
 	ge.Type = api.NewOptMicrosoftGraphEventType(graphEventType(e))
+	if e.ETag != "" {
+		ge.OdataDotEtag = api.NewOptString(e.ETag)
+	}
 	return ge
 }
 

@@ -180,8 +180,9 @@ func (f *fakeServer) dispatch(call rawCall) any {
 // setArgs decodes an Email/set request. The Update patch values arrive as raw
 // JSON (a $seen keyword set to true or null), which the test inspects directly.
 type setArgs struct {
-	Update  map[gojmap.ID]map[string]json.RawMessage `json:"update"`
-	Destroy []gojmap.ID                              `json:"destroy"`
+	IfInState string                                   `json:"ifInState"`
+	Update    map[gojmap.ID]map[string]json.RawMessage `json:"update"`
+	Destroy   []gojmap.ID                              `json:"destroy"`
 }
 
 // queryArgs decodes an Email/query request, keeping the filter as a recursive
@@ -234,7 +235,12 @@ func (f *fakeServer) get(m *email.Get) *email.GetResponse {
 	return resp
 }
 
-func (f *fakeServer) set(m *setArgs) *email.SetResponse {
+func (f *fakeServer) set(m *setArgs) any {
+	// ifInState is the account-level optimistic-concurrency guard (RFC 8620 §5.3):
+	// reject the whole call with a stateMismatch when it does not match.
+	if m.IfInState != "" && m.IfInState != f.state {
+		return &gojmap.MethodError{Type: "stateMismatch"}
+	}
 	resp := &email.SetResponse{Account: testAccount, OldState: f.state}
 	for id, patch := range m.Update {
 		e, ok := f.emails[id]
@@ -550,6 +556,45 @@ func TestSetReadAddsAndRemovesKeyword(t *testing.T) {
 	}
 }
 
+func TestSetReadIfMatchHonoursState(t *testing.T) {
+	f := newFakeServer()
+	f.seedInbox()
+	cl := f.start(t)
+	id := messageID("email-1")
+
+	// A message read surfaces the account Email state ("s0") as its coarse ETag.
+	msg, err := cl.GetMessage(context.Background(), id)
+	if err != nil {
+		t.Fatalf("GetMessage: %v", err)
+	}
+	if msg.ETag != "s0" {
+		t.Fatalf("message ETag = %q, want %q (account Email state)", msg.ETag, "s0")
+	}
+
+	// Matching ifMatch applies the read-state change.
+	if err := cl.SetReadIfMatch(context.Background(), id, true, "s0"); err != nil {
+		t.Fatalf("SetReadIfMatch(matching): %v", err)
+	}
+	if !f.emails["email-1"].Keywords[keywordSeen] {
+		t.Error("after matching SetReadIfMatch, $seen not set")
+	}
+
+	// The set advanced the state; the stale ETag now fails the precondition.
+	err = cl.SetReadIfMatch(context.Background(), id, false, "s0")
+	if !errors.Is(err, port.ErrPreconditionFailed) {
+		t.Fatalf("SetReadIfMatch(stale) err = %v, want ErrPreconditionFailed", err)
+	}
+	// The refused write left the keyword untouched.
+	if !f.emails["email-1"].Keywords[keywordSeen] {
+		t.Error("refused SetReadIfMatch cleared $seen; want unchanged")
+	}
+
+	// An empty ifMatch is rejected before any request.
+	if err := cl.SetReadIfMatch(context.Background(), id, false, ""); err == nil {
+		t.Error("SetReadIfMatch(empty) err = nil, want error")
+	}
+}
+
 func TestDeleteMessage(t *testing.T) {
 	f := newFakeServer()
 	f.seedInbox()
@@ -656,5 +701,8 @@ func TestInterfaceSatisfaction(t *testing.T) {
 	}
 	if _, ok := b.(port.RawReader); !ok {
 		t.Error("Client does not satisfy mail.RawReader")
+	}
+	if _, ok := b.(port.ConditionalWriter); !ok {
+		t.Error("Client does not satisfy mail.ConditionalWriter")
 	}
 }

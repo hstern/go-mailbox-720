@@ -54,6 +54,13 @@ type Event struct {
 	// embedded RecurrenceID is set. Maps to Graph's event.type ("exception" vs
 	// "occurrence").
 	IsOverride bool
+	// ETag is the backend's opaque entity-tag for the event's object resource
+	// (the CalDAV getetag), as read on GET/list. It backs Graph's @odata.etag and
+	// is the precondition a conditional update (ConditionalWriter) sends back as
+	// If-Match. Empty when the backend reports no ETag. It is a property of the
+	// stored resource, not of the event's content, so it sits here rather than on
+	// the embedded JSCalendar object.
+	ETag string
 
 	jscalendar.Event
 }
@@ -177,6 +184,39 @@ type Writer interface {
 	// that does not exist returns a not-found error (mirroring Graph's DELETE
 	// semantics); a caller wanting idempotent cleanup can ignore it.
 	DeleteEvent(ctx context.Context, id string) error
+}
+
+// ErrPreconditionFailed is returned by a ConditionalWriter when an If-Match
+// precondition fails: the stored resource's ETag no longer matches the value the
+// caller supplied, meaning the event changed since the caller last read it (a
+// lost-update conflict). The HTTP layer maps it to 412 Precondition Failed.
+var ErrPreconditionFailed = errors.New("calendar: precondition failed (ETag mismatch)")
+
+// ConditionalWriter is the optional capability to update an event only if its
+// stored ETag still matches a caller-supplied value — optimistic concurrency,
+// the backing for Microsoft Graph's PATCH /me/events/{id} carrying an If-Match
+// header. It is kept separate from Writer (like the other capabilities) so that
+// an adapter without conditional support need not implement it; consumers
+// type-assert for it:
+//
+//	if cw, ok := backend.(calendar.ConditionalWriter); ok {
+//		updated, err := cw.UpdateEventIfMatch(ctx, e, ifMatch)
+//	}
+//
+// The CalDAV adapter implements it by issuing a conditional PUT (If-Match) so the
+// DAV server enforces the precondition atomically, with no read-modify-write
+// race. A backend without an ETag concept — the JMAP calendar adapter (which
+// surfaces no per-event ETag) and the server's fakes — does not implement it, and
+// the server falls back to an unconditional Writer.UpdateEvent, ignoring If-Match.
+// A ConditionalWriter is bound to the same authenticated principal as its
+// Backend.
+type ConditionalWriter interface {
+	// UpdateEventIfMatch replaces the event identified by e.ID with e, but only if
+	// the event's current ETag equals ifMatch, and returns the stored event. It
+	// returns ErrPreconditionFailed when the precondition fails. ifMatch is the
+	// opaque ETag the caller last observed (Graph's If-Match); an empty ifMatch is
+	// an error — callers with no precondition use Writer.UpdateEvent instead.
+	UpdateEventIfMatch(ctx context.Context, e Event, ifMatch string) (Event, error)
 }
 
 // DeltaReader is the optional incremental-sync capability: report the events

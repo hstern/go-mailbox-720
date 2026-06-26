@@ -13,6 +13,7 @@ package contacts
 
 import (
 	"context"
+	"errors"
 
 	"github.com/hstern/go-jscontact"
 )
@@ -43,6 +44,13 @@ type Contact struct {
 	// AddressBookID is the opaque ID of the address-book collection the contact
 	// lives in.
 	AddressBookID string
+	// ETag is the backend's opaque entity-tag for the contact's object resource
+	// (the CardDAV getetag), as read on GET/list. It backs Graph's @odata.etag and
+	// is the precondition a conditional update (ConditionalWriter) sends back as
+	// If-Match. Empty when the backend reports no ETag. It is a property of the
+	// stored resource, not of the contact's content, so it sits here rather than
+	// on the embedded JSContact card.
+	ETag string
 
 	jscontact.Card
 }
@@ -89,6 +97,40 @@ type Writer interface {
 	// contact that does not exist returns a not-found error (mirroring Graph's
 	// DELETE semantics); a caller wanting idempotent cleanup can ignore it.
 	DeleteContact(ctx context.Context, id string) error
+}
+
+// ErrPreconditionFailed is returned by a ConditionalWriter when an If-Match
+// precondition fails: the stored resource's ETag no longer matches the value the
+// caller supplied, meaning the contact changed since the caller last read it (a
+// lost-update conflict). The HTTP layer maps it to 412 Precondition Failed.
+var ErrPreconditionFailed = errors.New("contacts: precondition failed (ETag mismatch)")
+
+// ConditionalWriter is the optional capability to update a contact only if its
+// stored ETag still matches a caller-supplied value — optimistic concurrency,
+// the backing for Microsoft Graph's PATCH /me/contacts/{id} carrying an If-Match
+// header. It is kept separate from Writer (like the other capabilities) so that
+// an adapter without conditional support need not implement it; consumers
+// type-assert for it:
+//
+//	if cw, ok := backend.(contacts.ConditionalWriter); ok {
+//		updated, err := cw.UpdateContactIfMatch(ctx, c, ifMatch)
+//	}
+//
+// The CardDAV adapter implements it by issuing a conditional PUT (If-Match) so
+// the DAV server enforces the precondition atomically, with no read-modify-write
+// race. A backend without an ETag concept — the JMAP contacts adapter (which
+// surfaces no per-contact ETag) and the server's fakes — does not implement it,
+// and the server falls back to an unconditional Writer.UpdateContact, ignoring
+// If-Match.
+// A ConditionalWriter is bound to the same authenticated principal as its
+// Backend.
+type ConditionalWriter interface {
+	// UpdateContactIfMatch replaces the contact identified by c.ID with c, but only
+	// if the contact's current ETag equals ifMatch, and returns the stored contact.
+	// It returns ErrPreconditionFailed when the precondition fails. ifMatch is the
+	// opaque ETag the caller last observed (Graph's If-Match); an empty ifMatch is
+	// an error — callers with no precondition use Writer.UpdateContact instead.
+	UpdateContactIfMatch(ctx context.Context, c Contact, ifMatch string) (Contact, error)
 }
 
 // DeltaReader is the optional incremental-sync capability: report the contacts

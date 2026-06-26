@@ -105,6 +105,9 @@ func toGraphContact(c contacts.Contact) api.MicrosoftGraphContact {
 		gc.PersonalNotes = api.NewOptNilString(c.Note())
 	}
 	addPhones(&gc, c.PhoneList())
+	if c.ETag != "" {
+		gc.OdataDotEtag = api.NewOptString(c.ETag)
+	}
 	return gc
 }
 

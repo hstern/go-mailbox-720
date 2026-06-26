@@ -198,7 +198,7 @@ func TestEventFromObjectSetsIDs(t *testing.T) {
 	objectPath := "/calendars/alice/work/event-123.ics"
 	calID := calendarID("/calendars/alice/work/")
 
-	e, ok := eventFromObject(calID, objectPath, cal)
+	e, ok := eventFromObject(calID, objectPath, `"etag-123"`, cal)
 	if !ok {
 		t.Fatal("eventFromObject returned ok=false")
 	}
@@ -208,10 +208,13 @@ func TestEventFromObjectSetsIDs(t *testing.T) {
 	if e.CalendarID != calID {
 		t.Errorf("CalendarID = %q, want %q", e.CalendarID, calID)
 	}
+	if e.ETag != `"etag-123"` {
+		t.Errorf("ETag = %q, want %q", e.ETag, `"etag-123"`)
+	}
 }
 
 func TestEventFromObjectNilCalendar(t *testing.T) {
-	if _, ok := eventFromObject("cal", "/p.ics", nil); ok {
+	if _, ok := eventFromObject("cal", "/p.ics", "", nil); ok {
 		t.Error("eventFromObject(nil) ok = true, want false")
 	}
 }
@@ -371,7 +374,7 @@ END:VEVENT
 END:VCALENDAR
 `
 	cal := decodeCalendar(t, recurring)
-	e, ok := eventFromObject("cal", "/series.ics", cal)
+	e, ok := eventFromObject("cal", "/series.ics", "", cal)
 	if !ok {
 		t.Fatal("eventFromObject returned ok=false")
 	}

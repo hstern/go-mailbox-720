@@ -43,7 +43,7 @@ func TestContactToCardRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("contactToCard: %v", err)
 	}
-	got, ok := contactFromObject("ab", "/p.vcf", card)
+	got, ok := contactFromObject("ab", "/p.vcf", "", card)
 	if !ok {
 		t.Fatal("contactFromObject returned ok=false")
 	}
@@ -101,7 +101,7 @@ func TestContactToCardFormattedNameFallback(t *testing.T) {
 	if err != nil {
 		t.Fatalf("contactToCard: %v", err)
 	}
-	got, ok := contactFromObject("ab", "/p.vcf", card)
+	got, ok := contactFromObject("ab", "/p.vcf", "", card)
 	if !ok {
 		t.Fatal("contactFromObject returned ok=false")
 	}

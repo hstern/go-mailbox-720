@@ -73,14 +73,37 @@ func (h Handler) MeUpdateContacts(ctx context.Context, req *api.MicrosoftGraphCo
 		return nil, fmt.Errorf("get contact: %w", err)
 	}
 
-	updated, err := w.UpdateContact(ctx, mergeContactPatch(current, req))
+	merged := mergeContactPatch(current, req)
+	updated, err := h.updateContact(ctx, b, w, merged, params.IfMatch)
 	if err != nil {
-		return nil, fmt.Errorf("update contact: %w", err)
+		return nil, err
 	}
 	return &api.MicrosoftGraphContactStatusCode{
 		StatusCode: http.StatusOK,
 		Response:   toGraphContact(updated),
 	}, nil
+}
+
+// updateContact writes merged, honouring an inbound If-Match precondition when one
+// is supplied and the backend supports conditional writes (CardDAV via a
+// conditional PUT). A failed precondition surfaces contacts.ErrPreconditionFailed,
+// which the error handler maps to 412. With no If-Match, or a backend that only
+// implements the unconditional Writer, it writes unconditionally.
+func (h Handler) updateContact(ctx context.Context, b contacts.Backend, w contacts.Writer, merged contacts.Contact, ifMatch api.OptString) (contacts.Contact, error) {
+	if etag, conditional := ifMatchOf(ifMatch); conditional {
+		if cw, ok := b.(contacts.ConditionalWriter); ok {
+			updated, err := cw.UpdateContactIfMatch(ctx, merged, etag)
+			if err != nil {
+				return contacts.Contact{}, fmt.Errorf("update contact (conditional): %w", err)
+			}
+			return updated, nil
+		}
+	}
+	updated, err := w.UpdateContact(ctx, merged)
+	if err != nil {
+		return contacts.Contact{}, fmt.Errorf("update contact: %w", err)
+	}
+	return updated, nil
 }
 
 // MeDeleteContacts implements DELETE /me/contacts/{contact-id}. It type-asserts

@@ -2,6 +2,7 @@ package jmap
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	gojmap "git.sr.ht/~rockorager/go-jmap"
@@ -34,6 +35,48 @@ func (cl *Client) SetRead(ctx context.Context, id string, read bool) error {
 			emailID: {"keywords/" + keywordSeen: value},
 		},
 	}, emailID, setUpdate)
+}
+
+var _ port.ConditionalWriter = (*Client)(nil)
+
+// SetReadIfMatch sets or clears the message's read state only if the account's
+// Email state still equals ifMatch — JMAP's ifInState optimistic-concurrency
+// guard on Email/set (RFC 8620 §5.3), the backing for Graph's PATCH of isRead
+// with an If-Match header.
+//
+// CAVEAT: ifInState is ACCOUNT-LEVEL, not per-message — ifMatch is the account
+// Email state surfaced as the message's coarse ETag (see port.Message.ETag), so a
+// concurrent change to any other email in the account flips the state and makes
+// this fail spuriously. It is best-effort until the per-object JMAP conditional
+// draft (draft-gondwana-jmap-conditional, MB720-39) ships. A server stateMismatch
+// is translated to port.ErrPreconditionFailed; the HTTP layer maps that to 412.
+func (cl *Client) SetReadIfMatch(ctx context.Context, id string, read bool, ifMatch string) error {
+	if ifMatch == "" {
+		return fmt.Errorf("jmap: SetReadIfMatch requires a non-empty If-Match ETag")
+	}
+	emailID, err := decodeMessageID(id)
+	if err != nil {
+		return err
+	}
+	var value any // null removes the keyword
+	if read {
+		value = true
+	}
+	err = cl.set(ctx, &email.Set{
+		Account:   cl.accountID,
+		IfInState: ifMatch,
+		Update: map[gojmap.ID]gojmap.Patch{
+			emailID: {"keywords/" + keywordSeen: value},
+		},
+	}, emailID, setUpdate)
+	if err != nil {
+		var me *gojmap.MethodError
+		if errors.As(err, &me) && me.Type == "stateMismatch" {
+			return port.ErrPreconditionFailed
+		}
+		return err
+	}
+	return nil
 }
 
 // DeleteMessage removes the message, the backing for Graph's DELETE, via an

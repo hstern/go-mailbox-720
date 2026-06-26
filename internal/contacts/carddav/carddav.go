@@ -119,7 +119,7 @@ func (cl *Client) ListContacts(ctx context.Context, abID string) ([]contacts.Con
 	}
 	var out []contacts.Contact
 	for _, obj := range objs {
-		if c, ok := contactFromObject(abID, obj.Path, obj.Card); ok {
+		if c, ok := contactFromObject(abID, obj.Path, obj.ETag, obj.Card); ok {
 			out = append(out, c)
 		}
 	}
@@ -137,7 +137,7 @@ func (cl *Client) GetContact(ctx context.Context, id string) (contacts.Contact, 
 	if err != nil {
 		return contacts.Contact{}, fmt.Errorf("carddav: get address object %q: %w", objectPath, err)
 	}
-	c, ok := contactFromObject(addressBookIDForObject(objectPath), objectPath, obj.Card)
+	c, ok := contactFromObject(addressBookIDForObject(objectPath), objectPath, obj.ETag, obj.Card)
 	if !ok {
 		return contacts.Contact{}, fmt.Errorf("carddav: address object %s has no vCard", id)
 	}
@@ -151,7 +151,7 @@ func (cl *Client) GetContact(ctx context.Context, id string) (contacts.Contact, 
 // that are ours, not JSContact's. Reports false when the card is empty (nil or
 // no properties) or the bridge fails to convert it, so an unparseable object is
 // skipped rather than yielding a blank contact.
-func contactFromObject(abID, objectPath string, card vcard.Card) (contacts.Contact, bool) {
+func contactFromObject(abID, objectPath, etag string, card vcard.Card) (contacts.Contact, bool) {
 	if len(card) == 0 {
 		return contacts.Contact{}, false
 	}
@@ -162,6 +162,7 @@ func contactFromObject(abID, objectPath string, card vcard.Card) (contacts.Conta
 	return contacts.Contact{
 		ID:            contactID(objectPath),
 		AddressBookID: abID,
+		ETag:          etag,
 		Card:          *jsCard,
 	}, true
 }
