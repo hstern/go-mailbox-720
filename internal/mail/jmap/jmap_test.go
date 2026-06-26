@@ -465,6 +465,9 @@ func TestListMailFolders(t *testing.T) {
 	if folders[0].DisplayName != "Inbox" || folders[0].Total != 1 || folders[0].Unread != 1 {
 		t.Errorf("folder = %+v, want Inbox total=1 unread=1", folders[0])
 	}
+	if folders[0].WellKnownName != "inbox" {
+		t.Errorf("folder WellKnownName = %q, want %q (from role)", folders[0].WellKnownName, "inbox")
+	}
 }
 
 func TestListMessagesInbox(t *testing.T) {

@@ -244,6 +244,30 @@ type DeltaReader interface {
 	Delta(ctx context.Context, calendarID string, token string) (changed []Event, removed []string, next string, err error)
 }
 
+// Watcher is the optional change-watch capability: block on a calendar and
+// signal whenever it changes. Like Writer and DeltaReader it is kept separate
+// from Backend so an adapter without watch support, and the read-path fakes,
+// need not implement it. It is the primitive the change-notification delivery
+// loop (subscriptions on /me/events, MB720-9) builds on; consumers type-assert
+// for it:
+//
+//	if wch, ok := backend.(calendar.Watcher); ok {
+//		err := wch.Watch(ctx, calendarID, func() { resync() })
+//	}
+//
+// A Watcher is bound to the same authenticated principal as its Backend. The
+// JMAP adapter implements it over an RFC 8887 WebSocket (MB720-27).
+type Watcher interface {
+	// Watch blocks until ctx is cancelled (or an error occurs), invoking
+	// onChange each time the calendar changes. onChange is a coalesced signal,
+	// NOT a description of what changed — the caller re-syncs (e.g. via
+	// DeltaReader) to discover specifics. An empty calendarID watches the primary
+	// calendar. onChange may fire once more concurrently with, or just after,
+	// Watch returns, so a caller must not free state onChange captures until it
+	// is sure no such call is in flight.
+	Watch(ctx context.Context, calendarID string, onChange func()) error
+}
+
 // SchedulingDetector is the optional capability to report whether the backing
 // server performs iTIP scheduling itself (CalDAV RFC 6638 calendar
 // auto-scheduling). It is kept separate from Backend (like Writer); an adapter

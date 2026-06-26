@@ -157,3 +157,27 @@ type DeltaReader interface {
 	// Graph @removed tombstones). On an initial sync removed is empty.
 	Delta(ctx context.Context, addressBookID string, token string) (changed []Contact, removed []string, next string, err error)
 }
+
+// Watcher is the optional change-watch capability: block on an address book and
+// signal whenever it changes. Like Writer and DeltaReader it is kept separate
+// from Backend so an adapter without watch support, and the read-path fakes,
+// need not implement it. It is the primitive the change-notification delivery
+// loop (subscriptions on /me/contacts, MB720-9) builds on; consumers type-assert
+// for it:
+//
+//	if wch, ok := backend.(contacts.Watcher); ok {
+//		err := wch.Watch(ctx, addressBookID, func() { resync() })
+//	}
+//
+// A Watcher is bound to the same authenticated principal as its Backend. The
+// JMAP adapter implements it over an RFC 8887 WebSocket (MB720-27).
+type Watcher interface {
+	// Watch blocks until ctx is cancelled (or an error occurs), invoking
+	// onChange each time the address book changes. onChange is a coalesced
+	// signal, NOT a description of what changed — the caller re-syncs (e.g. via
+	// DeltaReader) to discover specifics. An empty addressBookID watches the
+	// default address book. onChange may fire once more concurrently with, or
+	// just after, Watch returns, so a caller must not free state onChange
+	// captures until it is sure no such call is in flight.
+	Watch(ctx context.Context, addressBookID string, onChange func()) error
+}

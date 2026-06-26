@@ -84,6 +84,17 @@ type Subscription struct {
 	ClientState        string
 	ExpirationDateTime time.Time
 	CreatedAt          time.Time
+	// LifecycleNotificationURL is where lifecycle notifications
+	// (reauthorizationRequired, missed, subscriptionRemoved) are POSTed, distinct
+	// from NotificationURL which carries data changes. Empty when the subscriber
+	// did not ask for lifecycle events.
+	LifecycleNotificationURL string
+	// Owner is the opaque key of the principal that created the subscription
+	// (e.g. iss+sub), set by the handler from the authenticated identity. It
+	// scopes delivery: a change for principal P reaches only P's subscriptions.
+	// Empty in single-tenant mode (no per-request identity), where every change
+	// and every subscription share the empty owner and so still match.
+	Owner string
 }
 
 // Validation sentinel errors. Each names exactly one rejection reason so callers
@@ -94,6 +105,9 @@ var (
 	ErrNotificationURLRequired = errors.New("subscriptions: notificationUrl is required")
 	// ErrNotificationURLNotHTTPS is returned when notificationUrl is not https.
 	ErrNotificationURLNotHTTPS = errors.New("subscriptions: notificationUrl must be https")
+	// ErrLifecycleNotificationURLNotHTTPS is returned when a non-empty
+	// lifecycleNotificationUrl is not https.
+	ErrLifecycleNotificationURLNotHTTPS = errors.New("subscriptions: lifecycleNotificationUrl must be https")
 	// ErrInvalidChangeType is returned when changeType is empty or names an
 	// unknown change kind.
 	ErrInvalidChangeType = errors.New("subscriptions: changeType is invalid")
@@ -127,6 +141,20 @@ func Validate(req Subscription, now time.Time, maxTTL time.Duration, allowedReso
 	}
 	if !strings.EqualFold(u.Scheme, "https") {
 		return fmt.Errorf("%w: scheme %q", ErrNotificationURLNotHTTPS, u.Scheme)
+	}
+
+	// lifecycleNotificationUrl is optional, but when present it carries
+	// reauthorizationRequired/missed events and so must be https just like the
+	// data notificationUrl. Validated here (not just in the handler) so every
+	// caller of Validate gets the same SSRF-relevant scheme gate.
+	if req.LifecycleNotificationURL != "" {
+		lu, err := url.Parse(req.LifecycleNotificationURL)
+		if err != nil {
+			return fmt.Errorf("%w: %v", ErrLifecycleNotificationURLNotHTTPS, err)
+		}
+		if !strings.EqualFold(lu.Scheme, "https") {
+			return fmt.Errorf("%w: scheme %q", ErrLifecycleNotificationURLNotHTTPS, lu.Scheme)
+		}
 	}
 
 	if err := validateChangeType(req.ChangeType); err != nil {

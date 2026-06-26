@@ -19,6 +19,7 @@ func init() {
 	gojmap.RegisterMethod("AddressBook/get", func() gojmap.MethodResponse { return &addressBookGetResponse{} })
 	gojmap.RegisterMethod("ContactCard/query", func() gojmap.MethodResponse { return &cardQueryResponse{} })
 	gojmap.RegisterMethod("ContactCard/get", func() gojmap.MethodResponse { return &cardGetResponse{} })
+	gojmap.RegisterMethod("ContactCard/changes", func() gojmap.MethodResponse { return &cardChangesResponse{} })
 }
 
 // --- AddressBook/get (§2.3) ---
@@ -81,6 +82,27 @@ type cardGetResponse struct {
 	State    string         `json:"state,omitempty"`
 	List     []*contactCard `json:"list,omitempty"`
 	NotFound []gojmap.ID    `json:"notFound,omitempty"`
+}
+
+// --- ContactCard/changes (§3.4) ---
+
+type cardChanges struct {
+	Account    gojmap.ID `json:"accountId"`
+	SinceState string    `json:"sinceState"`
+	MaxChanges uint64    `json:"maxChanges,omitempty"`
+}
+
+func (m *cardChanges) Name() string           { return "ContactCard/changes" }
+func (m *cardChanges) Requires() []gojmap.URI { return []gojmap.URI{contactsURI} }
+
+type cardChangesResponse struct {
+	Account        gojmap.ID   `json:"accountId,omitempty"`
+	OldState       string      `json:"oldState"`
+	NewState       string      `json:"newState"`
+	HasMoreChanges bool        `json:"hasMoreChanges"`
+	Created        []gojmap.ID `json:"created"`
+	Updated        []gojmap.ID `json:"updated"`
+	Destroyed      []gojmap.ID `json:"destroyed"`
 }
 
 // contactCard is a JMAP ContactCard: a JSContact Card (RFC 9553) carrying the JMAP

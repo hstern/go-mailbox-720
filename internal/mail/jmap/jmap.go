@@ -55,6 +55,10 @@ type Options struct {
 type Client struct {
 	c         *gojmap.Client
 	accountID gojmap.ID
+	// token is the bearer access token that authenticated the session, retained
+	// so the RFC 8887 WebSocket watch (watch.go) can authenticate its own
+	// connection — go-jmap hides the token inside its HTTP client.
+	token string
 }
 
 var _ port.Backend = (*Client)(nil)
@@ -80,7 +84,7 @@ func Dial(sessionURL, accessToken string, o *Options) (*Client, error) {
 	if !ok || accountID == "" {
 		return nil, fmt.Errorf("jmap: session advertises no primary mail account (%s)", mail.URI)
 	}
-	return &Client{c: c, accountID: accountID}, nil
+	return &Client{c: c, accountID: accountID, token: accessToken}, nil
 }
 
 // newClient wraps an already-configured go-jmap client and account id. It is the
@@ -122,10 +126,11 @@ func (cl *Client) ListMailFolders(ctx context.Context) ([]port.MailFolder, error
 	folders := make([]port.MailFolder, 0, len(resp.List))
 	for _, mbox := range resp.List {
 		folders = append(folders, port.MailFolder{
-			ID:          folderID(mbox.ID),
-			DisplayName: mbox.Name,
-			Total:       int(mbox.TotalEmails),
-			Unread:      int(mbox.UnreadEmails),
+			ID:            folderID(mbox.ID),
+			DisplayName:   mbox.Name,
+			Total:         int(mbox.TotalEmails),
+			Unread:        int(mbox.UnreadEmails),
+			WellKnownName: wellKnownName(mbox.Role),
 		})
 	}
 	return folders, nil
@@ -298,6 +303,7 @@ func (cl *Client) inboxID(ctx context.Context) (gojmap.ID, error) {
 // withBody is set (the GetMessage path). For listings the JMAP server's own
 // preview is used.
 func mapEmail(e *email.Email, withBody bool) port.Message {
+	flagged, draft, categories := mapKeywords(e.Keywords)
 	m := port.Message{
 		ID:             messageID(e.ID),
 		FolderID:       primaryFolderID(e.MailboxIDs),
@@ -308,6 +314,9 @@ func mapEmail(e *email.Email, withBody bool) port.Message {
 		Bcc:            addresses(e.BCC),
 		Preview:        e.Preview,
 		IsRead:         e.Keywords[keywordSeen],
+		Flagged:        flagged,
+		IsDraft:        draft,
+		Categories:     categories,
 		HasAttachments: e.HasAttachment,
 	}
 	if e.SentAt != nil {

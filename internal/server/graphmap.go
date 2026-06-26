@@ -24,9 +24,18 @@ func toGraphMessage(m mail.Message) api.MicrosoftGraphMessage {
 		Subject:        api.NewOptNilString(m.Subject),
 		BodyPreview:    api.NewOptNilString(m.Preview),
 		IsRead:         api.NewOptNilBool(m.IsRead),
+		IsDraft:        api.NewOptNilBool(m.IsDraft),
 		HasAttachments: api.NewOptNilBool(m.HasAttachments),
+		Categories:     graphCategories(m.Categories),
 		ToRecipients:   toRecipients(m.To),
 		CcRecipients:   toRecipients(m.Cc),
+	}
+	// A flagged message surfaces Graph's follow-up flag with flagStatus=flagged;
+	// an unflagged one leaves flag unset rather than emitting notFlagged noise.
+	if m.Flagged {
+		gm.Flag = api.NewOptMicrosoftGraphFollowupFlag(api.MicrosoftGraphFollowupFlag{
+			FlagStatus: api.NewOptMicrosoftGraphFollowupFlagStatus(api.MicrosoftGraphFollowupFlagStatusFlagged),
+		})
 	}
 	if !m.ReceivedAt.IsZero() {
 		gm.ReceivedDateTime = api.NewOptNilDateTime(m.ReceivedAt)
@@ -47,6 +56,20 @@ func toGraphMessage(m mail.Message) api.MicrosoftGraphMessage {
 		gm.OdataDotEtag = api.NewOptString(m.ETag)
 	}
 	return gm
+}
+
+// graphCategories maps the neutral category strings onto Graph's categories
+// slice ([]NilString). It returns nil for no categories so the field is omitted
+// rather than serialized as an empty array.
+func graphCategories(cats []string) []api.NilString {
+	if len(cats) == 0 {
+		return nil
+	}
+	out := make([]api.NilString, 0, len(cats))
+	for _, c := range cats {
+		out = append(out, api.NewNilString(c))
+	}
+	return out
 }
 
 func graphBodyType(contentType string) api.MicrosoftGraphBodyType {
