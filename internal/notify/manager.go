@@ -117,8 +117,14 @@ func (m *Manager) OnSubscribe(owner, token string) {
 		}
 		loopCtx, loopCancel := pctx, context.CancelFunc(func() {})
 		if !expiresAt.IsZero() {
-			// Bound the loop by the token's expiry; a renewal re-arms it.
-			loopCtx, loopCancel = context.WithDeadline(pctx, expiresAt)
+			// Bound the loop by the token's remaining lifetime; a renewal re-arms
+			// it. The remaining lifetime is measured against the injected clock
+			// (m.now) and re-expressed as a real-clock timeout, because context
+			// deadlines run on the wall clock: a test that freezes m.now must see
+			// the loop bounded by the injected expiry, not by a fake-future
+			// timestamp that the real wall clock has already passed (MB720-58). In
+			// production m.now is time.Now, so this is the token's real expiry.
+			loopCtx, loopCancel = context.WithTimeout(pctx, expiresAt.Sub(m.now()))
 			earliest = earlier(earliest, expiresAt)
 		}
 		started++
