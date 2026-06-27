@@ -40,6 +40,7 @@ import (
 	"github.com/hstern/go-mailbox-720/internal/contacts"
 	"github.com/hstern/go-mailbox-720/internal/contacts/carddav"
 	jmapcontacts "github.com/hstern/go-mailbox-720/internal/contacts/jmap"
+	"github.com/hstern/go-mailbox-720/internal/kerbexchange"
 	"github.com/hstern/go-mailbox-720/internal/mail"
 	"github.com/hstern/go-mailbox-720/internal/mail/imap"
 	mailjmap "github.com/hstern/go-mailbox-720/internal/mail/jmap"
@@ -65,6 +66,7 @@ func main() {
 	tokenExchangeClientID := flag.String("tokenexchange-client-id", "", "OAuth2 client id mailboxd authenticates with at the token-exchange endpoint (required when -tokenexchange-endpoint is set; secret from MAILBOXD_TOKENEXCHANGE_CLIENT_SECRET)")
 	tokenExchangeClientAuth := flag.String("tokenexchange-client-auth", "client_secret_basic", "client-authentication method at the token-exchange endpoint: client_secret_basic or client_secret_post")
 	tokenExchangeRequestedTokenType := flag.String("tokenexchange-requested-token-type", rfc8693.TokenTypeAccessToken, "RFC 8693 requested_token_type for the exchange: "+rfc8693.TokenTypeAccessToken+" (default; AS picks the format) or "+rfc8693.TokenTypeJWT+" (request a JWT so backends can validate offline via JWKS instead of RFC 7662 introspection)")
+	kerbExchangeEndpoint := flag.String("kerbexchange-endpoint", "", "go-oauth2-kerberos-exchange token endpoint for OAuth2→Kerberos credential exchange (empty disables). Enables the second per-identity mechanism (MB720-45): a backend provider exchanges the authenticated user's token for a Kerberos credential (ccache/AP-REQ) for that user, to authenticate to Kerberos/GSSAPI-only backends. The endpoint validates the subject token itself, so no client credential is required")
 	ssfReceiverPath := flag.String("ssf-receiver-path", "/ssf/events", "public path for the Shared Signals SET receiver (CAEP/RISC revocation, MB720-18); served unauthenticated since the SET signature is the gate. Active only when auth is enabled")
 	imapAddr := flag.String("mail-imap-addr", "", "IMAP server address host:port for the mail backend (empty: mail operations return 501; password from MAILBOXD_IMAP_PASSWORD)")
 	imapUser := flag.String("mail-imap-username", "", "IMAP username for the mail backend")
@@ -132,6 +134,19 @@ func main() {
 	} else {
 		log.Println("token exchange: disabled — backends use their configured static credentials")
 	}
+	// Build the OAuth2→Kerberos credential exchanger that the second per-identity
+	// mechanism (MB720-46/47/48) uses to mint a Kerberos credential for the
+	// authenticated user, for backends that only speak Kerberos/GSSAPI. Like the
+	// token exchanger it is constructed here (validating its endpoint at startup)
+	// and status-logged; it is consumed per-protocol in the follow-up stories.
+	var kerbExchanger kerbexchange.Exchanger
+	if *kerbExchangeEndpoint != "" {
+		kerbExchanger = kerbexchange.New(*kerbExchangeEndpoint, nil)
+		log.Println("kerberos exchange: enabled (OAuth2→Kerberos) — per-identity GSSAPI backend auth ready")
+	} else {
+		log.Println("kerberos exchange: disabled")
+	}
+	_ = kerbExchanger // consumed by per-identity GSSAPI providers in MB720-46/47/48
 	// A per-identity audience without an exchange endpoint is a misconfiguration:
 	// the backend would silently fall back to the shared static token, serving every
 	// authenticated user from one account. Fail loudly rather than leak across tenants.
