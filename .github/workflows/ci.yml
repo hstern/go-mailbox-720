@@ -127,6 +127,24 @@ jobs:
         working-directory: test/e2e-oidc
         run: go test -timeout 1200s -run TestDumbBackendEndToEnd ./...
 
+  kerberos-e2e:
+    # Exercises the OAuth2->Kerberos foundation (MB720-45) end to end: builds and
+    # runs the real go-oauth2-kerberos-exchange service (kerbexchanged) against an
+    # in-process JWKS issuer, has internal/kerbexchange mint a Kerberos credential
+    # for a token subject, and validates the issued ticket cryptographically by
+    # decrypting it with the shared keytab key. No KDC daemon and no Docker are
+    # needed — the library mints tickets offline from held service keys.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Kerberos exchange e2e (kerbexchanged + internal/kerbexchange)
+        run: go test -tags kerberos_e2e -timeout 300s -run TestKerberosExchangeEndToEnd ./internal/kerbexchange/...
+
   mail-imap-e2e:
     # Runs the IMAP adapter against a real Dovecot server in Docker (build tag
     # dockertest), validating real-server behaviour the in-process memserver
