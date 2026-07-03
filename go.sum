@@ -67,8 +67,8 @@ github.com/hstern/go-managesieve v0.2.0 h1:Uwif0FdjffpCJkC9GalTB2hwFVNHhxuagRbnv
 github.com/hstern/go-managesieve v0.2.0/go.mod h1:H7vjmLjBVUgwIGmzTYzgW0qzLSVHJApN8CuAJ/c9uOw=
 github.com/hstern/go-oauth-client-authn v0.1.0 h1:zqD/lAhZjSrAYj57VRi7/c3ce0v9nR8gUl23884fpWg=
 github.com/hstern/go-oauth-client-authn v0.1.0/go.mod h1:8zsGLngFkLve7c0tpmyrPyjWw4eTkAmPM9H5lml4wW0=
-github.com/hstern/go-oauth2-kerberos-exchange v0.1.0 h1:LFh6Ii+Q+Cn+wNpxlNdAGdMsWiAn8na9zVB7iB3wnUM=
-github.com/hstern/go-oauth2-kerberos-exchange v0.1.0/go.mod h1:TaJhiAGdV4VC2imT69K6zxWJs1zScWETRqbMZMt0Oo0=
+github.com/hstern/go-oauth2-kerberos-exchange v0.2.0 h1:TWY3A7sFseAYgmTvvxNPLgTI3/WsclnqgxsO5ej7uQQ=
+github.com/hstern/go-oauth2-kerberos-exchange v0.2.0/go.mod h1:TaJhiAGdV4VC2imT69K6zxWJs1zScWETRqbMZMt0Oo0=
 github.com/hstern/go-protected-resource-metadata v0.1.0 h1:fdS80jxsA+ppRHlUoTuhgosaLPjLfWxLW4YFDNHwUSE=
 github.com/hstern/go-protected-resource-metadata v0.1.0/go.mod h1:thlCq+8qE2UrDhr5qTGRON+8bI+x1xIsA1zwPU53i7s=
 github.com/hstern/go-risc v0.2.0 h1:m6MQZ2n4QU4pErrxC590oEDXkzRssEWNJtfJP5mGJNo=
