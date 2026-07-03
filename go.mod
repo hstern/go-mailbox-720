@@ -33,7 +33,7 @@ require (
 	github.com/hstern/go-jscontact v0.1.0
 	github.com/hstern/go-managesieve v0.2.0
 	github.com/hstern/go-oauth-client-authn v0.1.0
-	github.com/hstern/go-oauth2-kerberos-exchange v0.1.0
+	github.com/hstern/go-oauth2-kerberos-exchange v0.2.0
 	github.com/hstern/go-protected-resource-metadata v0.1.0
 	github.com/hstern/go-risc v0.2.0
 	github.com/hstern/go-secevent v0.2.1

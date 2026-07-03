@@ -95,15 +95,17 @@ func TestKerberosExchangeEndToEnd(t *testing.T) {
 		}
 	})
 
-	// AP-REQ output: validate it is a well-formed GSSAPI initial-context token.
-	// Uses a distinct subject so it does not share the kerbexchanged service's
-	// (subject, SPN) cache entry with the ccache subtest — that server-side cache
-	// keys only on subject and SPN, not the output type, so a ccache then an
-	// AP-REQ request for the same subject+SPN would return the cached ccache-only
-	// credential (a go-oauth2-kerberos-exchange behavior, tracked separately).
+	// AP-REQ output for the SAME (subject, SPN) the ccache subtest already
+	// exchanged. The kerbexchanged service caches per output type (go-oauth2-
+	// kerberos-exchange v0.2.0), so requesting an AP-REQ after a ccache for one
+	// identity mints a fresh AP-REQ instead of returning the cached ccache-only
+	// credential. Subtests run in order, so "ccache" has already populated the
+	// server cache for this subject+SPN — this exercises the exact sequence the
+	// output-type cache-key fix repaired, and guards against its regression. (The
+	// client-side exchanger keys its cache on output type too, so this request is
+	// a client miss that reaches the server.)
 	t.Run("apreq", func(t *testing.T) {
-		carolJWT := issuer.mint(t, "carol", time.Now().Add(10*time.Minute))
-		cred, err := ex.Exchange(context.Background(), carolJWT, target, kerb.OutputAPReq)
+		cred, err := ex.Exchange(context.Background(), userJWT, target, kerb.OutputAPReq)
 		if err != nil {
 			t.Fatalf("Exchange (apreq): %v", err)
 		}
