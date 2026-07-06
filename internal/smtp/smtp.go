@@ -54,6 +54,14 @@ type Options struct {
 	// Dial username becomes the OAUTHBEARER authorization identity and the Dial
 	// password is ignored.
 	BearerToken string
+	// GSSAPIClient, when non-nil, authenticates with SASL GSSAPI (RFC 4752) using
+	// this pre-built mechanism instead of OAUTHBEARER/PLAIN — the Kerberos
+	// per-identity path (MB720-46), where the client carries the user's own
+	// Kerberos ticket (built by the caller from the exchanged ccache). It takes
+	// precedence over BearerToken; the Dial username/password are ignored (the
+	// authenticated principal is the ticket's). GSSAPI auth-only mode carries no
+	// confidentiality, so it must run over TLS.
+	GSSAPIClient sasl.Client
 }
 
 // Client is an SMTP-backed Sender over a single connection to a submission
@@ -86,12 +94,18 @@ func Dial(addr, username, password string, o *Options) (*Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("smtp: dial %s: %w", addr, err)
 	}
-	if o.BearerToken != "" {
+	switch {
+	case o.GSSAPIClient != nil:
+		if err := authenticateGSSAPI(c, o.GSSAPIClient); err != nil {
+			_ = c.Close()
+			return nil, err
+		}
+	case o.BearerToken != "":
 		if err := authenticateBearer(c, addr, username, o.BearerToken); err != nil {
 			_ = c.Close()
 			return nil, err
 		}
-	} else if username != "" {
+	case username != "":
 		if err := authenticate(c, username, password); err != nil {
 			_ = c.Close()
 			return nil, err
@@ -126,6 +140,17 @@ func authenticateBearer(c *gosmtp.Client, addr, username, token string) error {
 	})
 	if err := c.Auth(auth); err != nil {
 		return fmt.Errorf("smtp: oauthbearer: %w", err)
+	}
+	return nil
+}
+
+// authenticateGSSAPI logs in with a caller-supplied SASL GSSAPI mechanism
+// (RFC 4752): the per-identity Kerberos path (MB720-46), where sc wraps the
+// user's own Kerberos ticket. The authenticated principal is the ticket's, so
+// no Dial username/password is involved.
+func authenticateGSSAPI(c *gosmtp.Client, sc sasl.Client) error {
+	if err := c.Auth(sc); err != nil {
+		return fmt.Errorf("smtp: gssapi: %w", err)
 	}
 	return nil
 }

@@ -7,11 +7,13 @@ import (
 	"sync"
 	"time"
 
+	kerb "github.com/hstern/go-oauth2-kerberos-exchange"
 	subjectid "github.com/hstern/go-subjectid"
 
 	"github.com/hstern/go-mailbox-720/internal/auth"
 	"github.com/hstern/go-mailbox-720/internal/calendar"
 	"github.com/hstern/go-mailbox-720/internal/contacts"
+	"github.com/hstern/go-mailbox-720/internal/kerbexchange"
 	"github.com/hstern/go-mailbox-720/internal/mail"
 	"github.com/hstern/go-mailbox-720/internal/smtp"
 	"github.com/hstern/go-mailbox-720/internal/tokenexchange"
@@ -231,10 +233,117 @@ func (p *perIdentityBackend[B]) get(ctx context.Context) (B, error) {
 	return backend, nil
 }
 
+// identity returns the request's authenticated identity, exposing the mailbox
+// field as a method so the provider adapters can hold either an OAuth
+// (perIdentityBackend) or a Kerberos (perIdentityKerbBackend) backend behind the
+// identityBackend interface.
+func (p *perIdentityBackend[B]) identity(ctx context.Context) (subjectid.SubjectIdentifier, bool) {
+	return p.mailbox(ctx)
+}
+
+// identityBackend is the per-identity backend contract shared by the OAuth
+// (perIdentityBackend) and Kerberos (perIdentityKerbBackend) providers, so the
+// provider adapters can hold either.
+type identityBackend[B io.Closer] interface {
+	get(ctx context.Context) (B, error)
+	identity(ctx context.Context) (subjectid.SubjectIdentifier, bool)
+}
+
+// perIdentityKerbBackend is the Kerberos twin of perIdentityBackend's pooling
+// mode (MB720-46): instead of exchanging the user's token for a bearer token
+// string, it exchanges it for a Kerberos credential (a ccache, via kerbexchange
+// requesting OutputCCache) and dials with that. The dial closure turns the
+// credential into a SASL GSSAPI client. Pooling only — IMAP/SMTP have a real
+// Close, and the pool amortizes the connect + TLS + GSSAPI handshake, keyed to
+// the ticket's expiry exactly as the OAuth path keys to the token's. See
+// perIdentityBackend and connPool.
+type perIdentityKerbBackend[B io.Closer] struct {
+	exchanger kerbexchange.Exchanger
+	target    kerb.ServicePrincipal
+	dial      func(id subjectid.IssSubID, cred *kerb.Credential) (B, error)
+
+	// mailbox and rawToken read the authenticated identity and bearer token from
+	// the request context; fields only so tests can inject a principal.
+	mailbox  func(context.Context) (subjectid.SubjectIdentifier, bool)
+	rawToken func(context.Context) (string, bool)
+
+	pool *connPool[B]
+	now  func() time.Time
+}
+
+// newPerIdentityKerbPool builds a POOLING per-identity Kerberos provider for a
+// backend with a real Close (IMAP/SMTP), mirroring newPerIdentityPool: it leases
+// a parked connection per principal, dialing a fresh one (credential exchange +
+// connect + GSSAPI) only on a pool miss. target is the backend's Kerberos service
+// principal (SPN). The caller starts the pool's reaper with startPoolReaper.
+func newPerIdentityKerbPool[B io.Closer](exchanger kerbexchange.Exchanger, target kerb.ServicePrincipal, dial func(id subjectid.IssSubID, cred *kerb.Credential) (B, error), opts poolOptions[B]) *perIdentityKerbBackend[B] {
+	maxIdle := opts.maxIdle
+	if maxIdle == 0 {
+		maxIdle = defaultMaxIdlePerPrincipal
+	}
+	idleTimeout := opts.idleTimeout
+	if idleTimeout == 0 {
+		idleTimeout = defaultIdleTimeout
+	}
+	return &perIdentityKerbBackend[B]{
+		exchanger: exchanger,
+		target:    target,
+		dial:      dial,
+		mailbox:   auth.Mailbox,
+		rawToken:  auth.RawToken,
+		now:       time.Now,
+		pool: &connPool[B]{
+			wrap:        opts.wrap,
+			healthCheck: opts.healthCheck,
+			maxIdle:     maxIdle,
+			idleTimeout: idleTimeout,
+			skew:        identityBackendSkew,
+			now:         time.Now,
+			idle:        make(map[subjectid.IssSubID][]idleConn[B]),
+		},
+	}
+}
+
+// get leases a parked connection for the request's principal, dialing a fresh one
+// (credential exchange + connect + GSSAPI handshake) only on a pool miss. The
+// exchanger caches the credential, so a miss does not re-hit the exchange service.
+func (p *perIdentityKerbBackend[B]) get(ctx context.Context) (B, error) {
+	var zero B
+	id, ok := p.mailbox(ctx)
+	if !ok {
+		return zero, fmt.Errorf("per-identity kerberos backend: request is not authenticated")
+	}
+	issSub, ok := id.(subjectid.IssSubID)
+	if !ok {
+		return zero, fmt.Errorf("per-identity kerberos backend: identity format %q is not iss_sub", id.Format())
+	}
+	raw, ok := p.rawToken(ctx)
+	if !ok {
+		return zero, fmt.Errorf("per-identity kerberos backend: no bearer token on the request")
+	}
+	return p.pool.get(ctx, issSub, func() (B, time.Time, error) {
+		var zero B
+		cred, err := p.exchanger.Exchange(ctx, raw, p.target, kerb.OutputCCache)
+		if err != nil {
+			return zero, time.Time{}, fmt.Errorf("per-identity kerberos backend: credential exchange: %w", err)
+		}
+		backend, err := p.dial(issSub, cred)
+		if err != nil {
+			return zero, time.Time{}, fmt.Errorf("per-identity kerberos backend: dial: %w", err)
+		}
+		return backend, cred.Expiry(), nil
+	})
+}
+
+// identity returns the request's authenticated identity (see the OAuth twin).
+func (p *perIdentityKerbBackend[B]) identity(ctx context.Context) (subjectid.SubjectIdentifier, bool) {
+	return p.mailbox(ctx)
+}
+
 // mailIdentityProvider adapts a perIdentityBackend to server.MailProvider for
 // either JMAP or IMAP; proto labels which, for startup logging.
 type mailIdentityProvider struct {
-	p     *perIdentityBackend[mail.Backend]
+	p     identityBackend[mail.Backend]
 	proto string
 }
 
@@ -269,7 +378,7 @@ func (c calendarIdentityProvider) Calendar(ctx context.Context) (calendar.Backen
 // attendee address (MailboxAddress) is the authenticated principal's subject —
 // so the deployment should map -auth-subject-claim to the user's email (MB720-43).
 type schedulingIdentityProvider struct {
-	p *perIdentityBackend[smtp.Sender]
+	p identityBackend[smtp.Sender]
 }
 
 func (s schedulingIdentityProvider) Sender(ctx context.Context) (smtp.Sender, error) {
@@ -277,7 +386,7 @@ func (s schedulingIdentityProvider) Sender(ctx context.Context) (smtp.Sender, er
 }
 
 func (s schedulingIdentityProvider) MailboxAddress(ctx context.Context) (string, error) {
-	id, ok := s.p.mailbox(ctx)
+	id, ok := s.p.identity(ctx)
 	if !ok {
 		return "", fmt.Errorf("scheduling: request is not authenticated")
 	}

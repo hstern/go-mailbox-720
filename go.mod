@@ -36,6 +36,7 @@ require (
 	github.com/hstern/go-oauth2-kerberos-exchange v0.2.0
 	github.com/hstern/go-protected-resource-metadata v0.1.0
 	github.com/hstern/go-risc v0.2.0
+	github.com/hstern/go-sasl-gssapi v0.1.0
 	github.com/hstern/go-secevent v0.2.1
 	github.com/hstern/go-sieve v0.2.0
 	github.com/hstern/go-ssf v0.1.0
@@ -88,3 +89,10 @@ replace github.com/emersion/go-imap/v2 => github.com/hstern/go-imap/v2 v2.0.0-be
 // Fork adds client-side If-Match on caldav/carddav PUT + webdav.HTTPErrorCode (MB720-39);
 // PR'd upstream, drop the replace once merged.
 replace github.com/emersion/go-webdav => github.com/hstern/go-webdav v0.7.1-0.20260625191323-6c7cfde5c0a0
+
+// go-oauth2-kerberos-exchange needs krb5 v0.1.2 (PAC-marshal, pac.NewPAC) while
+// go-sasl-gssapi needs krb5 master (gssapi/krb5context); those trees had diverged.
+// master now carries both (the PAC-marshal stack was cherry-picked in), but stays
+// untagged to track upstream's versioning — so pin the master pseudo-version here.
+// Bump the pseudo-version as krb5 master advances.
+replace github.com/hstern/krb5 => github.com/hstern/krb5 v0.1.2-0.20260706001242-dc144bee7a4b

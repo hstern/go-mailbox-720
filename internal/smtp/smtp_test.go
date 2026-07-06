@@ -34,6 +34,10 @@ type recordingBackend struct {
 	// requireToken, when non-empty, makes the server advertise and require SASL
 	// OAUTHBEARER with this exact token instead of PLAIN.
 	requireToken string
+	// requireGSSAPIToken, when non-empty, makes the server advertise and require
+	// the test's fake single-round GSSAPI mechanism with this exact token. It lets
+	// us exercise the SASL GSSAPI dial branch (MB720-46) without real Kerberos.
+	requireGSSAPIToken string
 }
 
 func (b *recordingBackend) NewSession(_ *gosmtp.Conn) (gosmtp.Session, error) {
@@ -70,6 +74,9 @@ var (
 // (go-sasl ships only a PLAIN server implementation, so LOGIN cannot be
 // exercised server-side here.)
 func (s *recordingSession) AuthMechanisms() []string {
+	if s.be.requireGSSAPIToken != "" {
+		return []string{fakeGSSAPIMech}
+	}
 	if s.be.requireToken != "" {
 		return []string{sasl.OAuthBearer}
 	}
@@ -79,6 +86,12 @@ func (s *recordingSession) AuthMechanisms() []string {
 // Auth returns a server-side SASL handler that validates the credentials
 // against the backend's required user/pass (PLAIN) or token (OAUTHBEARER).
 func (s *recordingSession) Auth(mech string) (sasl.Server, error) {
+	if s.be.requireGSSAPIToken != "" {
+		if mech != fakeGSSAPIMech {
+			return nil, &gosmtp.SMTPError{Code: 504, Message: "unsupported auth mechanism"}
+		}
+		return &fakeGSSAPIServer{want: s.be.requireGSSAPIToken, onOK: func() { s.authenticated = true }}, nil
+	}
 	if s.be.requireToken != "" {
 		if mech != sasl.OAuthBearer {
 			return nil, &gosmtp.SMTPError{Code: 504, Message: "unsupported auth mechanism"}
@@ -108,7 +121,7 @@ func (s *recordingSession) checkCreds(username, password string) error {
 }
 
 func (s *recordingSession) Mail(from string, _ *gosmtp.MailOptions) error {
-	if s.be.requireUser != "" && !s.authenticated {
+	if (s.be.requireUser != "" || s.be.requireGSSAPIToken != "") && !s.authenticated {
 		return &gosmtp.SMTPError{Code: 530, Message: "authentication required"}
 	}
 	s.from = from
@@ -277,6 +290,87 @@ func TestSendWithOAuthBearer(t *testing.T) {
 				}
 				if !strings.Contains(err.Error(), "smtp: oauthbearer:") {
 					t.Errorf("Dial error = %v, want it to wrap %q", err, "smtp: oauthbearer:")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Dial: %v", err)
+			}
+			defer func() { _ = cl.Close() }()
+
+			from, to := "alice@example.com", []string{"bob@example.com"}
+			if err := cl.Send(context.Background(), from, to, []byte(sampleMessage)); err != nil {
+				t.Fatalf("Send: %v", err)
+			}
+			if got := be.recorded(); len(got) != 1 || got[0].from != from {
+				t.Fatalf("recorded %#v, want one message from %q", got, from)
+			}
+		})
+	}
+}
+
+// fakeGSSAPIMech is a stand-in single-round SASL mechanism advertised under the
+// GSSAPI name. It lets the tests drive the SASL GSSAPI dial branch (MB720-46)
+// without a KDC or real Kerberos crypto — the full RFC 4752 handshake is
+// exercised by the Docker e2e and by go-sasl-gssapi's own interop suite.
+const fakeGSSAPIMech = "GSSAPI"
+
+// fakeGSSAPIClient sends a fixed token as its initial response and expects the
+// server to accept in one round (no challenge). It satisfies sasl.Client so it
+// slots into Options.GSSAPIClient exactly like the real saslgssapi client.
+type fakeGSSAPIClient struct{ token string }
+
+func (c *fakeGSSAPIClient) Start() (mech string, ir []byte, err error) {
+	return fakeGSSAPIMech, []byte(c.token), nil
+}
+
+func (c *fakeGSSAPIClient) Next(challenge []byte) ([]byte, error) {
+	return nil, errors.New("fakeGSSAPIClient: unexpected server challenge")
+}
+
+// fakeGSSAPIServer accepts the initial response iff it equals want, in one round.
+type fakeGSSAPIServer struct {
+	want string
+	onOK func()
+}
+
+func (s *fakeGSSAPIServer) Next(response []byte) (challenge []byte, done bool, err error) {
+	if string(response) != s.want {
+		return nil, false, errors.New("gssapi: bad token")
+	}
+	s.onOK()
+	return nil, true, nil
+}
+
+func TestSendWithGSSAPI(t *testing.T) {
+	tests := []struct {
+		name    string
+		opts    *Options
+		wantErr bool
+	}{
+		{name: "valid ticket", opts: &Options{GSSAPIClient: &fakeGSSAPIClient{token: "krb-ticket"}}},
+		{name: "wrong ticket", opts: &Options{GSSAPIClient: &fakeGSSAPIClient{token: "nope"}}, wantErr: true},
+		{
+			// GSSAPI must take precedence over BearerToken: the server advertises
+			// only GSSAPI, so if the bearer path were taken the AUTH would fail.
+			name: "precedence over bearer",
+			opts: &Options{GSSAPIClient: &fakeGSSAPIClient{token: "krb-ticket"}, BearerToken: "unused"},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			be := &recordingBackend{requireGSSAPIToken: "krb-ticket"}
+			addr := startServer(t, be)
+
+			// Username/password are supplied but must be ignored on the GSSAPI path.
+			cl, err := Dial(addr, "ignored-user", "ignored-pass", tc.opts)
+			if tc.wantErr {
+				if err == nil {
+					_ = cl.Close()
+					t.Fatal("Dial: want auth error, got nil")
+				}
+				if !strings.Contains(err.Error(), "smtp: gssapi:") {
+					t.Errorf("Dial error = %v, want it to wrap %q", err, "smtp: gssapi:")
 				}
 				return
 			}
