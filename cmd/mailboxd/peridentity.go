@@ -49,11 +49,24 @@ const identityBackendSkew = 30 * time.Second
 //     handshake is amortized. See connPool.
 //
 // In every mode the token itself is cached by the exchanger, so a re-dial does not
-// re-hit the authorization server.
+// re-hit the authorization server. The mint field generalizes the credential
+// source: the default is the RFC 8693 token exchanger, but a caller can supply a
+// mint closure to use the OAuth2→Kerberos exchange instead (MB720-46/47/48),
+// producing a GSSAPI credential for a Kerberos/GSSAPI-only backend.
 type perIdentityBackend[B io.Closer] struct {
 	exchanger tokenexchange.Exchanger
 	audience  string
 	dial      func(id subjectid.IssSubID, token string) (B, error)
+
+	// mint, when non-nil, supersedes exchanger+audience: it produces the
+	// per-request credential secret and its expiry directly from the raw subject
+	// token. It is the seam for the second per-identity mechanism (MB720-46/47/48):
+	// the OAuth2→Kerberos path mints a base64 GSSAPI AP-REQ (for Authorization:
+	// Negotiate) where exchanger+audience mints an RFC 8693 access token (for
+	// Authorization: Bearer). The secret it returns is what dial receives; the
+	// expiry bounds the backend cache exactly as the exchanged token's does. When
+	// nil, get falls back to exchanger.Exchange(ctx, raw, audience).
+	mint func(ctx context.Context, raw string) (secret string, expiresAt time.Time, err error)
 
 	// mailbox and rawToken read the authenticated identity and bearer token from
 	// the request context. They default to auth.Mailbox / auth.RawToken and are
@@ -98,6 +111,25 @@ func newPerIdentityBackend[B io.Closer](exchanger tokenexchange.Exchanger, audie
 		skew:      identityBackendSkew,
 		now:       time.Now,
 		cache:     make(map[subjectid.IssSubID]identityEntry[B]),
+	}
+}
+
+// newPerIdentityKerberosBackend builds a CACHING per-identity provider whose
+// credential comes from the OAuth2→Kerberos exchange rather than RFC 8693 token
+// exchange (MB720-47 CalDAV/CardDAV over SPNEGO; MB720-48 JMAP). mint returns the
+// per-request credential secret (a base64 GSSAPI AP-REQ) and its expiry; the rest
+// of the machinery — the per-principal backend cache keyed to that expiry — is the
+// same as newPerIdentityBackend. Use it only for backends whose Close is a no-op
+// (stateless HTTP DAV/JMAP); see the type doc.
+func newPerIdentityKerberosBackend[B io.Closer](mint func(ctx context.Context, raw string) (string, time.Time, error), dial func(id subjectid.IssSubID, token string) (B, error)) *perIdentityBackend[B] {
+	return &perIdentityBackend[B]{
+		mint:     mint,
+		dial:     dial,
+		mailbox:  auth.Mailbox,
+		rawToken: auth.RawToken,
+		skew:     identityBackendSkew,
+		now:      time.Now,
+		cache:    make(map[subjectid.IssSubID]identityEntry[B]),
 	}
 }
 
@@ -165,6 +197,21 @@ func newPerIdentityPool[B io.Closer](exchanger tokenexchange.Exchanger, audience
 	}
 }
 
+// exchange mints the per-request credential for raw: via the mint closure when
+// set (the OAuth2→Kerberos path), else the RFC 8693 token exchanger. It returns
+// the secret handed to dial and the expiry that bounds the backend cache. Both
+// sources cache internally, so a re-dial does not re-hit the exchange service.
+func (p *perIdentityBackend[B]) exchange(ctx context.Context, raw string) (string, time.Time, error) {
+	if p.mint != nil {
+		return p.mint(ctx, raw)
+	}
+	tok, err := p.exchanger.Exchange(ctx, raw, p.audience)
+	if err != nil {
+		return "", time.Time{}, err
+	}
+	return tok.AccessToken, tok.ExpiresAt, nil
+}
+
 // get resolves the request's backend: a cached one for the principal when its
 // token is still fresh, else a freshly exchanged-and-dialed one. In pooling mode
 // it leases a parked connection (or dials one), reusing it across requests.
@@ -187,20 +234,20 @@ func (p *perIdentityBackend[B]) get(ctx context.Context) (B, error) {
 	now := p.now()
 
 	// Pooling mode: lease a parked connection for the principal, dialing a fresh
-	// one (exchange + connect) only on a pool miss. The exchanger still caches the
-	// token, so a miss does not re-hit the authorization server.
+	// one (exchange + connect) only on a pool miss. The exchange still caches the
+	// credential, so a miss does not re-hit the authorization server.
 	if p.pool != nil {
 		return p.pool.get(ctx, issSub, func() (B, time.Time, error) {
 			var zero B
-			tok, err := p.exchanger.Exchange(ctx, raw, p.audience)
+			secret, expiresAt, err := p.exchange(ctx, raw)
 			if err != nil {
-				return zero, time.Time{}, fmt.Errorf("per-identity backend: token exchange: %w", err)
+				return zero, time.Time{}, fmt.Errorf("per-identity backend: credential exchange: %w", err)
 			}
-			backend, err := p.dial(issSub, tok.AccessToken)
+			backend, err := p.dial(issSub, secret)
 			if err != nil {
 				return zero, time.Time{}, fmt.Errorf("per-identity backend: dial: %w", err)
 			}
-			return backend, tok.ExpiresAt, nil
+			return backend, expiresAt, nil
 		})
 	}
 
@@ -213,21 +260,21 @@ func (p *perIdentityBackend[B]) get(ctx context.Context) (B, error) {
 		p.mu.Unlock()
 	}
 
-	// Miss (or no-cache): exchange (the exchanger caches the token) and dial,
+	// Miss (or no-cache): exchange (the exchange caches the credential) and dial,
 	// outside the lock so a slow backend does not block cache reads for others.
-	tok, err := p.exchanger.Exchange(ctx, raw, p.audience)
+	secret, expiresAt, err := p.exchange(ctx, raw)
 	if err != nil {
-		return zero, fmt.Errorf("per-identity backend: token exchange: %w", err)
+		return zero, fmt.Errorf("per-identity backend: credential exchange: %w", err)
 	}
-	backend, err := p.dial(issSub, tok.AccessToken)
+	backend, err := p.dial(issSub, secret)
 	if err != nil {
 		return zero, fmt.Errorf("per-identity backend: dial: %w", err)
 	}
-	// Cache only when caching is enabled and the token has a known expiry; a
-	// lifetime-less token cannot be invalidated on time, so re-dial each request.
-	if !p.noCache && !tok.ExpiresAt.IsZero() {
+	// Cache only when caching is enabled and the credential has a known expiry; a
+	// lifetime-less one cannot be invalidated on time, so re-dial each request.
+	if !p.noCache && !expiresAt.IsZero() {
 		p.mu.Lock()
-		p.cache[issSub] = identityEntry[B]{backend: backend, expiresAt: tok.ExpiresAt}
+		p.cache[issSub] = identityEntry[B]{backend: backend, expiresAt: expiresAt}
 		p.mu.Unlock()
 	}
 	return backend, nil
