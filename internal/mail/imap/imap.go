@@ -46,6 +46,14 @@ type Options struct {
 	// Dial username becomes the OAUTHBEARER authorization identity and the Dial
 	// password is ignored.
 	BearerToken string
+	// GSSAPIClient, when non-nil, authenticates with SASL GSSAPI (RFC 4752) using
+	// this pre-built mechanism instead of OAUTHBEARER/LOGIN — the Kerberos
+	// per-identity path (MB720-46), where the client carries the user's own
+	// Kerberos ticket (built by the caller from the exchanged ccache). It takes
+	// precedence over BearerToken; the Dial username/password are ignored (the
+	// authenticated principal is the ticket's). GSSAPI auth-only mode carries no
+	// confidentiality, so it must run over TLS.
+	GSSAPIClient sasl.Client
 }
 
 // ManageSieveOptions configures the ManageSieve connection used for inbox rules. It
@@ -130,7 +138,7 @@ func Dial(addr, username, password string, o *Options) (*Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("imap: dial %s: %w", addr, err)
 	}
-	if err := authenticate(c, addr, username, password, o.BearerToken); err != nil {
+	if err := authenticate(c, addr, username, password, o.BearerToken, o.GSSAPIClient); err != nil {
 		_ = c.Close()
 		return nil, err
 	}
@@ -149,10 +157,18 @@ func Dial(addr, username, password string, o *Options) (*Client, error) {
 	return cl, nil
 }
 
-// authenticate logs in to the IMAP connection: SASL OAUTHBEARER (RFC 7628) when a
-// bearer token is supplied — the per-identity path, where username is the
-// authorization identity and password is ignored — else the IMAP LOGIN command.
-func authenticate(c *imapclient.Client, addr, username, password, bearer string) error {
+// authenticate logs in to the IMAP connection: SASL GSSAPI (RFC 4752) when a
+// GSSAPI mechanism is supplied (the Kerberos per-identity path, MB720-46), else
+// SASL OAUTHBEARER (RFC 7628) when a bearer token is supplied — the per-identity
+// path, where username is the authorization identity and password is ignored —
+// else the IMAP LOGIN command.
+func authenticate(c *imapclient.Client, addr, username, password, bearer string, gssapi sasl.Client) error {
+	if gssapi != nil {
+		if err := c.Authenticate(gssapi); err != nil {
+			return fmt.Errorf("imap: gssapi: %w", err)
+		}
+		return nil
+	}
 	if bearer != "" {
 		host, port := splitAddr(addr)
 		sc := sasl.NewOAuthBearerClient(&sasl.OAuthBearerOptions{

@@ -145,6 +145,24 @@ jobs:
       - name: Kerberos exchange e2e (kerbexchanged + internal/kerbexchange)
         run: go test -tags kerberos_e2e -timeout 300s -run TestKerberosExchangeEndToEnd ./internal/kerbexchange/...
 
+  kerberos-gssapi-e2e:
+    # Exercises the per-identity SASL GSSAPI path (MB720-46) end to end against a
+    # REAL GSSAPI-speaking IMAP server: a stock Dovecot (which ships the GSSAPI auth
+    # mechanism) with a Kerberos service keytab. kerbexchanged mints the user's
+    # ticket offline (holder-of-key), the internal IMAP adapter authenticates with
+    # the go-sasl-gssapi client, and Dovecot accepts it. No live KDC — kerbexchanged
+    # and Dovecot share one service keytab. Docker is available on GitHub runners.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Per-identity SASL GSSAPI e2e (real Dovecot)
+        run: go test -tags dockertest -timeout 300s ./test/e2e-kerberos/
+
   mail-imap-e2e:
     # Runs the IMAP adapter against a real Dovecot server in Docker (build tag
     # dockertest), validating real-server behaviour the in-process memserver

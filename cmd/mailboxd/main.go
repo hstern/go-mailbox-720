@@ -28,9 +28,12 @@ import (
 	_ "time/tzdata"
 
 	clientauthn "github.com/hstern/go-oauth-client-authn"
+	kerb "github.com/hstern/go-oauth2-kerberos-exchange"
+	saslgssapi "github.com/hstern/go-sasl-gssapi"
 	"github.com/hstern/go-ssf/receiver"
 	subjectid "github.com/hstern/go-subjectid"
 	rfc8693 "github.com/hstern/go-token-exchange"
+	"github.com/hstern/krb5/credentials"
 
 	"github.com/hstern/go-mailbox-720/internal/auth"
 	"github.com/hstern/go-mailbox-720/internal/batch"
@@ -72,6 +75,7 @@ func main() {
 	imapUser := flag.String("mail-imap-username", "", "IMAP username for the mail backend")
 	imapTLS := flag.Bool("mail-imap-tls", true, "use implicit TLS for the IMAP connection")
 	mailIMAPAudience := flag.String("mail-imap-audience", "", "RFC 8693 audience to request for the IMAP mail backend (MB720-43). When set together with -tokenexchange-endpoint, IMAP authenticates per-identity via SASL OAUTHBEARER (the OAUTHBEARER username is the authenticated subject) instead of -mail-imap-username/MAILBOXD_IMAP_PASSWORD")
+	mailIMAPSPN := flag.String("mail-imap-spn", "", "Kerberos service principal (SPN, e.g. imap/mail.example.com@EXAMPLE.COM) for the IMAP mail backend (MB720-46). When set together with -kerbexchange-endpoint, IMAP authenticates per-identity via SASL GSSAPI with the user's own Kerberos ticket. Mutually exclusive with -mail-imap-audience")
 	sieveAddr := flag.String("mail-managesieve-addr", "", "ManageSieve server host:port (RFC 5804) for inbox rules on the IMAP tier (empty: mail-filter operations return 501; SASL PLAIN reuses the IMAP username and MAILBOXD_IMAP_PASSWORD)")
 	sieveTLS := flag.Bool("mail-managesieve-starttls", true, "use STARTTLS on the ManageSieve connection (RFC 5804 §2.2); disabling it sends the SASL PLAIN credentials in the clear — for local servers only")
 	jmapSession := flag.String("mail-jmap-session-url", "", "JMAP session resource URL for the mail backend (empty: use IMAP, or return 501 if neither set; access token from MAILBOXD_JMAP_TOKEN). Takes precedence over the IMAP flags when set")
@@ -95,6 +99,7 @@ func main() {
 	smtpStartTLS := flag.Bool("smtp-starttls", true, "use STARTTLS (submission, port 587) for SMTP; ignored when -smtp-tls is set")
 	mailboxEmail := flag.String("mailbox-email", "", "the mailbox owner's email, used as the responding attendee when accepting/declining meetings")
 	smtpAudience := flag.String("smtp-audience", "", "RFC 8693 audience to request for the SMTP submission backend (MB720-43). When set together with -tokenexchange-endpoint, SMTP authenticates per-identity via SASL OAUTHBEARER and the responding attendee is the authenticated subject, instead of -smtp-username/MAILBOXD_SMTP_PASSWORD/-mailbox-email")
+	smtpSPN := flag.String("smtp-spn", "", "Kerberos service principal (SPN, e.g. smtp/mail.example.com@EXAMPLE.COM) for the SMTP submission backend (MB720-46). When set together with -kerbexchange-endpoint, SMTP authenticates per-identity via SASL GSSAPI with the user's own Kerberos ticket and the responding attendee is the authenticated subject. Mutually exclusive with -smtp-audience")
 	flag.Parse()
 
 	// The revocation store is the receiver's sink AND the middleware's revocation
@@ -146,12 +151,37 @@ func main() {
 	} else {
 		log.Println("kerberos exchange: disabled")
 	}
-	_ = kerbExchanger // consumed by per-identity GSSAPI providers in MB720-46/47/48
 	// A per-identity audience without an exchange endpoint is a misconfiguration:
 	// the backend would silently fall back to the shared static token, serving every
 	// authenticated user from one account. Fail loudly rather than leak across tenants.
 	if exchanger == nil && (*mailJMAPAudience != "" || *contactsJMAPAudience != "" || *mailIMAPAudience != "" || *smtpAudience != "" || *caldavAudience != "" || *carddavAudience != "") {
 		log.Fatalln("mailboxd: the -*-audience flags require -tokenexchange-endpoint (per-identity backends need the token exchange)")
+	}
+	// The GSSAPI counterpart: a Kerberos SPN without the kerberos exchanger would
+	// likewise fall back to a shared static credential, leaking across tenants.
+	if kerbExchanger == nil && (*mailIMAPSPN != "" || *smtpSPN != "") {
+		log.Fatalln("mailboxd: the -*-spn flags require -kerbexchange-endpoint (per-identity GSSAPI backends need the Kerberos exchange)")
+	}
+	// A backend authenticates with exactly one per-identity mechanism: OAUTHBEARER
+	// (audience) or GSSAPI (SPN), never both.
+	if *mailIMAPSPN != "" && *mailIMAPAudience != "" {
+		log.Fatalln("mailboxd: -mail-imap-spn and -mail-imap-audience are mutually exclusive (pick GSSAPI or OAUTHBEARER for the IMAP backend)")
+	}
+	if *smtpSPN != "" && *smtpAudience != "" {
+		log.Fatalln("mailboxd: -smtp-spn and -smtp-audience are mutually exclusive (pick GSSAPI or OAUTHBEARER for the SMTP backend)")
+	}
+	// Parse the SPNs once at startup so a malformed principal fails loudly here
+	// rather than on the first request.
+	var imapSPN, smtpSPNParsed kerb.ServicePrincipal
+	if *mailIMAPSPN != "" {
+		if imapSPN, err = kerb.ParseServicePrincipal(*mailIMAPSPN); err != nil {
+			log.Fatalln("mailboxd: -mail-imap-spn:", err)
+		}
+	}
+	if *smtpSPN != "" {
+		if smtpSPNParsed, err = kerb.ParseServicePrincipal(*smtpSPN); err != nil {
+			log.Fatalln("mailboxd: -smtp-spn:", err)
+		}
 	}
 
 	// poolHooks collects the reaper + shutdown-drain of any connection pools wired
@@ -191,6 +221,21 @@ func main() {
 			}, imapPoolOptions())
 		poolHooks = append(poolHooks, connPoolHook{reap: imapPool.pool.reap, closeAll: imapPool.pool.closeAll})
 		provider = mailIdentityProvider{proto: "IMAP", p: imapPool}
+	case *imapAddr != "" && kerbExchanger != nil && *mailIMAPSPN != "":
+		// Per-identity Kerberos (MB720-46): SASL GSSAPI with the user's own ticket,
+		// exchanged for a ccache against the IMAP SPN. Pooled like the OAUTHBEARER
+		// path — the pool amortizes the connect + TLS + GSSAPI handshake.
+		addr, tls, spn := *imapAddr, *imapTLS, imapSPN
+		imapPool := newPerIdentityKerbPool(kerbExchanger, spn,
+			func(id subjectid.IssSubID, cred *kerb.Credential) (mail.Backend, error) {
+				sc, err := gssapiClient(cred, spn, id.Sub)
+				if err != nil {
+					return nil, err
+				}
+				return imap.Dial(addr, id.Sub, "", &imap.Options{TLS: tls, GSSAPIClient: sc})
+			}, imapPoolOptions())
+		poolHooks = append(poolHooks, connPoolHook{reap: imapPool.pool.reap, closeAll: imapPool.pool.closeAll})
+		provider = mailIdentityProvider{proto: "IMAP+GSSAPI", p: imapPool}
 	case *imapAddr != "":
 		provider = staticIMAPProvider{
 			addr:      *imapAddr,
@@ -278,6 +323,21 @@ func main() {
 		smtpPool := newPerIdentityPool(exchanger, *smtpAudience,
 			func(id subjectid.IssSubID, token string) (smtp.Sender, error) {
 				return smtp.Dial(addr, id.Sub, "", &smtp.Options{TLS: tls, StartTLS: startTLS, BearerToken: token})
+			}, smtpPoolOptions())
+		poolHooks = append(poolHooks, connPoolHook{reap: smtpPool.pool.reap, closeAll: smtpPool.pool.closeAll})
+		schedProvider = schedulingIdentityProvider{smtpPool}
+	case *smtpAddr != "" && kerbExchanger != nil && *smtpSPN != "":
+		// Per-identity Kerberos (MB720-46): SASL GSSAPI with the user's own ticket,
+		// exchanged for a ccache against the SMTP SPN; the responding attendee is the
+		// authenticated subject, as on the OAUTHBEARER path.
+		addr, tls, startTLS, spn := *smtpAddr, *smtpTLS, *smtpStartTLS, smtpSPNParsed
+		smtpPool := newPerIdentityKerbPool(kerbExchanger, spn,
+			func(id subjectid.IssSubID, cred *kerb.Credential) (smtp.Sender, error) {
+				sc, err := gssapiClient(cred, spn, id.Sub)
+				if err != nil {
+					return nil, err
+				}
+				return smtp.Dial(addr, id.Sub, "", &smtp.Options{TLS: tls, StartTLS: startTLS, GSSAPIClient: sc})
 			}, smtpPoolOptions())
 		poolHooks = append(poolHooks, connPoolHook{reap: smtpPool.pool.reap, closeAll: smtpPool.pool.closeAll})
 		schedProvider = schedulingIdentityProvider{smtpPool}
@@ -890,6 +950,37 @@ func startScheduler(ctx context.Context, provider server.MailProvider, calProvid
 			log.Println("scheduling: trigger stopped:", err)
 		}
 	}()
+}
+
+// gssapiClient turns a Kerberos credential (an MIT ccache minted by kerbexchange
+// for the authenticated user) into a SASL GSSAPI client (MB720-46): it unmarshals
+// the ccache into a holder-of-key krb5 client and wraps it as the go-sasl-gssapi
+// mechanism targeting spn, authenticating as authzID (the user's subject). The
+// returned client is single-use — one per dial — which is why the pool parks the
+// authenticated connection rather than the client.
+func gssapiClient(cred *kerb.Credential, spn kerb.ServicePrincipal, authzID string) (*saslgssapi.Client, error) {
+	b, err := cred.CCache()
+	if err != nil {
+		return nil, fmt.Errorf("gssapi: ccache: %w", err)
+	}
+	var cc credentials.CCache
+	if err := cc.Unmarshal(b); err != nil {
+		return nil, fmt.Errorf("gssapi: parse ccache: %w", err)
+	}
+	kc, err := saslgssapi.FromCCache(&cc)
+	if err != nil {
+		return nil, fmt.Errorf("gssapi: client from ccache: %w", err)
+	}
+	// Service is the realm-less "service/host": the holder-of-key ccache lookup
+	// keys tickets by their realm-less principal string, so passing spn.String()
+	// (which appends @REALM) would miss the cached ticket and fall back to a live
+	// KDC exchange, which a holder-of-key credential cannot do. The realm travels
+	// with the cached ticket, not with the target name.
+	sc, err := saslgssapi.NewClient(saslgssapi.Config{Client: kc, Service: spn.Service + "/" + spn.Host, AuthzID: authzID})
+	if err != nil {
+		return nil, fmt.Errorf("gssapi: new client: %w", err)
+	}
+	return sc, nil
 }
 
 // buildExchanger constructs the RFC 8693 token-exchange helper per-identity

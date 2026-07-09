@@ -146,6 +146,127 @@ func TestDialOAuthBearer(t *testing.T) {
 	})
 }
 
+// fakeGSSAPIMech is a stand-in single-round SASL mechanism advertised under the
+// GSSAPI name, so the tests can drive the SASL GSSAPI dial branch (MB720-46)
+// without a KDC or real Kerberos crypto — the full RFC 4752 handshake is covered
+// by the Docker e2e and go-sasl-gssapi's own interop suite.
+const fakeGSSAPIMech = "GSSAPI"
+
+// fakeGSSAPIClient sends a fixed token as its initial response and expects the
+// server to accept in one round. It satisfies sasl.Client, so it slots into
+// Options.GSSAPIClient exactly like the real saslgssapi client.
+type fakeGSSAPIClient struct{ token string }
+
+func (c *fakeGSSAPIClient) Start() (mech string, ir []byte, err error) {
+	return fakeGSSAPIMech, []byte(c.token), nil
+}
+
+func (c *fakeGSSAPIClient) Next(challenge []byte) ([]byte, error) {
+	return nil, errors.New("fakeGSSAPIClient: unexpected server challenge")
+}
+
+// fakeGSSAPIServer accepts the initial response iff it equals want, in one round,
+// then binds the memserver user via onOK.
+type fakeGSSAPIServer struct {
+	want string
+	onOK func() error
+}
+
+func (s *fakeGSSAPIServer) Next(response []byte) (challenge []byte, done bool, err error) {
+	if string(response) != s.want {
+		return nil, false, errors.New("gssapi: bad token")
+	}
+	if err := s.onOK(); err != nil {
+		return nil, false, err
+	}
+	return nil, true, nil
+}
+
+// gssapiSession wraps a memserver session to add the fake SASL GSSAPI mechanism:
+// it validates the token, then binds the memserver user via Login.
+type gssapiSession struct {
+	imapserver.Session
+	token string
+}
+
+func (s *gssapiSession) AuthenticateMechanisms() []string { return []string{fakeGSSAPIMech} }
+
+func (s *gssapiSession) Authenticate(mech string) (sasl.Server, error) {
+	if mech != fakeGSSAPIMech {
+		return nil, imapserver.ErrAuthFailed
+	}
+	return &fakeGSSAPIServer{want: s.token, onOK: func() error { return s.Login(testUser, testPass) }}, nil
+}
+
+// newMemoryIMAPGSSAPI starts an in-process IMAP server (one user, one INBOX
+// message) that authenticates with the fake SASL GSSAPI mechanism requiring token.
+func newMemoryIMAPGSSAPI(t *testing.T, token string) string {
+	t.Helper()
+	memServer := imapmemserver.New()
+	user := imapmemserver.NewUser(testUser, testPass)
+	if err := user.Create("INBOX", nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := user.Append("INBOX", strings.NewReader(testRawMessage), &goimap.AppendOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	memServer.AddUser(user)
+
+	srv := imapserver.New(&imapserver.Options{
+		NewSession: func(*imapserver.Conn) (imapserver.Session, *imapserver.GreetingData, error) {
+			return &gssapiSession{Session: memServer.NewSession(), token: token}, nil, nil
+		},
+		InsecureAuth: true,
+	})
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() { _ = srv.Serve(ln) }()
+	t.Cleanup(func() { _ = srv.Close(); _ = ln.Close() })
+	return ln.Addr().String()
+}
+
+func TestDialGSSAPI(t *testing.T) {
+	addr := newMemoryIMAPGSSAPI(t, "krb-ticket")
+
+	t.Run("valid ticket", func(t *testing.T) {
+		cl, err := Dial(addr, "ignored", "ignored", &Options{TLS: false, GSSAPIClient: &fakeGSSAPIClient{token: "krb-ticket"}})
+		if err != nil {
+			t.Fatalf("Dial with GSSAPI: %v", err)
+		}
+		defer func() { _ = cl.Close() }()
+		folders, err := cl.ListMailFolders(context.Background())
+		if err != nil {
+			t.Fatalf("ListMailFolders after GSSAPI: %v", err)
+		}
+		if len(folders) == 0 {
+			t.Error("no folders after GSSAPI login")
+		}
+	})
+
+	t.Run("wrong ticket", func(t *testing.T) {
+		cl, err := Dial(addr, "ignored", "", &Options{TLS: false, GSSAPIClient: &fakeGSSAPIClient{token: "nope"}})
+		if err == nil {
+			_ = cl.Close()
+			t.Fatal("Dial with a bad ticket: want auth error, got nil")
+		}
+		if !strings.Contains(err.Error(), "imap: gssapi:") {
+			t.Errorf("Dial error = %v, want it to wrap %q", err, "imap: gssapi:")
+		}
+	})
+
+	t.Run("precedence over bearer", func(t *testing.T) {
+		// The server advertises only GSSAPI, so if the bearer path were taken the
+		// AUTH would fail — success proves GSSAPI wins over BearerToken.
+		cl, err := Dial(addr, "ignored", "", &Options{TLS: false, GSSAPIClient: &fakeGSSAPIClient{token: "krb-ticket"}, BearerToken: "unused"})
+		if err != nil {
+			t.Fatalf("Dial with GSSAPI+bearer: %v", err)
+		}
+		_ = cl.Close()
+	})
+}
+
 func TestSplitAddr(t *testing.T) {
 	tests := []struct {
 		addr     string
