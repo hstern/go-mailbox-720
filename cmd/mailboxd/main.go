@@ -971,7 +971,12 @@ func gssapiClient(cred *kerb.Credential, spn kerb.ServicePrincipal, authzID stri
 	if err != nil {
 		return nil, fmt.Errorf("gssapi: client from ccache: %w", err)
 	}
-	sc, err := saslgssapi.NewClient(saslgssapi.Config{Client: kc, Service: spn.String(), AuthzID: authzID})
+	// Service is the realm-less "service/host": the holder-of-key ccache lookup
+	// keys tickets by their realm-less principal string, so passing spn.String()
+	// (which appends @REALM) would miss the cached ticket and fall back to a live
+	// KDC exchange, which a holder-of-key credential cannot do. The realm travels
+	// with the cached ticket, not with the target name.
+	sc, err := saslgssapi.NewClient(saslgssapi.Config{Client: kc, Service: spn.Service + "/" + spn.Host, AuthzID: authzID})
 	if err != nil {
 		return nil, fmt.Errorf("gssapi: new client: %w", err)
 	}
