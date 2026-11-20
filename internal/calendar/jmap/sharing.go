@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"slices"
+	"strings"
 
 	gojmap "git.sr.ht/~rockorager/go-jmap"
 
@@ -155,8 +156,9 @@ func (cl *Client) GetCalendarPermission(ctx context.Context, calendarID, permiss
 	return calendar.Permission{}, calendar.ErrPermissionNotFound
 }
 
-// CreateCalendarPermission resolves the grantee email to a principal, then adds it
-// to the calendar's shareWith with the rights for the requested role.
+// CreateCalendarPermission resolves the grantee email to a principal, then grants
+// the rights for the requested role on the calendar's shareWith. The returned
+// Permission is the stored grant as a later GET would return it.
 func (cl *Client) CreateCalendarPermission(ctx context.Context, calendarID string, p calendar.Permission) (calendar.Permission, error) {
 	rights, err := rightsForRole(p.Role)
 	if err != nil {
@@ -169,14 +171,12 @@ func (cl *Client) CreateCalendarPermission(ctx context.Context, calendarID strin
 	if err := cl.setShare(ctx, calendarID, pid, rights, false); err != nil {
 		return calendar.Permission{}, err
 	}
-	p.ID = string(pid)
-	p.Role = rightsToRole(rights)
-	p.AllowedRoles = allowedRoles()
-	p.IsRemovable = true
-	return p, nil
+	return cl.GetCalendarPermission(ctx, calendarID, string(pid))
 }
 
-// UpdateCalendarPermission changes the rights of an existing grant (id = principal id).
+// UpdateCalendarPermission changes the role of an existing grant (id = principal
+// id); only p.Role is used. The returned Permission is the stored grant as a later
+// GET would return it.
 func (cl *Client) UpdateCalendarPermission(ctx context.Context, calendarID, permissionID string, p calendar.Permission) (calendar.Permission, error) {
 	rights, err := rightsForRole(p.Role)
 	if err != nil {
@@ -185,11 +185,7 @@ func (cl *Client) UpdateCalendarPermission(ctx context.Context, calendarID, perm
 	if err := cl.setShare(ctx, calendarID, gojmap.ID(permissionID), rights, true); err != nil {
 		return calendar.Permission{}, err
 	}
-	p.ID = permissionID
-	p.Role = rightsToRole(rights)
-	p.AllowedRoles = allowedRoles()
-	p.IsRemovable = true
-	return p, nil
+	return cl.GetCalendarPermission(ctx, calendarID, permissionID)
 }
 
 // DeleteCalendarPermission revokes a grant by removing the principal from shareWith.
@@ -212,7 +208,7 @@ func (cl *Client) getShared(ctx context.Context, calendarID string) (*jmapCalend
 		return nil, fmt.Errorf("jmap: unexpected response %T for Calendar/get", args)
 	}
 	if len(resp.List) == 0 {
-		return nil, fmt.Errorf("jmap: calendar %q not found", calendarID)
+		return nil, calendar.ErrCalendarNotFound
 	}
 	return resp.List[0], nil
 }
@@ -252,38 +248,38 @@ func (cl *Client) resolvePrincipal(ctx context.Context, email string) (gojmap.ID
 	return resp.IDs[0], nil
 }
 
-// setShare read-modify-writes the calendar's shareWith map in one round-trip,
-// setting (or, when rights is nil, removing) the grant for one principal. When
-// requireExisting is set, a missing principal yields ErrPermissionNotFound (the
-// update/revoke paths), so the not-found check sees the same snapshot it writes. The
-// whole map is written back, since Calendar/set replaces shareWith; concurrent
-// writers are last-write-wins, consistent with the mail-filter tier.
+// jsonPointerEscape escapes a path segment per RFC 6901 for a JMAP PatchObject key.
+func jsonPointerEscape(seg string) string {
+	return strings.ReplaceAll(strings.ReplaceAll(seg, "~", "~0"), "/", "~1")
+}
+
+// setShare sets (or, when rights is nil, removes) the grant for one principal with
+// a per-principal PatchObject on shareWith ("shareWith/<pid>"), so concurrent
+// writers touching other grantees cannot clobber or resurrect each other's
+// entries. The granted rights are normalised to satisfy the mayWriteAll
+// implication Stalwart 1.x enforces. When requireExisting is set (update/revoke),
+// a missing principal yields ErrPermissionNotFound.
 func (cl *Client) setShare(ctx context.Context, calendarID string, pid gojmap.ID, rights *calendarRights, requireExisting bool) error {
-	cal, err := cl.getShared(ctx, calendarID)
-	if err != nil {
-		return err
+	if requireExisting {
+		cal, err := cl.getShared(ctx, calendarID)
+		if err != nil {
+			return err
+		}
+		if _, ok := cal.ShareWith[pid]; !ok {
+			return calendar.ErrPermissionNotFound
+		}
 	}
-	share := cal.ShareWith
-	if share == nil {
-		share = map[gojmap.ID]*calendarRights{}
-	}
-	// Calendar/set replaces shareWith wholesale and Stalwart 1.x validates every
-	// entry, so one stored entry violating the mayWriteAll implication (e.g. made
-	// directly in Stalwart) would make every sharing change on the calendar fail.
-	for _, r := range share {
-		normalizeRights(r)
-	}
-	if _, ok := share[pid]; requireExisting && !ok {
-		return calendar.ErrPermissionNotFound
-	}
-	if rights == nil {
-		delete(share, pid)
-	} else {
-		share[pid] = rights
+	var value any // nil marshals to JSON null: remove the grant
+	if rights != nil {
+		r := *rights
+		normalizeRights(&r)
+		value = r
 	}
 	args, err := cl.do(ctx, &calendarSet{
 		Account: cl.accountID,
-		Update:  map[gojmap.ID]map[string]any{gojmap.ID(calendarID): {"shareWith": share}},
+		Update: map[gojmap.ID]map[string]any{
+			gojmap.ID(calendarID): {"shareWith/" + jsonPointerEscape(string(pid)): value},
+		},
 	})
 	if err != nil {
 		return err
@@ -293,6 +289,14 @@ func (cl *Client) setShare(ctx context.Context, calendarID string, pid gojmap.ID
 		return fmt.Errorf("jmap: unexpected response %T for Calendar/set", args)
 	}
 	if se := resp.NotUpdated[gojmap.ID(calendarID)]; se != nil {
+		switch se.Type {
+		case "notFound":
+			return calendar.ErrCalendarNotFound
+		case "invalidProperties", "forbidden":
+			// e.g. sharing a calendar with its own owner. The server's description
+			// is intentionally dropped (it is backend text, not for the client).
+			return calendar.ErrInvalidGrantee
+		}
 		return fmt.Errorf("jmap: calendar shareWith not updated: %s", se.Type)
 	}
 	return nil

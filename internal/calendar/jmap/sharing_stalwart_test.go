@@ -74,6 +74,11 @@ func TestStalwartCalendarSharing(t *testing.T) {
 		t.Errorf("AllowedRoles not populated: created=%v listed=%v", created.AllowedRoles, found.AllowedRoles)
 	}
 
+	// Sharing with the calendar's own owner is refused with a typed error.
+	if _, err := cl.CreateCalendarPermission(ctx, calID, calendar.Permission{Email: login, Role: calendar.RoleRead}); !errors.Is(err, calendar.ErrInvalidGrantee) {
+		t.Errorf("owner self-share err = %v, want ErrInvalidGrantee", err)
+	}
+
 	// Roles the JMAP tier cannot enforce are refused, not downgraded.
 	for _, role := range []calendar.PermissionRole{calendar.RoleDelegatePrivate, calendar.RoleLimitedRead} {
 		if _, err := cl.UpdateCalendarPermission(ctx, calID, created.ID, calendar.Permission{Role: role}); !errors.Is(err, calendar.ErrRoleNotAllowed) {
@@ -99,7 +104,7 @@ func TestStalwartCalendarSharing(t *testing.T) {
 	if err := cl.DeleteCalendarPermission(ctx, calID, created.ID); err != nil {
 		t.Fatalf("DeleteCalendarPermission: %v", err)
 	}
-	if perms, _ := cl.ListCalendarPermissions(ctx, calID); len(perms) != 0 {
-		t.Errorf("after delete, still shared: %+v", perms)
+	if perms, err := cl.ListCalendarPermissions(ctx, calID); err != nil || len(perms) != 0 {
+		t.Errorf("after delete: %+v, %v; want no grants", perms, err)
 	}
 }

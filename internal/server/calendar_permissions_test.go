@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"reflect"
+	"strings"
 	"testing"
 
 	ht "github.com/ogen-go/ogen/http"
@@ -203,39 +205,52 @@ func TestCalendarPermissionsNotImplemented(t *testing.T) {
 	}
 }
 
-// roleNormalizingBackend mimics an adapter whose read-back role differs from the
-// requested one (as the JMAP tier's rights-to-role inference can), and refuses
-// limitedRead like the JMAP adapter.
-type roleNormalizingBackend struct{ permCalendarBackend }
-
-func (b *roleNormalizingBackend) norm(p calendar.Permission) (calendar.Permission, error) {
-	switch p.Role {
-	case calendar.RoleLimitedRead:
-		return p, fmt.Errorf("%w: %q", calendar.ErrRoleNotAllowed, p.Role)
-	case calendar.RoleDelegatePrivate:
-		p.Role = calendar.RoleWrite
-	}
-	return p, nil
+// storedBackend mimics the JMAP adapter's observable behaviour: it validates the
+// role (refusing limitedRead like the real adapter), resolves the grantee to a
+// canonical email/name, and returns the stored grant from Create/Update, as a later
+// GET would. It counts writes and can be told to fail with a sentinel.
+type storedBackend struct {
+	permCalendarBackend
+	writes  int
+	failErr error
 }
 
-func (b *roleNormalizingBackend) CreateCalendarPermission(ctx context.Context, cal string, p calendar.Permission) (calendar.Permission, error) {
-	p, err := b.norm(p)
-	if err != nil {
-		return calendar.Permission{}, err
-	}
-	return b.permCalendarBackend.CreateCalendarPermission(ctx, cal, p)
+func (b *storedBackend) stored(p calendar.Permission) calendar.Permission {
+	p.Email = "bob@example.com"
+	p.Name = "Bob Builder"
+	p.AllowedRoles = []calendar.PermissionRole{calendar.RoleNone, calendar.RoleFreeBusyRead, calendar.RoleRead, calendar.RoleWrite}
+	p.IsRemovable = true
+	return p
 }
 
-func (b *roleNormalizingBackend) UpdateCalendarPermission(ctx context.Context, cal, id string, p calendar.Permission) (calendar.Permission, error) {
-	p, err := b.norm(p)
-	if err != nil {
+func (b *storedBackend) check(p calendar.Permission) error {
+	if b.failErr != nil {
+		return b.failErr
+	}
+	if p.Role == calendar.RoleLimitedRead {
+		return fmt.Errorf("%w: %q", calendar.ErrRoleNotAllowed, p.Role)
+	}
+	return nil
+}
+
+func (b *storedBackend) CreateCalendarPermission(ctx context.Context, cal string, p calendar.Permission) (calendar.Permission, error) {
+	if err := b.check(p); err != nil {
 		return calendar.Permission{}, err
 	}
-	return b.permCalendarBackend.UpdateCalendarPermission(ctx, cal, id, p)
+	b.writes++
+	return b.permCalendarBackend.CreateCalendarPermission(ctx, cal, b.stored(p))
+}
+
+func (b *storedBackend) UpdateCalendarPermission(ctx context.Context, cal, id string, p calendar.Permission) (calendar.Permission, error) {
+	if err := b.check(p); err != nil {
+		return calendar.Permission{}, err
+	}
+	b.writes++
+	return b.permCalendarBackend.UpdateCalendarPermission(ctx, cal, id, b.stored(p))
 }
 
 func TestCalendarPermissionsRejectedRoleIs400(t *testing.T) {
-	h := permHandler(&roleNormalizingBackend{})
+	h := permHandler(&storedBackend{})
 	ctx := context.Background()
 	res, err := h.MeCalendarsCreateCalendarPermissions(ctx, grantReq("bob@example.com", api.MicrosoftGraphCalendarRoleTypeLimitedRead), api.MeCalendarsCreateCalendarPermissionsParams{CalendarID: "c"})
 	if err != nil {
@@ -257,27 +272,98 @@ func TestCalendarPermissionsRejectedRoleIs400(t *testing.T) {
 	}
 }
 
-func TestCalendarPermissionsResponseRoleMatchesReadBack(t *testing.T) {
-	b := &roleNormalizingBackend{}
-	h := permHandler(b)
+func TestCalendarPermissionsResponseMatchesGet(t *testing.T) {
+	h := permHandler(&storedBackend{})
 	ctx := context.Background()
-	res, err := h.MeCalendarsCreateCalendarPermissions(ctx, grantReq("bob@example.com", api.MicrosoftGraphCalendarRoleTypeDelegateWithPrivateEventAccess), api.MeCalendarsCreateCalendarPermissionsParams{CalendarID: "c"})
+	// The request's email casing and name differ from the stored grant's.
+	req := grantReq("BOB@Example.com", api.MicrosoftGraphCalendarRoleTypeRead)
+	req.EmailAddress.Value.Name = api.NewOptNilString("whatever")
+	res, err := h.MeCalendarsCreateCalendarPermissions(ctx, req, api.MeCalendarsCreateCalendarPermissionsParams{CalendarID: "c"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	created := res.(*api.MicrosoftGraphCalendarPermissionStatusCode).Response
-	got, _ := h.MeCalendarsGetCalendarPermissions(ctx, api.MeCalendarsGetCalendarPermissionsParams{CalendarID: "c", CalendarPermissionID: "perm-1"})
-	read := got.(*api.MicrosoftGraphCalendarPermissionStatusCode).Response
-	if created.Role != read.Role || created.Role.Value != api.MicrosoftGraphCalendarRoleTypeWrite {
-		t.Errorf("create role %v vs read-back %v, want both write", created.Role, read.Role)
+	get := func() api.MicrosoftGraphCalendarPermission {
+		g, err := h.MeCalendarsGetCalendarPermissions(ctx, api.MeCalendarsGetCalendarPermissionsParams{CalendarID: "c", CalendarPermissionID: "perm-1"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return g.(*api.MicrosoftGraphCalendarPermissionStatusCode).Response
+	}
+	if !reflect.DeepEqual(created, get()) {
+		t.Errorf("create response %+v != GET %+v", created, get())
 	}
 
-	ures, err := h.MeCalendarsUpdateCalendarPermissions(ctx, grantReq("", api.MicrosoftGraphCalendarRoleTypeDelegateWithPrivateEventAccess), api.MeCalendarsUpdateCalendarPermissionsParams{CalendarID: "c", CalendarPermissionID: "perm-1"})
+	// PATCH ignores emailAddress in the body; response equals a later GET.
+	body := grantReq("attacker@example.com", api.MicrosoftGraphCalendarRoleTypeWrite)
+	ures, err := h.MeCalendarsUpdateCalendarPermissions(ctx, body, api.MeCalendarsUpdateCalendarPermissionsParams{CalendarID: "c", CalendarPermissionID: "perm-1"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	updated := ures.(*api.MicrosoftGraphCalendarPermissionStatusCode).Response
-	if updated.Role.Value != api.MicrosoftGraphCalendarRoleTypeWrite {
-		t.Errorf("update role = %v, want write (read-back)", updated.Role)
+	if !reflect.DeepEqual(updated, get()) || updated.EmailAddress.Value.Address.Value != "bob@example.com" || updated.Role.Value != api.MicrosoftGraphCalendarRoleTypeWrite {
+		t.Errorf("update response %+v != GET %+v", updated, get())
+	}
+}
+
+func TestCalendarPermissionsRolelessPatchWritesNothing(t *testing.T) {
+	// A grant made outside the gateway, with flags the gateway would not set.
+	b := &storedBackend{permCalendarBackend: permCalendarBackend{perms: []calendar.Permission{
+		{ID: "ext", Email: "eve@example.com", Name: "Eve", Role: calendar.RoleWrite, IsRemovable: true},
+	}}}
+	h := permHandler(b)
+	body := &api.MicrosoftGraphCalendarPermission{
+		EmailAddress: api.NewOptMicrosoftGraphEmailAddress(api.MicrosoftGraphEmailAddress{Address: api.NewOptNilString("other@example.com")}),
+	}
+	res, err := h.MeCalendarsUpdateCalendarPermissions(context.Background(), body, api.MeCalendarsUpdateCalendarPermissionsParams{CalendarID: "c", CalendarPermissionID: "ext"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := res.(*api.MicrosoftGraphCalendarPermissionStatusCode)
+	if got.StatusCode != http.StatusOK || got.Response.EmailAddress.Value.Address.Value != "eve@example.com" {
+		t.Errorf("response = %+v", got)
+	}
+	if b.writes != 0 {
+		t.Errorf("role-less PATCH wrote to the backend %d time(s)", b.writes)
+	}
+}
+
+func TestCalendarPermissionsCreateRequiresRole(t *testing.T) {
+	b := &storedBackend{}
+	req := &api.MicrosoftGraphCalendarPermission{
+		EmailAddress: api.NewOptMicrosoftGraphEmailAddress(api.MicrosoftGraphEmailAddress{Address: api.NewOptNilString("bob@example.com")}),
+	}
+	res, err := permHandler(b).MeCalendarsCreateCalendarPermissions(context.Background(), req, api.MeCalendarsCreateCalendarPermissionsParams{CalendarID: "c"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	e, ok := res.(*api.ErrorStatusCode)
+	if !ok || e.StatusCode != http.StatusBadRequest || !strings.Contains(e.Response.Error.Message, "role") || b.writes != 0 {
+		t.Errorf("res = %#v writes=%d, want 400 mentioning role", res, b.writes)
+	}
+}
+
+func TestCalendarPermissionsBackendRefusalMapping(t *testing.T) {
+	cases := []struct {
+		err  error
+		want int
+	}{
+		{calendar.ErrInvalidGrantee, http.StatusBadRequest},
+		{calendar.ErrCalendarNotFound, http.StatusNotFound},
+	}
+	for _, c := range cases {
+		b := &storedBackend{failErr: fmt.Errorf("backend: %w (raw backend text)", c.err)}
+		res, err := permHandler(b).MeCalendarsCreateCalendarPermissions(context.Background(), grantReq("bob@example.com", api.MicrosoftGraphCalendarRoleTypeRead), api.MeCalendarsCreateCalendarPermissionsParams{CalendarID: "c"})
+		if err != nil {
+			t.Fatalf("%v: %v", c.err, err)
+		}
+		e, ok := res.(*api.ErrorStatusCode)
+		if !ok || e.StatusCode != c.want {
+			t.Errorf("%v: res = %#v, want %d", c.err, res, c.want)
+			continue
+		}
+		if strings.Contains(e.Response.Error.Message, "raw backend text") {
+			t.Errorf("%v: backend text leaked: %q", c.err, e.Response.Error.Message)
+		}
 	}
 }

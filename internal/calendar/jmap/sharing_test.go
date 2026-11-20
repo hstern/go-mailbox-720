@@ -6,6 +6,8 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/hstern/go-mailbox-720/internal/calendar"
@@ -25,7 +27,12 @@ func shareSessionJSON(apiURL string) string {
 // PermissionReader/Writer round-trip runs over the real go-jmap client + wire.
 type shareFake struct {
 	share      map[string]*calendarRights
-	principals map[string]jmapPrincipal // by email
+	principals map[string]jmapPrincipal // by email (lower-case)
+	// setErr, when non-nil, is returned as the Calendar/set notUpdated error.
+	setErr map[string]any
+	// noCalendar makes Calendar/get return an empty list.
+	noCalendar bool
+	patches    []map[string]any // every Calendar/set update patch received
 }
 
 func (f *shareFake) handle(w http.ResponseWriter, body map[string]any) {
@@ -39,19 +46,32 @@ func (f *shareFake) handle(w http.ResponseWriter, body map[string]any) {
 		var resp map[string]any
 		switch name {
 		case "Calendar/get":
-			resp = map[string]any{"accountId": "acc1", "state": "s", "notFound": []any{},
-				"list": []any{map[string]any{"id": "cal-1", "name": "Cal", "shareWith": f.share}}}
+			list := []any{map[string]any{"id": "cal-1", "name": "Cal", "shareWith": f.share}}
+			if f.noCalendar {
+				list = []any{}
+			}
+			resp = map[string]any{"accountId": "acc1", "state": "s", "notFound": []any{}, "list": list}
 		case "Calendar/set":
+			if f.setErr != nil {
+				resp = map[string]any{"accountId": "acc1", "newState": "s", "notUpdated": map[string]any{"cal-1": f.setErr}}
+				break
+			}
 			if upd, ok := args["update"].(map[string]any); ok {
 				if c1, ok := upd["cal-1"].(map[string]any); ok {
-					if sw, ok := c1["shareWith"].(map[string]any); ok {
-						f.share = map[string]*calendarRights{}
-						for pid, r := range sw {
-							b, _ := json.Marshal(r)
-							var cr calendarRights
-							_ = json.Unmarshal(b, &cr)
-							f.share[pid] = &cr
+					f.patches = append(f.patches, c1)
+					for k, v := range c1 {
+						pid, ok := strings.CutPrefix(k, "shareWith/")
+						if !ok {
+							continue
 						}
+						if v == nil {
+							delete(f.share, pid)
+							continue
+						}
+						b, _ := json.Marshal(v)
+						var cr calendarRights
+						_ = json.Unmarshal(b, &cr)
+						f.share[pid] = &cr
 					}
 				}
 			}
@@ -71,7 +91,7 @@ func (f *shareFake) handle(w http.ResponseWriter, body map[string]any) {
 			var ids []any
 			if filt, ok := args["filter"].(map[string]any); ok {
 				if email, ok := filt["email"].(string); ok {
-					if p, ok := f.principals[email]; ok {
+					if p, ok := f.principals[strings.ToLower(email)]; ok {
 						ids = append(ids, string(p.ID))
 					}
 				}
@@ -141,8 +161,8 @@ func TestJMAPCalendarSharingCRUD(t *testing.T) {
 	if _, err := cl.UpdateCalendarPermission(ctx, "cal-1", "bob", calendar.Permission{Role: calendar.RoleWrite}); err != nil {
 		t.Fatalf("update: %v", err)
 	}
-	if perms, _ := cl.ListCalendarPermissions(ctx, "cal-1"); perms[0].Role != calendar.RoleWrite {
-		t.Errorf("role after update = %q, want write", perms[0].Role)
+	if perms, err := cl.ListCalendarPermissions(ctx, "cal-1"); err != nil || len(perms) != 1 || perms[0].Role != calendar.RoleWrite {
+		t.Errorf("after update: %+v, %v; want one write grant", perms, err)
 	}
 	if _, err := cl.UpdateCalendarPermission(ctx, "cal-1", "ghost", calendar.Permission{Role: calendar.RoleRead}); !errors.Is(err, calendar.ErrPermissionNotFound) {
 		t.Errorf("update missing = %v, want ErrPermissionNotFound", err)
@@ -151,8 +171,8 @@ func TestJMAPCalendarSharingCRUD(t *testing.T) {
 	if err := cl.DeleteCalendarPermission(ctx, "cal-1", "bob"); err != nil {
 		t.Fatalf("delete: %v", err)
 	}
-	if perms, _ := cl.ListCalendarPermissions(ctx, "cal-1"); len(perms) != 0 {
-		t.Errorf("after delete: %+v", perms)
+	if perms, err := cl.ListCalendarPermissions(ctx, "cal-1"); err != nil || len(perms) != 0 {
+		t.Errorf("after delete: %+v, %v", perms, err)
 	}
 	if err := cl.DeleteCalendarPermission(ctx, "cal-1", "bob"); !errors.Is(err, calendar.ErrPermissionNotFound) {
 		t.Errorf("delete missing = %v, want ErrPermissionNotFound", err)
@@ -254,7 +274,10 @@ func TestJMAPSharingAllowedRolesAndReadBack(t *testing.T) {
 	if f.share["bob"].MayDelete || f.share["bob"].MayShare {
 		t.Errorf("write grant carries mayDelete/mayShare: %+v", *f.share["bob"])
 	}
-	perms, _ := cl.ListCalendarPermissions(ctx, "cal-1")
+	perms, err := cl.ListCalendarPermissions(ctx, "cal-1")
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
 	if len(perms) != 1 || len(perms[0].AllowedRoles) != 4 || perms[0].Role != calendar.RoleWrite {
 		t.Errorf("listed = %+v", perms)
 	}
@@ -264,20 +287,92 @@ func TestJMAPSharingAllowedRolesAndReadBack(t *testing.T) {
 	}
 }
 
-func TestSetShareNormalizesExistingEntries(t *testing.T) {
-	// An entry made outside the gateway violates the mayWriteAll implication; the
-	// write-back must repair it so the server does not reject the whole map.
-	f := &shareFake{share: map[string]*calendarRights{
-		"eve": {MayReadFreeBusy: true, MayReadItems: true, MayWriteAll: true},
-	}, principals: map[string]jmapPrincipal{
+func TestSetSharePatchesOnlyTheTargetPrincipal(t *testing.T) {
+	// An entry made outside the gateway (extra flags, even non-conforming) must not
+	// be rewritten by a change to another grantee, and the patch must be a
+	// per-principal path so concurrent writers cannot clobber each other.
+	eve := calendarRights{MayReadFreeBusy: true, MayReadItems: true, MayWriteAll: true, MayShare: true, MayDelete: true}
+	f := &shareFake{share: map[string]*calendarRights{"eve": &eve}, principals: map[string]jmapPrincipal{
 		"bob@example.com": {ID: "bob", Name: "Bob", Email: "bob@example.com"},
 	}}
 	cl := newShareClient(t, f)
-	if _, err := cl.CreateCalendarPermission(context.Background(), "cal-1", calendar.Permission{Email: "bob@example.com", Role: calendar.RoleRead}); err != nil {
+	ctx := context.Background()
+	if _, err := cl.CreateCalendarPermission(ctx, "cal-1", calendar.Permission{Email: "bob@example.com", Role: calendar.RoleWrite}); err != nil {
 		t.Fatal(err)
 	}
-	e := f.share["eve"]
-	if e == nil || !(e.MayWriteOwn && e.MayUpdatePrivate && e.MayRSVP) {
-		t.Errorf("existing entry not normalised: %+v", e)
+	if got := f.share["eve"]; got == nil || *got != eve {
+		t.Errorf("unrelated entry rewritten: %+v, want %+v", got, eve)
+	}
+	if len(f.patches) != 1 {
+		t.Fatalf("patches = %v", f.patches)
+	}
+	for k := range f.patches[0] {
+		if k != "shareWith/bob" {
+			t.Errorf("patch key %q, want only shareWith/bob (no whole-map write)", k)
+		}
+	}
+	if err := cl.DeleteCalendarPermission(ctx, "cal-1", "bob"); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := f.share["bob"]; ok {
+		t.Error("bob not revoked")
+	}
+	if f.patches[1]["shareWith/bob"] != nil {
+		t.Errorf("revoke patch = %v, want null", f.patches[1])
+	}
+	if got := f.share["eve"]; got == nil || *got != eve {
+		t.Errorf("unrelated entry rewritten by revoke: %+v", got)
+	}
+}
+
+func TestJMAPCreateResponseMatchesGet(t *testing.T) {
+	f := &shareFake{share: map[string]*calendarRights{}, principals: map[string]jmapPrincipal{
+		"bob@example.com": {ID: "bob", Name: "Bob Builder", Email: "bob@example.com"},
+	}}
+	cl := newShareClient(t, f)
+	ctx := context.Background()
+	// Request with different casing and a caller-supplied name.
+	created, err := cl.CreateCalendarPermission(ctx, "cal-1", calendar.Permission{Email: "BOB@Example.com", Name: "x", Role: calendar.RoleRead})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := cl.GetCalendarPermission(ctx, "cal-1", created.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(created, got) || got.Email != "bob@example.com" || got.Name != "Bob Builder" {
+		t.Errorf("create = %+v, get = %+v", created, got)
+	}
+	updated, err := cl.UpdateCalendarPermission(ctx, "cal-1", created.ID, calendar.Permission{Email: "zzz", Name: "zzz", Role: calendar.RoleWrite})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, _ = cl.GetCalendarPermission(ctx, "cal-1", created.ID)
+	if !reflect.DeepEqual(updated, got) || got.Email != "bob@example.com" {
+		t.Errorf("update = %+v, get = %+v", updated, got)
+	}
+}
+
+func TestJMAPSharingBackendRefusals(t *testing.T) {
+	principals := map[string]jmapPrincipal{"bob@example.com": {ID: "bob", Name: "Bob", Email: "bob@example.com"}}
+	ctx := context.Background()
+
+	owner := &shareFake{share: map[string]*calendarRights{}, principals: principals,
+		setErr: map[string]any{"type": "invalidProperties", "description": "An object cannot be shared with the principal that owns it.", "properties": []string{"shareWith"}}}
+	_, err := newShareClient(t, owner).CreateCalendarPermission(ctx, "cal-1", calendar.Permission{Email: "bob@example.com", Role: calendar.RoleRead})
+	if !errors.Is(err, calendar.ErrInvalidGrantee) {
+		t.Errorf("owner share err = %v, want ErrInvalidGrantee", err)
+	}
+	if err != nil && strings.Contains(err.Error(), "owns it") {
+		t.Errorf("backend text leaked into error: %v", err)
+	}
+
+	missing := &shareFake{share: map[string]*calendarRights{"bob": {}}, principals: principals, noCalendar: true}
+	if _, err := newShareClient(t, missing).UpdateCalendarPermission(ctx, "cal-1", "bob", calendar.Permission{Role: calendar.RoleRead}); !errors.Is(err, calendar.ErrCalendarNotFound) {
+		t.Errorf("missing calendar update err = %v, want ErrCalendarNotFound", err)
+	}
+	nf := &shareFake{share: map[string]*calendarRights{}, principals: principals, setErr: map[string]any{"type": "notFound"}}
+	if _, err := newShareClient(t, nf).CreateCalendarPermission(ctx, "cal-1", calendar.Permission{Email: "bob@example.com", Role: calendar.RoleRead}); !errors.Is(err, calendar.ErrCalendarNotFound) {
+		t.Errorf("notFound create err = %v, want ErrCalendarNotFound", err)
 	}
 }
