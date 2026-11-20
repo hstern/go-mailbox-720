@@ -34,6 +34,9 @@ func (h Handler) MeCalendarsListCalendarPermissions(ctx context.Context, params 
 	}
 	perms, err := pr.ListCalendarPermissions(ctx, params.CalendarID)
 	if err != nil {
+		if e := permissionError(err); e != nil {
+			return e, nil
+		}
 		return nil, fmt.Errorf("list calendar permissions: %w", err)
 	}
 	value := make([]api.MicrosoftGraphCalendarPermission, 0, len(perms))
@@ -60,8 +63,8 @@ func (h Handler) MeCalendarsGetCalendarPermissions(ctx context.Context, params a
 	}
 	p, err := pr.GetCalendarPermission(ctx, params.CalendarID, params.CalendarPermissionID)
 	if err != nil {
-		if errors.Is(err, calendar.ErrPermissionNotFound) {
-			return notFound("calendar permission not found"), nil
+		if e := permissionError(err); e != nil {
+			return e, nil
 		}
 		return nil, fmt.Errorf("get calendar permission: %w", err)
 	}
@@ -88,8 +91,16 @@ func (h Handler) MeCalendarsCreateCalendarPermissions(ctx context.Context, req *
 	if p.Email == "" {
 		return badRequest("calendarPermission requires emailAddress.address"), nil
 	}
+	if p.Role == "" {
+		return badRequest("calendarPermission requires role"), nil
+	}
+	// The response carries the grant as the backend returns it (the role as it
+	// would be read back), not the requested role.
 	created, err := pw.CreateCalendarPermission(ctx, params.CalendarID, p)
 	if err != nil {
+		if e := permissionError(err); e != nil {
+			return e, nil
+		}
 		return nil, fmt.Errorf("create calendar permission: %w", err)
 	}
 	return &api.MicrosoftGraphCalendarPermissionStatusCode{
@@ -99,9 +110,9 @@ func (h Handler) MeCalendarsCreateCalendarPermissions(ctx context.Context, req *
 }
 
 // MeCalendarsUpdateCalendarPermissions implements PATCH /me/calendars/{id}/calendarPermissions/{id}.
-// PATCH is a partial update: the existing grant is read and the request's set fields
-// (typically the role) are overlaid, so an omitted member is left untouched. The
-// merge needs both capabilities; a backend missing either yields 501.
+// Graph's PATCH changes only role: emailAddress in the body is ignored, and a body
+// with no role writes nothing (the existing grant is returned as-is). The handler
+// needs both capabilities; a backend missing either yields 501.
 func (h Handler) MeCalendarsUpdateCalendarPermissions(ctx context.Context, req *api.MicrosoftGraphCalendarPermission, params api.MeCalendarsUpdateCalendarPermissionsParams) (api.MeCalendarsUpdateCalendarPermissionsRes, error) {
 	b, err := h.calendarBackend(ctx)
 	if err != nil {
@@ -116,15 +127,29 @@ func (h Handler) MeCalendarsUpdateCalendarPermissions(ctx context.Context, req *
 	}
 	existing, err := pr.GetCalendarPermission(ctx, params.CalendarID, params.CalendarPermissionID)
 	if err != nil {
-		if errors.Is(err, calendar.ErrPermissionNotFound) {
-			return notFound("calendar permission not found"), nil
+		if e := permissionError(err); e != nil {
+			return e, nil
 		}
 		return nil, fmt.Errorf("get calendar permission: %w", err)
 	}
-	updated, err := pw.UpdateCalendarPermission(ctx, params.CalendarID, params.CalendarPermissionID, mergeGraphPermission(existing, req))
+	role, ok := req.Role.Get()
+	if !ok || role == "" {
+		// Graph's PATCH may only change role; with none given there is nothing to
+		// write, so return the grant untouched rather than rewriting it.
+		return &api.MicrosoftGraphCalendarPermissionStatusCode{
+			StatusCode: http.StatusOK,
+			Response:   toGraphCalendarPermission(existing),
+		}, nil
+	}
+	next := existing
+	next.Role = calendar.PermissionRole(role)
+	updated, err := pw.UpdateCalendarPermission(ctx, params.CalendarID, params.CalendarPermissionID, next)
 	if err != nil {
-		if errors.Is(err, calendar.ErrPermissionNotFound) {
-			return notFound("calendar permission not found"), nil
+		if e := permissionError(err); e != nil {
+			return e, nil
+		}
+		if e := permissionError(err); e != nil {
+			return e, nil
 		}
 		return nil, fmt.Errorf("update calendar permission: %w", err)
 	}
@@ -148,8 +173,8 @@ func (h Handler) MeCalendarsDeleteCalendarPermissions(ctx context.Context, param
 		return nil, ht.ErrNotImplemented
 	}
 	if err := pw.DeleteCalendarPermission(ctx, params.CalendarID, params.CalendarPermissionID); err != nil {
-		if errors.Is(err, calendar.ErrPermissionNotFound) {
-			return notFound("calendar permission not found"), nil
+		if e := permissionError(err); e != nil {
+			return e, nil
 		}
 		return nil, fmt.Errorf("delete calendar permission: %w", err)
 	}
@@ -157,9 +182,8 @@ func (h Handler) MeCalendarsDeleteCalendarPermissions(ctx context.Context, param
 }
 
 // mergeGraphPermission overlays the set fields of a Graph calendarPermission body
-// onto an existing neutral permission, implementing PATCH's partial-update semantics.
-// A create passes an empty base, so the overlay reduces to "take every set field".
-// The read-only ID, AllowedRoles, and IsRemovable are never taken from the body.
+// onto a base neutral permission. Only POST uses it (with an empty base); PATCH
+// changes the role alone. The read-only ID, AllowedRoles, and IsRemovable are never taken from the body.
 func mergeGraphPermission(base calendar.Permission, g *api.MicrosoftGraphCalendarPermission) calendar.Permission {
 	p := base
 	if ea, ok := g.EmailAddress.Get(); ok {
@@ -196,4 +220,20 @@ func toGraphCalendarPermission(p calendar.Permission) api.MicrosoftGraphCalendar
 		}
 	}
 	return g
+}
+
+// permissionError maps the neutral sharing sentinels onto Graph error responses, or
+// returns nil when err is not one of them. Backend error text is never echoed.
+func permissionError(err error) *api.ErrorStatusCode {
+	switch {
+	case errors.Is(err, calendar.ErrPermissionNotFound):
+		return notFound("calendar permission not found")
+	case errors.Is(err, calendar.ErrCalendarNotFound):
+		return notFound("calendar not found")
+	case errors.Is(err, calendar.ErrRoleNotAllowed):
+		return badRequest(err.Error())
+	case errors.Is(err, calendar.ErrInvalidGrantee):
+		return badRequest("the calendar cannot be shared with this recipient (for example, its own owner)")
+	}
+	return nil
 }

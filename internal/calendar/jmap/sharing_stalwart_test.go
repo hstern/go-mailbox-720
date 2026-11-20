@@ -1,9 +1,9 @@
 //go:build dockertest
 
 // Integration test for the JMAP calendar-sharing adapter (PermissionReader/Writer)
-// against a real Stalwart server. Shares the user's own calendar with their own
-// principal (Stalwart accepts a self-grant), which exercises the full RFC 9670 +
-// shareWith round-trip without provisioning a second account. Run with:
+// against a real Stalwart server. Shares the user's calendar with a second
+// provisioned account (Stalwart v1.x rejects a self-grant), which exercises the full RFC 9670 +
+// shareWith round-trip. Run with:
 //
 //	go test -tags dockertest ./internal/calendar/jmap/ -run TestStalwartCalendarSharing
 
@@ -11,8 +11,11 @@ package jmap
 
 import (
 	"context"
+	"errors"
 	"os/exec"
 	"testing"
+
+	gojmap "git.sr.ht/~rockorager/go-jmap"
 
 	"github.com/hstern/go-mailbox-720/internal/calendar"
 )
@@ -39,8 +42,10 @@ func TestStalwartCalendarSharing(t *testing.T) {
 	}
 	calID := cals[0].ID
 
-	// Grant read access (to the user's own principal — a self-share Stalwart allows).
-	created, err := cl.CreateCalendarPermission(ctx, calID, calendar.Permission{Email: login, Role: calendar.RoleRead})
+	sharee := jmapStalwartShareeUser + "@" + jmapStalwartDomain
+
+	// Grant read access to the second account.
+	created, err := cl.CreateCalendarPermission(ctx, calID, calendar.Permission{Email: sharee, Role: calendar.RoleRead})
 	if err != nil {
 		t.Fatalf("CreateCalendarPermission: %v", err)
 	}
@@ -61,21 +66,45 @@ func TestStalwartCalendarSharing(t *testing.T) {
 	if found == nil {
 		t.Fatalf("granted permission not listed: %+v", perms)
 	}
-	if found.Email != login || found.Role != calendar.RoleRead {
-		t.Errorf("listed permission = %+v, want email=%s role=read", *found, login)
+	if found.Email != sharee || found.Role != calendar.RoleRead {
+		t.Errorf("listed permission = %+v, want email=%s role=read", *found, sharee)
 	}
 
-	// Promote to write, then revoke.
+	if len(created.AllowedRoles) == 0 || len(found.AllowedRoles) == 0 {
+		t.Errorf("AllowedRoles not populated: created=%v listed=%v", created.AllowedRoles, found.AllowedRoles)
+	}
+
+	// Sharing with the calendar's own owner is refused with a typed error.
+	if _, err := cl.CreateCalendarPermission(ctx, calID, calendar.Permission{Email: login, Role: calendar.RoleRead}); !errors.Is(err, calendar.ErrInvalidGrantee) {
+		t.Errorf("owner self-share err = %v, want ErrInvalidGrantee", err)
+	}
+
+	// Roles the JMAP tier cannot enforce are refused, not downgraded.
+	for _, role := range []calendar.PermissionRole{calendar.RoleDelegatePrivate, calendar.RoleLimitedRead} {
+		if _, err := cl.UpdateCalendarPermission(ctx, calID, created.ID, calendar.Permission{Role: role}); !errors.Is(err, calendar.ErrRoleNotAllowed) {
+			t.Errorf("update to %q: err = %v, want ErrRoleNotAllowed", role, err)
+		}
+	}
+
+	// Promote to write: it must read back as write without mayDelete (which in
+	// JMAP Calendars deletes the calendar itself).
 	if _, err := cl.UpdateCalendarPermission(ctx, calID, created.ID, calendar.Permission{Role: calendar.RoleWrite}); err != nil {
 		t.Fatalf("UpdateCalendarPermission: %v", err)
 	}
 	if got, err := cl.GetCalendarPermission(ctx, calID, created.ID); err != nil || got.Role != calendar.RoleWrite {
 		t.Errorf("after update: %+v, %v; want role=write", got, err)
 	}
+	cal, err := cl.getShared(ctx, calID)
+	if err != nil {
+		t.Fatalf("getShared: %v", err)
+	}
+	if r := cal.ShareWith[gojmap.ID(created.ID)]; r == nil || !r.MayWriteAll || r.MayDelete || r.MayShare {
+		t.Errorf("stored write rights = %+v, want mayWriteAll without mayDelete/mayShare", r)
+	}
 	if err := cl.DeleteCalendarPermission(ctx, calID, created.ID); err != nil {
 		t.Fatalf("DeleteCalendarPermission: %v", err)
 	}
-	if perms, _ := cl.ListCalendarPermissions(ctx, calID); len(perms) != 0 {
-		t.Errorf("after delete, still shared: %+v", perms)
+	if perms, err := cl.ListCalendarPermissions(ctx, calID); err != nil || len(perms) != 0 {
+		t.Errorf("after delete: %+v, %v; want no grants", perms, err)
 	}
 }
