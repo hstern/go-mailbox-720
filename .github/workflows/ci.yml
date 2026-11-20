@@ -160,7 +160,9 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      - name: Per-identity SASL GSSAPI e2e (real Dovecot)
+      # Includes per-identity ManageSieve over GSSAPI (MB720-60) against Dovecot's
+      # Pigeonhole ManageSieve service.
+      - name: "Per-identity SASL GSSAPI e2e (real Dovecot: IMAP, SMTP, ManageSieve)"
         run: go test -tags dockertest -timeout 300s -run TestDovecot ./test/e2e-kerberos/
 
   kerberos-dav-e2e:

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 
+	"github.com/emersion/go-sasl"
 	managesieve "github.com/hstern/go-managesieve"
 
 	port "github.com/hstern/go-mailbox-720/internal/mail"
@@ -36,12 +37,19 @@ type manageSieveConfig struct {
 	username string
 	password string
 	starttls bool
+	// newSASL, when non-nil, builds a fresh SASL client per connection and is used
+	// instead of PLAIN (per-identity OAUTHBEARER / GSSAPI, MB720-60).
+	newSASL func(ctx context.Context) (sasl.Client, error)
 }
 
 // resolveManageSieve turns the public options into the internal config, defaulting
 // the SASL credentials to the IMAP ones. It returns nil (filters disabled) when no
 // ManageSieve address is configured.
-func resolveManageSieve(o *ManageSieveOptions, imapUser, imapPass string) *manageSieveConfig {
+//
+// A per-identity mechanism takes precedence over PLAIN: an explicit o.SASL factory
+// (GSSAPI), else OAUTHBEARER built from the IMAP bearer token (MB720-60), with the
+// IMAP username as the authorization identity.
+func resolveManageSieve(o *ManageSieveOptions, imapUser, imapPass, bearer string) *manageSieveConfig {
 	if o == nil || o.Addr == "" {
 		return nil
 	}
@@ -51,6 +59,17 @@ func resolveManageSieve(o *ManageSieveOptions, imapUser, imapPass string) *manag
 	}
 	if cfg.password == "" {
 		cfg.password = imapPass
+	}
+	switch {
+	case o.SASL != nil:
+		cfg.newSASL = o.SASL
+	case bearer != "":
+		host, port := splitAddr(o.Addr)
+		cfg.newSASL = func(context.Context) (sasl.Client, error) {
+			return sasl.NewOAuthBearerClient(&sasl.OAuthBearerOptions{
+				Username: imapUser, Token: bearer, Host: host, Port: port,
+			}), nil
+		}
 	}
 	return cfg
 }
@@ -75,7 +94,16 @@ func (cl *Client) dialSieve(ctx context.Context) (*managesieve.Client, error) {
 			return nil, fmt.Errorf("managesieve: starttls: %w", err)
 		}
 	}
-	if err := ms.Authenticate(managesieve.PlainAuth("", cl.sieve.username, cl.sieve.password)); err != nil {
+	mech := managesieve.PlainAuth("", cl.sieve.username, cl.sieve.password)
+	if cl.sieve.newSASL != nil {
+		sc, err := cl.sieve.newSASL(ctx)
+		if err != nil {
+			_ = ms.Close()
+			return nil, fmt.Errorf("managesieve: sasl client: %w", err)
+		}
+		mech = newSASLAdapter(sc)
+	}
+	if err := ms.Authenticate(mech); err != nil {
 		_ = ms.Close()
 		return nil, fmt.Errorf("managesieve: authenticate: %w", err)
 	}
