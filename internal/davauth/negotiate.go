@@ -40,7 +40,9 @@ type TokenSource func() (string, error)
 // redirect), and the Transport mints a real token only when the placeholder is
 // still present AND the round trip targets the original origin. A redirect to
 // another host, or a scheme downgrade such as https to http, therefore carries no
-// Authorization header and no token is minted for it. Any other
+// Authorization header and no token is minted for it. Redirects are matched on the literal scheme and
+// host, so an http to https redirect (or one differing in default-port or host-case spelling) deliberately
+// loses auth: configure the canonical https URL. Any other
 // webdav.HTTPClient is wrapped at Do, minting once per call; its own redirect
 // handling is outside this package's control.
 func NegotiateHTTPClient(c webdav.HTTPClient, src TokenSource) webdav.HTTPClient {
@@ -73,20 +75,28 @@ type negotiateTransport struct {
 }
 
 func (n *negotiateTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	if req.Header.Get("Authorization") == placeholderAuth {
-		origin, _ := req.Context().Value(originKey{}).(string)
-		req = req.Clone(req.Context()) // RoundTrip must not mutate its argument
-		if origin == originOf(req.URL) {
-			tok, err := n.src()
-			if err != nil {
-				return nil, fmt.Errorf("negotiate: mint token: %w", err)
-			}
-			req.Header.Set("Authorization", "Negotiate "+tok)
-		} else {
-			req.Header.Del("Authorization")
-		}
+	if req.Header.Get("Authorization") != placeholderAuth {
+		return n.rt.RoundTrip(req)
 	}
-	return n.rt.RoundTrip(req)
+	origin, _ := req.Context().Value(originKey{}).(string)
+	out := req.Clone(req.Context()) // RoundTrip must not mutate its argument
+	if origin == originOf(req.URL) {
+		tok, err := n.src()
+		if err != nil {
+			return nil, fmt.Errorf("negotiate: mint token: %w", err)
+		}
+		out.Header.Set("Authorization", "Negotiate "+tok)
+	} else {
+		out.Header.Del("Authorization")
+	}
+	resp, err := n.rt.RoundTrip(out)
+	if resp != nil {
+		// The transport points resp.Request at the clone carrying the real token;
+		// restore the placeholder request so logging or tracing resp.Request does
+		// not expose the AP-REQ.
+		resp.Request = req
+	}
+	return resp, err
 }
 
 type negotiateHTTPClient struct {

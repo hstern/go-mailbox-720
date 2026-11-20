@@ -3,6 +3,7 @@ package davauth
 import (
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -189,5 +190,103 @@ func TestNegotiateHTTPClientNoTokenOnSchemeDowngrade(t *testing.T) {
 	}
 	if n != 1 {
 		t.Errorf("token source called %d times, want 1", n)
+	}
+}
+
+// resp.Request must not expose the minted token to anything that logs it.
+func TestNegotiateHTTPClientHidesTokenInRespRequest(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	t.Cleanup(srv.Close)
+	c := NegotiateHTTPClient(srv.Client(), fixed("secret-apreq"))
+	req, _ := http.NewRequest("GET", srv.URL, nil)
+	resp, err := c.Do(req)
+	if err != nil {
+		t.Fatalf("Do: %v", err)
+	}
+	_ = resp.Body.Close()
+	if got := resp.Request.Header.Get("Authorization"); strings.Contains(got, "secret-apreq") {
+		t.Errorf("resp.Request carries the minted token: %q", got)
+	}
+}
+
+// Same scheme and host, different port: net/http keeps Authorization (the
+// domain matches), so only the origin check keeps the token off the target.
+func TestNegotiateHTTPClientNoTokenAcrossPorts(t *testing.T) {
+	var targetAuth []string
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		targetAuth = append(targetAuth, r.Header.Get("Authorization"))
+	}))
+	t.Cleanup(target.Close)
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target.URL+"/x", http.StatusFound)
+	}))
+	t.Cleanup(origin.Close)
+
+	n := 0
+	c := NegotiateHTTPClient(http.DefaultClient, func() (string, error) { n++; return "tok", nil })
+	req, _ := http.NewRequest("GET", origin.URL, nil)
+	resp, err := c.Do(req)
+	if err != nil {
+		t.Fatalf("Do: %v", err)
+	}
+	_ = resp.Body.Close()
+	if len(targetAuth) != 1 || targetAuth[0] != "" {
+		t.Errorf("other-port target saw Authorization %q, want none", targetAuth)
+	}
+	if n != 1 {
+		t.Errorf("token source called %d times, want 1", n)
+	}
+}
+
+// A placeholder with no origin in the context sends no Authorization and mints
+// nothing.
+func TestNegotiateTransportPlaceholderWithoutOrigin(t *testing.T) {
+	var sent string
+	rt := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		sent = r.Header.Get("Authorization")
+		return &http.Response{StatusCode: http.StatusOK, Body: http.NoBody}, nil
+	})
+	n := 0
+	tr := &negotiateTransport{rt: rt, src: func() (string, error) { n++; return "tok", nil }}
+	req, _ := http.NewRequest("GET", "http://dav.example/", nil)
+	req.Header.Set("Authorization", placeholderAuth)
+	if _, err := tr.RoundTrip(req); err != nil {
+		t.Fatalf("RoundTrip: %v", err)
+	}
+	if sent != "" || n != 0 {
+		t.Errorf("sent Authorization %q, minted %d; want none and 0", sent, n)
+	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+// A same-origin 307 replays the body and each hop gets a distinct fresh token.
+func TestNegotiateHTTPClientRedirect307ReplaysBody(t *testing.T) {
+	var auths, bodies []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		auths = append(auths, r.Header.Get("Authorization"))
+		bodies = append(bodies, string(b))
+		if r.URL.Path == "/start" {
+			http.Redirect(w, r, "/final", http.StatusTemporaryRedirect)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	n := 0
+	c := NegotiateHTTPClient(srv.Client(), func() (string, error) { n++; return fmt.Sprintf("tok-%d", n), nil })
+	req, _ := http.NewRequest("PUT", srv.URL+"/start", strings.NewReader("payload"))
+	resp, err := c.Do(req)
+	if err != nil {
+		t.Fatalf("Do: %v", err)
+	}
+	_ = resp.Body.Close()
+	if fmt.Sprint(auths) != "[Negotiate tok-1 Negotiate tok-2]" {
+		t.Errorf("Authorization headers = %v, want two distinct tokens", auths)
+	}
+	if fmt.Sprint(bodies) != "[payload payload]" {
+		t.Errorf("bodies = %v, want the body replayed", bodies)
 	}
 }
