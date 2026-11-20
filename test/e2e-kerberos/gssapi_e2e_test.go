@@ -315,17 +315,10 @@ func TestDovecotGSSAPIAuth(t *testing.T) {
 // for a ccache against the submission SPN and authenticate to Dovecot's real
 // submission (SMTP) service via the internal SMTP adapter's GSSAPI branch.
 func TestDovecotGSSAPISMTPAuth(t *testing.T) {
-	// Skipped: the GSSAPI initial response (an AP-REQ carrying kerbexchanged's
-	// synthetic PAC, ~1.5-2 KB base64) exceeds SMTP's line limits — Dovecot
-	// submission rejects the AUTH with "500 Line too long". SMTP has no
-	// imap_max_line_length (64 KB) equivalent, and go-smtp inlines the initial
-	// response on the AUTH command line rather than deferring it to a continuation
-	// (RFC 4954 §4) — tracked upstream at emersion/go-smtp. The SMTP GSSAPI dial
-	// path is covered by the internal/smtp unit test, and the GSSAPI handshake
-	// against real Dovecot is proven by TestDovecotGSSAPIAuth (same sasl client).
-	// The harness is kept so this can be revisited (e.g. a PAC-less/smaller ticket
-	// or a submission server with larger line limits).
-	t.Skip("SMTP submission GSSAPI: AP-REQ initial response exceeds SMTP line limits (see comment)")
+	// Previously skipped: go-smtp inlined the ~1.5-2 KB AP-REQ initial response
+	// on the AUTH command line, which Dovecot submission rejected as "Line too
+	// long". go-smtp v0.26.0 (emersion/go-smtp#301, #307) defers an oversized
+	// initial response to the first continuation (RFC 4954 §4).
 
 	dockerAvailable(t)
 	dir := t.TempDir()
