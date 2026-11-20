@@ -3,6 +3,7 @@ package carddav
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -139,6 +140,30 @@ func newTestClientWithBackend(t *testing.T, b *memBackend) *Client {
 		t.Fatalf("new client: %v", err)
 	}
 	return &Client{c: c}
+}
+
+// Dial with Options.NegotiateToken authenticates every backend request with
+// Authorization: Negotiate, not Basic — the second per-identity path (MB720-47).
+func TestDialNegotiateAuth(t *testing.T) {
+	var gotAuth string
+	h := &gocarddav.Handler{Backend: newMemBackend(t)}
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		h.ServeHTTP(w, r)
+	}))
+	t.Cleanup(ts.Close)
+
+	cl, err := Dial(ts.URL+"/.well-known/carddav", "ignored-user", "ignored-pass",
+		&Options{NegotiateToken: "apreq-b64"})
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	if _, err := cl.ListAddressBooks(context.Background()); err != nil {
+		t.Fatalf("ListAddressBooks: %v", err)
+	}
+	if gotAuth != "Negotiate apreq-b64" {
+		t.Errorf("Authorization = %q, want %q (Negotiate, not Basic)", gotAuth, "Negotiate apreq-b64")
+	}
 }
 
 func TestClientListAddressBooks(t *testing.T) {

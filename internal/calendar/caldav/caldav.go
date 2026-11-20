@@ -36,6 +36,12 @@ type Options struct {
 	// Basic — the Dial username and password are then ignored. The token is an
 	// exchanged backend-audience access token.
 	BearerToken string
+	// NegotiateToken, when non-empty, authenticates every request with
+	// Authorization: Negotiate (the second per-identity path, MB720-47) instead of
+	// HTTP Basic — the Dial username and password are then ignored. It is the
+	// base64 GSSAPI/SPNEGO initial-context token (an AP-REQ) minted for the user by
+	// the OAuth2→Kerberos exchange. BearerToken takes precedence when both are set.
+	NegotiateToken string
 }
 
 // Client is a CalDAV-backed calendar.Backend over a single authenticated
@@ -53,9 +59,10 @@ var _ calendar.Finder = (*Client)(nil)
 
 // Dial builds a CalDAV client for endpoint (the server's CalDAV base URL),
 // authenticating every request with HTTP Basic credentials — or, when
-// Options.BearerToken is set, with Authorization: Bearer (the per-identity path).
-// It does not perform any network I/O itself — discovery happens lazily on the
-// first call.
+// Options.BearerToken is set, with Authorization: Bearer, or when
+// Options.NegotiateToken is set, with Authorization: Negotiate (the per-identity
+// paths). It does not perform any network I/O itself — discovery happens lazily
+// on the first call.
 func Dial(endpoint, username, password string, o *Options) (*Client, error) {
 	if o == nil {
 		o = &Options{}
@@ -64,9 +71,12 @@ func Dial(endpoint, username, password string, o *Options) (*Client, error) {
 	if httpClient == nil {
 		httpClient = http.DefaultClient
 	}
-	if o.BearerToken != "" {
+	switch {
+	case o.BearerToken != "":
 		httpClient = davauth.BearerHTTPClient(httpClient, o.BearerToken)
-	} else {
+	case o.NegotiateToken != "":
+		httpClient = davauth.NegotiateHTTPClient(httpClient, o.NegotiateToken)
+	default:
 		httpClient = webdav.HTTPClientWithBasicAuth(httpClient, username, password)
 	}
 

@@ -43,6 +43,41 @@ func TestDialBearerAuth(t *testing.T) {
 	}
 }
 
+// Dial with Options.NegotiateToken authenticates with Authorization: Negotiate,
+// not Basic — the second per-identity path (MB720-47).
+func TestDialNegotiateAuth(t *testing.T) {
+	rec := &recordingHTTPClient{}
+	cl, err := Dial("http://dav.example/", "ignored-user", "ignored-pass",
+		&Options{HTTPClient: rec, NegotiateToken: "apreq-b64"})
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	req, _ := http.NewRequest("PROPFIND", "http://dav.example/", nil)
+	if _, err := cl.http.Do(req); err != nil {
+		t.Fatalf("Do: %v", err)
+	}
+	if rec.auth != "Negotiate apreq-b64" {
+		t.Errorf("Authorization = %q, want %q (Negotiate, not Basic)", rec.auth, "Negotiate apreq-b64")
+	}
+}
+
+// When both are set, BearerToken wins over NegotiateToken (documented precedence).
+func TestDialBearerBeatsNegotiate(t *testing.T) {
+	rec := &recordingHTTPClient{}
+	cl, err := Dial("http://dav.example/", "", "",
+		&Options{HTTPClient: rec, BearerToken: "b-tok", NegotiateToken: "n-tok"})
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	req, _ := http.NewRequest("PROPFIND", "http://dav.example/", nil)
+	if _, err := cl.http.Do(req); err != nil {
+		t.Fatalf("Do: %v", err)
+	}
+	if rec.auth != "Bearer b-tok" {
+		t.Errorf("Authorization = %q, want %q (Bearer precedence)", rec.auth, "Bearer b-tok")
+	}
+}
+
 // decodeCalendar parses a VCALENDAR fixture. iCalendar requires CRLF line
 // endings, so the fixtures are written with \n and normalized here.
 func decodeCalendar(t *testing.T, s string) *ical.Calendar {

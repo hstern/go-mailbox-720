@@ -13,6 +13,7 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"flag"
 	"fmt"
@@ -83,6 +84,7 @@ func main() {
 	caldavURL := flag.String("cal-caldav-url", "", "CalDAV base URL for the calendar backend (empty: calendar operations return 501; password from MAILBOXD_CALDAV_PASSWORD). Use an https:// URL for TLS")
 	caldavUser := flag.String("cal-caldav-username", "", "CalDAV username for the calendar backend")
 	caldavAudience := flag.String("cal-caldav-audience", "", "RFC 8693 audience to request for the CalDAV calendar backend (MB720-44). When set together with -tokenexchange-endpoint, CalDAV authenticates per-identity with an Authorization: Bearer exchanged token instead of -cal-caldav-username/MAILBOXD_CALDAV_PASSWORD")
+	caldavSPN := flag.String("cal-caldav-spn", "", "Kerberos service principal (HTTP/host[@REALM]) of the CalDAV backend for SPNEGO auth (MB720-47). When set together with -kerbexchange-endpoint, CalDAV authenticates per-identity with Authorization: Negotiate — a GSSAPI AP-REQ minted for the user — instead of -cal-caldav-username/MAILBOXD_CALDAV_PASSWORD. The Bearer path (-cal-caldav-audience) takes precedence if both are set")
 	jmapCalSession := flag.String("cal-jmap-session-url", "", "JMAP session resource URL for the calendar backend (empty: use CalDAV, or return 501 if neither set; access token from MAILBOXD_CALENDAR_JMAP_TOKEN). Takes precedence over the CalDAV flags when set")
 	jmapCalUsername := flag.String("cal-jmap-username", "", "JMAP calendar username for HTTP Basic auth (empty: use bearer token from MAILBOXD_CALENDAR_JMAP_TOKEN; password from MAILBOXD_CALENDAR_JMAP_PASSWORD)")
 	jmapCalAPIURL := flag.String("cal-jmap-api-url", "", "override the apiUrl advertised in the JMAP session document (for servers advertising an unreachable internal apiUrl)")
@@ -90,6 +92,7 @@ func main() {
 	carddavURL := flag.String("contacts-carddav-url", "", "CardDAV base URL for the contacts backend (empty: contacts operations return 501; password from MAILBOXD_CARDDAV_PASSWORD). Use an https:// URL for TLS")
 	carddavUser := flag.String("contacts-carddav-username", "", "CardDAV username for the contacts backend")
 	carddavAudience := flag.String("contacts-carddav-audience", "", "RFC 8693 audience to request for the CardDAV contacts backend (MB720-44). When set together with -tokenexchange-endpoint, CardDAV authenticates per-identity with an Authorization: Bearer exchanged token instead of -contacts-carddav-username/MAILBOXD_CARDDAV_PASSWORD")
+	carddavSPN := flag.String("contacts-carddav-spn", "", "Kerberos service principal (HTTP/host[@REALM]) of the CardDAV backend for SPNEGO auth (MB720-47). When set together with -kerbexchange-endpoint, CardDAV authenticates per-identity with Authorization: Negotiate — a GSSAPI AP-REQ minted for the user — instead of -contacts-carddav-username/MAILBOXD_CARDDAV_PASSWORD. The Bearer path (-contacts-carddav-audience) takes precedence if both are set")
 	contactsJMAP := flag.String("contacts-jmap-session-url", "", "JMAP session resource URL for the contacts backend (empty: use CardDAV, or return 501 if neither set; access token from MAILBOXD_CONTACTS_JMAP_TOKEN). Takes precedence over the CardDAV flags when set")
 	contactsJMAPAudience := flag.String("contacts-jmap-audience", "", "RFC 8693 audience to request for the JMAP contacts backend (MB720-42). When set together with -tokenexchange-endpoint, the contacts backend authenticates per-identity instead of using the shared MAILBOXD_CONTACTS_JMAP_TOKEN")
 	enableScheduling := flag.Bool("enable-scheduling", false, "run the iTIP scheduling trigger: turn inbound mail invitations into tentative calendar events (needs IMAP + CalDAV backends; opt-in, since it writes to the calendar). Auto-disables when the CalDAV server schedules natively (RFC 6638)")
@@ -159,8 +162,8 @@ func main() {
 	}
 	// The GSSAPI counterpart: a Kerberos SPN without the kerberos exchanger would
 	// likewise fall back to a shared static credential, leaking across tenants.
-	if kerbExchanger == nil && (*mailIMAPSPN != "" || *smtpSPN != "") {
-		log.Fatalln("mailboxd: the -*-spn flags require -kerbexchange-endpoint (per-identity GSSAPI backends need the Kerberos exchange)")
+	if kerbExchanger == nil && (*mailIMAPSPN != "" || *smtpSPN != "" || *caldavSPN != "" || *carddavSPN != "") {
+		log.Fatalln("mailboxd: the -*-spn flags require -kerbexchange-endpoint (per-identity Kerberos backends need the OAuth2→Kerberos exchange)")
 	}
 	// A backend authenticates with exactly one per-identity mechanism: OAUTHBEARER
 	// (audience) or GSSAPI (SPN), never both.
@@ -271,6 +274,18 @@ func main() {
 			func(_ subjectid.IssSubID, token string) (calendar.Backend, error) {
 				return caldav.Dial(url, "", "", &caldav.Options{BearerToken: token})
 			})}
+	case *caldavURL != "" && kerbExchanger != nil && *caldavSPN != "":
+		// Per-identity via SPNEGO (MB720-47): mint a GSSAPI AP-REQ for the user and
+		// dial with Authorization: Negotiate. Caching, like the Bearer path above.
+		url := *caldavURL
+		mint, err := kerberosNegotiateMint(kerbExchanger, *caldavSPN)
+		if err != nil {
+			log.Fatalln("mailboxd: -cal-caldav-spn:", err)
+		}
+		calProvider = calendarIdentityProvider{proto: "CalDAV+SPNEGO", p: newPerIdentityKerberosBackend(mint,
+			func(_ subjectid.IssSubID, token string) (calendar.Backend, error) {
+				return caldav.Dial(url, "", "", &caldav.Options{NegotiateToken: token})
+			})}
 	case *caldavURL != "":
 		calProvider = staticCalDAVProvider{
 			url:      *caldavURL,
@@ -302,6 +317,18 @@ func main() {
 		contactsProvider = contactsIdentityProvider{proto: "CardDAV", p: newPerIdentityBackend(exchanger, *carddavAudience,
 			func(_ subjectid.IssSubID, token string) (contacts.Backend, error) {
 				return carddav.Dial(url, "", "", &carddav.Options{BearerToken: token})
+			})}
+	case *carddavURL != "" && kerbExchanger != nil && *carddavSPN != "":
+		// Per-identity via SPNEGO (MB720-47), mirroring the CalDAV backend (Negotiate
+		// AP-REQ, caching).
+		url := *carddavURL
+		mint, err := kerberosNegotiateMint(kerbExchanger, *carddavSPN)
+		if err != nil {
+			log.Fatalln("mailboxd: -contacts-carddav-spn:", err)
+		}
+		contactsProvider = contactsIdentityProvider{proto: "CardDAV+SPNEGO", p: newPerIdentityKerberosBackend(mint,
+			func(_ subjectid.IssSubID, token string) (contacts.Backend, error) {
+				return carddav.Dial(url, "", "", &carddav.Options{NegotiateToken: token})
 			})}
 	case *carddavURL != "":
 		contactsProvider = staticCardDAVProvider{
@@ -1022,6 +1049,31 @@ func buildExchanger(endpoint, clientID, clientAuth, reqTokenType string) (tokene
 	}
 	return tokenexchange.New(endpoint, clientauthn.NewClient(method, nil),
 		tokenexchange.WithRequestedTokenType(rtt)), nil
+}
+
+// kerberosNegotiateMint returns a mint closure for a per-identity DAV backend
+// fronted by SPNEGO/Negotiate (MB720-47). The closure exchanges the authenticated
+// user's token for a GSSAPI AP-REQ targeting spn (OutputAPReq) and returns it
+// base64-encoded for an Authorization: Negotiate header, capped to the
+// credential's expiry so the backend cache re-mints in step. spn is parsed once
+// here — "HTTP/host" or "HTTP/host@REALM" — so a malformed principal fails at
+// startup rather than on the first request.
+func kerberosNegotiateMint(ex kerbexchange.Exchanger, spn string) (func(context.Context, string) (string, time.Time, error), error) {
+	target, err := kerb.ParseServicePrincipal(spn)
+	if err != nil {
+		return nil, fmt.Errorf("parse service principal %q: %w", spn, err)
+	}
+	return func(ctx context.Context, raw string) (string, time.Time, error) {
+		cred, err := ex.Exchange(ctx, raw, target, kerb.OutputAPReq)
+		if err != nil {
+			return "", time.Time{}, err
+		}
+		apreq, err := cred.APReq()
+		if err != nil {
+			return "", time.Time{}, err
+		}
+		return base64.StdEncoding.EncodeToString(apreq), cred.Expiry(), nil
+	}, nil
 }
 
 // requestedTokenType validates the -tokenexchange-requested-token-type flag and
