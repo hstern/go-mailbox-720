@@ -97,4 +97,4 @@ replace github.com/emersion/go-webdav => github.com/hstern/go-webdav v0.7.1-0.20
 // master now carries both (the PAC-marshal stack was cherry-picked in), but stays
 // untagged to track upstream's versioning — so pin the master pseudo-version here.
 // Bump the pseudo-version as krb5 master advances.
-replace github.com/hstern/krb5 => github.com/hstern/krb5 v0.1.2-0.20260706001242-dc144bee7a4b
+replace github.com/hstern/krb5 => github.com/hstern/krb5 v0.1.2-0.20261120185541-51cea5a63518
