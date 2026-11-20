@@ -207,7 +207,7 @@ func TestRoleRightsTable(t *testing.T) {
 			if r.MayShare || r.MayDelete {
 				t.Errorf("%q must not grant mayShare/mayDelete: %+v", c.role, *r)
 			}
-			if r.MayWriteAll && !(r.MayWriteOwn && r.MayUpdatePrivate && r.MayRSVP) {
+			if r.MayWriteAll && (!r.MayWriteOwn || !r.MayUpdatePrivate || !r.MayRSVP) {
 				t.Errorf("%q: mayWriteAll without implied flags: %+v", c.role, *r)
 			}
 		} else if !errors.Is(err, calendar.ErrRoleNotAllowed) {
