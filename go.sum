@@ -93,8 +93,8 @@ github.com/hstern/go-token-introspection v0.1.0 h1:Q4CkhEtYRoMkBb0S+lytvn94+BoTj
 github.com/hstern/go-token-introspection v0.1.0/go.mod h1:JS0m/iCfUqyU/R85fKfRgdQ+H0fICFVSCQ4u55xAahU=
 github.com/hstern/go-webdav v0.7.1-0.20260625191323-6c7cfde5c0a0 h1:I+eCx4Pi5Mr+MsjhrK0pQKpmFskpjfPOMybrrgtI6/0=
 github.com/hstern/go-webdav v0.7.1-0.20260625191323-6c7cfde5c0a0/go.mod h1:/CletBm2Vo0CX6I20VQsoRkkX1CzzNCK1PNCqKW//iQ=
-github.com/hstern/krb5 v0.1.2-0.20260706001242-dc144bee7a4b h1:kKLITc3nVGDUlPHahLKe5F1sXHgSbAG81OooHA/2zYI=
-github.com/hstern/krb5 v0.1.2-0.20260706001242-dc144bee7a4b/go.mod h1:XAIUFbJWIU8GCI3Hf0gqk+sAx1i7KNclOqKL2wJr7rU=
+github.com/hstern/krb5 v0.1.2-0.20261120185541-51cea5a63518 h1:9+2Vfd1JQgTaQO3sOt+m252fFrVIvy6xfgfR52+N/4A=
+github.com/hstern/krb5 v0.1.2-0.20261120185541-51cea5a63518/go.mod h1:XAIUFbJWIU8GCI3Hf0gqk+sAx1i7KNclOqKL2wJr7rU=
 github.com/hstern/x v0.3.4 h1:gjBwZfgfzieeIJ+OzVshYHelznsJ90vtTr1ELH/aKZc=
 github.com/hstern/x v0.3.4/go.mod h1:FS8uVcjqbGUpoSXeWp6ha7jJ1umJ2R2cNHQlDxMhIMo=
 github.com/kr/pretty v0.3.1 h1:flRD4NNwYAUpkphVc1HcthR4KEIFJ65n8Mw5qdRn3LE=
