@@ -9,29 +9,29 @@
 //
 // Self-skips when docker is unavailable.
 //
-// # Stalwart v1.0 compatibility notes
+// # Stalwart v1.1.1 compatibility notes
 //
-// Several JMAP Calendars draft features are not yet fully implemented in
-// Stalwart v1.0:
+// The image is pinned to v1.1.1. Observed behaviour of that release:
 //
-//  1. recurrenceRules (plural array): CalendarEvent/set rejects the
-//     `recurrenceRules` property with "invalidProperties". Stalwart stores
-//     recurrence data internally but surfaces it via a non-standard singular
-//     `recurrenceRule` field, not the draft-specified array. The adapter
-//     follows the draft and sends `recurrenceRules`; creation of recurring
-//     events via JMAP fails. Workaround: seed recurring events via CalDAV PUT.
+//  1. CalendarEvent/query rejects the inCalendars filter with
+//     "unsupportedFilter", so ListEvents fails; the test logs this as an
+//     expected limitation (and notes if it starts succeeding).
 //
-//  2. WriteInstanceOverride on synthetic instance IDs: Stalwart returns
-//     "Updating synthetic ids is not yet supported." The WriteInstanceOverride
-//     step is exercised and the adapter's error path is asserted; the step is
-//     marked as an expected failure.
+//  2. recurrenceRules (plural array): seeding recurring events over JMAP is
+//     not relied on; the test seeds them via CalDAV PUT instead.
 //
-//  3. CalendarEvent/changes sinceState: Stalwart rejects an empty sinceState.
-//     The test obtains an initial state via CalendarEvent/get before mutations.
+//  3. CalendarEvent/get rejects recurrenceOverrides requested together with
+//     utcStart/utcEnd, so the adapter does not request utcStart/utcEnd.
 //
-// These are adapter-vs-server compatibility findings, not adapter bugs. The
-// adapter correctly implements the JMAP Calendars draft; Stalwart v1.0 has
-// partial draft coverage.
+//  4. JMAP Calendars rights: mayWriteAll implies mayWriteOwn, mayUpdatePrivate
+//     and mayRSVP, and sharing a calendar with its owner is rejected, so the
+//     sharing e2e uses a second account. Directory queries are off by default;
+//     the harness enables them via x:Sharing and a ReloadSettings action.
+//
+//  5. WriteInstanceOverride on synthetic instance IDs now succeeds; the test
+//     tolerates either outcome. CalendarEvent/changes rejects an empty
+//     sinceState, so the test fetches an initial state first.
+
 package jmap
 
 import (
@@ -52,7 +52,8 @@ import (
 // — Stalwart container constants -------------------------------------------
 
 const (
-	jmapStalwartImage = "stalwartlabs/stalwart:latest"
+	// Pinned deliberately: a floating `latest` broke this harness on the 1.0 upgrade.
+	jmapStalwartImage = "docker.io/stalwartlabs/stalwart:v1.1.1"
 	jmapStalwartCtr   = "mailbox-e2e-stalwart-jmap"
 	jmapStalwartAdmin = "admin"
 	jmapStalwartPass  = "adminpass"
@@ -63,6 +64,10 @@ const (
 	jmapStalwartUser   = "me"
 	jmapStalwartDomain = "example.com"
 	jmapStalwartUserPW = "Zx9-Kp2v-Qm7w-Lt4r"
+
+	// jmapStalwartShareeUser is a second account (same domain/password) used as the
+	// grantee in the calendar-sharing e2e.
+	jmapStalwartShareeUser = "sharee"
 
 	// jmapStalwartConfig is the entire on-disk configuration. In Stalwart v0.16+
 	// config.json contains only the datastore declaration; domains and accounts
@@ -126,17 +131,32 @@ func jmapStartStalwart(t *testing.T) (sessionURL, login, password, apiURL, root 
 		"@type": "User", "name": jmapStalwartUser, "domainId": domainID,
 		"credentials": map[string]any{"0": map[string]any{
 			"@type": "Password", "secret": jmapStalwartUserPW,
-			"otpAuth": nil, "expiresAt": nil, "allowedIps": map[string]any{},
+			"expiresAt": nil, "allowedIps": map[string]any{},
 		}},
-		"memberGroupIds": map[string]any{},
-		"roles":          map[string]any{"@type": "User"},
-		"permissions":    map[string]any{"@type": "Inherit"},
-		"quotas":         map[string]any{},
-		// The login address (name@domain) must be an explicit alias; without it
-		// the account has no email address and cannot authenticate.
-		"aliases":          map[string]any{"0": map[string]any{"enabled": true, "name": jmapStalwartUser, "domainId": domainID}},
+		// v1.x derives the login address (name@domain) itself; "aliases" and
+		// "credentials/otpAuth" are no longer accepted on create.
+		"memberGroupIds":   map[string]any{},
+		"roles":            map[string]any{"@type": "User"},
+		"permissions":      map[string]any{"@type": "Inherit"},
+		"quotas":           map[string]any{},
 		"encryptionAtRest": map[string]any{"@type": "Disabled"},
 	})
+
+	// Second account: v1.x rejects sharing a calendar with its own owner, so the
+	// sharing e2e needs a distinct sharee.
+	jmapStalwartCreate(t, root, "x:Account/set", "s", map[string]any{
+		"@type": "User", "name": jmapStalwartShareeUser, "domainId": domainID,
+		"credentials": map[string]any{"0": map[string]any{
+			"@type": "Password", "secret": jmapStalwartUserPW,
+			"expiresAt": nil, "allowedIps": map[string]any{},
+		}},
+	})
+
+	// v1.x ships with directory queries disabled, which makes Principal/query
+	// (used to resolve a sharee by email) fail with "forbidden". Enable them.
+	jmapStalwartUpdateSingleton(t, root, "x:Sharing/set", map[string]any{"allowDirectoryQueries": true})
+	// Settings are cached; the change only takes effect after a reload.
+	jmapStalwartCreate(t, root, "x:Action/set", "a", map[string]any{"@type": "ReloadSettings"})
 
 	login = jmapStalwartUser + "@" + jmapStalwartDomain
 	sessionURL = root + "/jmap/session"
@@ -165,6 +185,40 @@ func jmapWaitStalwart(t *testing.T, root string) {
 	}
 	logs, _ := exec.Command("docker", "logs", jmapStalwartCtr).CombinedOutput()
 	t.Fatalf("stalwart did not become ready in 60 s\n%s", logs)
+}
+
+// jmapStalwartUpdateSingleton patches a management singleton object (id
+// "singleton", e.g. x:Sharing) and fails the test if the server rejects it.
+func jmapStalwartUpdateSingleton(t *testing.T, root, method string, patch map[string]any) {
+	t.Helper()
+	body, _ := json.Marshal(map[string]any{
+		"using":       []string{"urn:ietf:params:jmap:core", "urn:stalwart:jmap"},
+		"methodCalls": []any{[]any{method, map[string]any{"update": map[string]any{"singleton": patch}}, "c1"}},
+	})
+	req, _ := http.NewRequest(http.MethodPost, root+"/jmap/", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.SetBasicAuth(jmapStalwartAdmin, jmapStalwartPass)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("%s: %v", method, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	raw, _ := io.ReadAll(resp.Body)
+	var out struct {
+		MethodResponses []json.RawMessage `json:"methodResponses"`
+	}
+	var call []json.RawMessage
+	var args struct {
+		Updated map[string]json.RawMessage `json:"updated"`
+	}
+	if json.Unmarshal(raw, &out) != nil || len(out.MethodResponses) == 0 ||
+		json.Unmarshal(out.MethodResponses[0], &call) != nil || len(call) < 2 ||
+		json.Unmarshal(call[1], &args) != nil {
+		t.Fatalf("%s: bad response: %s", method, raw)
+	}
+	if _, ok := args.Updated["singleton"]; !ok {
+		t.Fatalf("%s did not update singleton: %s", method, raw)
+	}
 }
 
 // jmapStalwartCreate issues a management JMAP <type>/set create call using the
@@ -521,7 +575,7 @@ func TestStalwartJMAP(t *testing.T) {
 	if listEventsErr == nil {
 		t.Logf("ListEvents succeeded (Stalwart may have gained inCalendars support)")
 	} else {
-		t.Logf("ListEvents returned expected error for Stalwart v1.0 (inCalendars unsupported): %v", listEventsErr)
+		t.Logf("ListEvents returned expected error for Stalwart v1.1.1 (inCalendars unsupported): %v", listEventsErr)
 	}
 
 	// — 6. GetEvent by opaque ID — round-trip subject and start ---------------

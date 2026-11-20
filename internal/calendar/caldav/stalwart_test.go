@@ -18,7 +18,8 @@ import (
 // iTIP/iMIP itself). It backs the native-scheduling gating e2e with a REAL
 // scheduler, unlike the Radicale+OPTIONS-proxy fake.
 const (
-	stalwartImage = "stalwartlabs/stalwart:latest"
+	// Pinned deliberately: a floating `latest` broke this harness on the 1.0 upgrade.
+	stalwartImage = "docker.io/stalwartlabs/stalwart:v1.1.1"
 	stalwartCtr   = "mailbox-e2e-stalwart"
 	stalwartAdmin = "admin"
 	stalwartPass  = "adminpass"
@@ -80,15 +81,14 @@ func startStalwart(t *testing.T) (base, login, pass string) {
 		"@type": "User", "name": stalwartUser, "domainId": domainID,
 		"credentials": map[string]any{"0": map[string]any{
 			"@type": "Password", "secret": stalwartUserPW,
-			"otpAuth": nil, "expiresAt": nil, "allowedIps": map[string]any{},
+			"expiresAt": nil, "allowedIps": map[string]any{},
 		}},
-		"memberGroupIds": map[string]any{},
-		"roles":          map[string]any{"@type": "User"},
-		"permissions":    map[string]any{"@type": "Inherit"},
-		"quotas":         map[string]any{},
-		// The login address (name@domain) is an explicit alias; without it the
-		// account has no email address and cannot authenticate.
-		"aliases":          map[string]any{"0": map[string]any{"enabled": true, "name": stalwartUser, "domainId": domainID}},
+		// v1.x derives the login address (name@domain) itself; "aliases" and
+		// "credentials/otpAuth" are no longer accepted on create.
+		"memberGroupIds":   map[string]any{},
+		"roles":            map[string]any{"@type": "User"},
+		"permissions":      map[string]any{"@type": "Inherit"},
+		"quotas":           map[string]any{},
 		"encryptionAtRest": map[string]any{"@type": "Disabled"},
 	})
 

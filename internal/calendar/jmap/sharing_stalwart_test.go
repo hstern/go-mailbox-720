@@ -1,9 +1,9 @@
 //go:build dockertest
 
 // Integration test for the JMAP calendar-sharing adapter (PermissionReader/Writer)
-// against a real Stalwart server. Shares the user's own calendar with their own
-// principal (Stalwart accepts a self-grant), which exercises the full RFC 9670 +
-// shareWith round-trip without provisioning a second account. Run with:
+// against a real Stalwart server. Shares the user's calendar with a second
+// provisioned account (Stalwart v1.x rejects a self-grant), which exercises the full RFC 9670 +
+// shareWith round-trip. Run with:
 //
 //	go test -tags dockertest ./internal/calendar/jmap/ -run TestStalwartCalendarSharing
 
@@ -39,8 +39,10 @@ func TestStalwartCalendarSharing(t *testing.T) {
 	}
 	calID := cals[0].ID
 
-	// Grant read access (to the user's own principal — a self-share Stalwart allows).
-	created, err := cl.CreateCalendarPermission(ctx, calID, calendar.Permission{Email: login, Role: calendar.RoleRead})
+	sharee := jmapStalwartShareeUser + "@" + jmapStalwartDomain
+
+	// Grant read access to the second account.
+	created, err := cl.CreateCalendarPermission(ctx, calID, calendar.Permission{Email: sharee, Role: calendar.RoleRead})
 	if err != nil {
 		t.Fatalf("CreateCalendarPermission: %v", err)
 	}
@@ -61,8 +63,8 @@ func TestStalwartCalendarSharing(t *testing.T) {
 	if found == nil {
 		t.Fatalf("granted permission not listed: %+v", perms)
 	}
-	if found.Email != login || found.Role != calendar.RoleRead {
-		t.Errorf("listed permission = %+v, want email=%s role=read", *found, login)
+	if found.Email != sharee || found.Role != calendar.RoleRead {
+		t.Errorf("listed permission = %+v, want email=%s role=read", *found, sharee)
 	}
 
 	// Promote to write, then revoke.
