@@ -68,6 +68,8 @@ func writeKeytab(t *testing.T, dir string) string {
 		// Dovecot's submission service derives its acceptor principal from the
 		// protocol name ("submission"), so seed that too.
 		"submission/" + mailHost,
+		// The CalDAV/CardDAV (Apache mod_auth_gssapi) acceptor's HTTP service key.
+		httpService + "/" + davHost,
 		"krbtgt/" + realm,
 	}
 	for _, pn := range principals {

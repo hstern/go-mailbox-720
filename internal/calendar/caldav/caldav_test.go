@@ -2,6 +2,7 @@ package caldav
 
 import (
 	"bytes"
+	"fmt"
 	"net/http"
 	"sort"
 	"strings"
@@ -48,7 +49,7 @@ func TestDialBearerAuth(t *testing.T) {
 func TestDialNegotiateAuth(t *testing.T) {
 	rec := &recordingHTTPClient{}
 	cl, err := Dial("http://dav.example/", "ignored-user", "ignored-pass",
-		&Options{HTTPClient: rec, NegotiateToken: "apreq-b64"})
+		&Options{HTTPClient: rec, NegotiateToken: func() (string, error) { return "apreq-b64", nil }})
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
@@ -61,11 +62,35 @@ func TestDialNegotiateAuth(t *testing.T) {
 	}
 }
 
+// Each request draws a fresh token from the source (MB720-59): a Kerberos
+// acceptor with a replay cache rejects a re-presented AP-REQ.
+func TestDialNegotiateFreshTokenPerRequest(t *testing.T) {
+	rec := &recordingHTTPClient{}
+	n := 0
+	cl, err := Dial("http://dav.example/", "", "", &Options{HTTPClient: rec,
+		NegotiateToken: func() (string, error) { n++; return fmt.Sprintf("apreq-%d", n), nil }})
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	var got []string
+	for range 2 {
+		req, _ := http.NewRequest("PROPFIND", "http://dav.example/", nil)
+		if _, err := cl.http.Do(req); err != nil {
+			t.Fatalf("Do: %v", err)
+		}
+		got = append(got, rec.auth)
+	}
+	if got[0] == got[1] {
+		t.Errorf("two requests carried the same Authorization %q; want distinct tokens", got[0])
+	}
+}
+
 // When both are set, BearerToken wins over NegotiateToken (documented precedence).
 func TestDialBearerBeatsNegotiate(t *testing.T) {
 	rec := &recordingHTTPClient{}
 	cl, err := Dial("http://dav.example/", "", "",
-		&Options{HTTPClient: rec, BearerToken: "b-tok", NegotiateToken: "n-tok"})
+		&Options{HTTPClient: rec, BearerToken: "b-tok",
+			NegotiateToken: func() (string, error) { return "n-tok", nil }})
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}

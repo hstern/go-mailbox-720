@@ -13,7 +13,6 @@ package main
 
 import (
 	"context"
-	"encoding/base64"
 	"errors"
 	"flag"
 	"fmt"
@@ -44,6 +43,7 @@ import (
 	"github.com/hstern/go-mailbox-720/internal/contacts"
 	"github.com/hstern/go-mailbox-720/internal/contacts/carddav"
 	jmapcontacts "github.com/hstern/go-mailbox-720/internal/contacts/jmap"
+	"github.com/hstern/go-mailbox-720/internal/davauth"
 	"github.com/hstern/go-mailbox-720/internal/kerbexchange"
 	"github.com/hstern/go-mailbox-720/internal/mail"
 	"github.com/hstern/go-mailbox-720/internal/mail/imap"
@@ -275,16 +275,21 @@ func main() {
 				return caldav.Dial(url, "", "", &caldav.Options{BearerToken: token})
 			})}
 	case *caldavURL != "" && kerbExchanger != nil && *caldavSPN != "":
-		// Per-identity via SPNEGO (MB720-47): mint a GSSAPI AP-REQ for the user and
-		// dial with Authorization: Negotiate. Caching, like the Bearer path above.
+		// Per-identity via SPNEGO (MB720-47/59): exchange for the user's ccache and
+		// dial with Authorization: Negotiate, minting a fresh token per HTTP request
+		// from it. Caching, like the Bearer path above.
 		url := *caldavURL
-		mint, err := kerberosNegotiateMint(kerbExchanger, *caldavSPN)
+		mint, target, err := kerberosCCacheMint(kerbExchanger, *caldavSPN)
 		if err != nil {
 			log.Fatalln("mailboxd: -cal-caldav-spn:", err)
 		}
 		calProvider = calendarIdentityProvider{proto: "CalDAV+SPNEGO", p: newPerIdentityKerberosBackend(mint,
-			func(_ subjectid.IssSubID, token string) (calendar.Backend, error) {
-				return caldav.Dial(url, "", "", &caldav.Options{NegotiateToken: token})
+			func(_ subjectid.IssSubID, cred *kerb.Credential) (calendar.Backend, error) {
+				src, err := davauth.KerberosTokenSource(cred, target)
+				if err != nil {
+					return nil, err
+				}
+				return caldav.Dial(url, "", "", &caldav.Options{NegotiateToken: src})
 			})}
 	case *caldavURL != "":
 		calProvider = staticCalDAVProvider{
@@ -319,16 +324,20 @@ func main() {
 				return carddav.Dial(url, "", "", &carddav.Options{BearerToken: token})
 			})}
 	case *carddavURL != "" && kerbExchanger != nil && *carddavSPN != "":
-		// Per-identity via SPNEGO (MB720-47), mirroring the CalDAV backend (Negotiate
-		// AP-REQ, caching).
+		// Per-identity via SPNEGO (MB720-47/59), mirroring the CalDAV backend (ccache,
+		// fresh Negotiate token per request, caching).
 		url := *carddavURL
-		mint, err := kerberosNegotiateMint(kerbExchanger, *carddavSPN)
+		mint, target, err := kerberosCCacheMint(kerbExchanger, *carddavSPN)
 		if err != nil {
 			log.Fatalln("mailboxd: -contacts-carddav-spn:", err)
 		}
 		contactsProvider = contactsIdentityProvider{proto: "CardDAV+SPNEGO", p: newPerIdentityKerberosBackend(mint,
-			func(_ subjectid.IssSubID, token string) (contacts.Backend, error) {
-				return carddav.Dial(url, "", "", &carddav.Options{NegotiateToken: token})
+			func(_ subjectid.IssSubID, cred *kerb.Credential) (contacts.Backend, error) {
+				src, err := davauth.KerberosTokenSource(cred, target)
+				if err != nil {
+					return nil, err
+				}
+				return carddav.Dial(url, "", "", &carddav.Options{NegotiateToken: src})
 			})}
 	case *carddavURL != "":
 		contactsProvider = staticCardDAVProvider{
@@ -1051,29 +1060,22 @@ func buildExchanger(endpoint, clientID, clientAuth, reqTokenType string) (tokene
 		tokenexchange.WithRequestedTokenType(rtt)), nil
 }
 
-// kerberosNegotiateMint returns a mint closure for a per-identity DAV backend
-// fronted by SPNEGO/Negotiate (MB720-47). The closure exchanges the authenticated
-// user's token for a GSSAPI AP-REQ targeting spn (OutputAPReq) and returns it
-// base64-encoded for an Authorization: Negotiate header, capped to the
-// credential's expiry so the backend cache re-mints in step. spn is parsed once
-// here — "HTTP/host" or "HTTP/host@REALM" — so a malformed principal fails at
-// startup rather than on the first request.
-func kerberosNegotiateMint(ex kerbexchange.Exchanger, spn string) (func(context.Context, string) (string, time.Time, error), error) {
+// kerberosCCacheMint returns a mint closure for a per-identity DAV backend
+// fronted by SPNEGO/Negotiate (MB720-47/59), plus the parsed target principal.
+// The closure exchanges the authenticated user's token for a Kerberos ccache
+// (OutputCCache) targeting spn; the exchanger caches it per identity until its
+// expiry. Callers build a davauth token source from it, which mints a NEW SPNEGO
+// token per HTTP request: one AP-REQ replayed across requests is rejected by an
+// acceptor with a replay cache. spn is parsed once here — "HTTP/host" or
+// "HTTP/host@REALM" — so a malformed principal fails at startup.
+func kerberosCCacheMint(ex kerbexchange.Exchanger, spn string) (func(context.Context, string) (*kerb.Credential, error), kerb.ServicePrincipal, error) {
 	target, err := kerb.ParseServicePrincipal(spn)
 	if err != nil {
-		return nil, fmt.Errorf("parse service principal %q: %w", spn, err)
+		return nil, kerb.ServicePrincipal{}, fmt.Errorf("parse service principal %q: %w", spn, err)
 	}
-	return func(ctx context.Context, raw string) (string, time.Time, error) {
-		cred, err := ex.Exchange(ctx, raw, target, kerb.OutputAPReq)
-		if err != nil {
-			return "", time.Time{}, err
-		}
-		apreq, err := cred.APReq()
-		if err != nil {
-			return "", time.Time{}, err
-		}
-		return base64.StdEncoding.EncodeToString(apreq), cred.Expiry(), nil
-	}, nil
+	return func(ctx context.Context, raw string) (*kerb.Credential, error) {
+		return ex.Exchange(ctx, raw, target, kerb.OutputCCache)
+	}, target, nil
 }
 
 // requestedTokenType validates the -tokenexchange-requested-token-type flag and

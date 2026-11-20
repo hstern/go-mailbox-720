@@ -49,24 +49,24 @@ const identityBackendSkew = 30 * time.Second
 //     handshake is amortized. See connPool.
 //
 // In every mode the token itself is cached by the exchanger, so a re-dial does not
-// re-hit the authorization server. The mint field generalizes the credential
+// re-hit the authorization server. The mintCred field generalizes the credential
 // source: the default is the RFC 8693 token exchanger, but a caller can supply a
-// mint closure to use the OAuth2→Kerberos exchange instead (MB720-46/47/48),
-// producing a GSSAPI credential for a Kerberos/GSSAPI-only backend.
+// mintCred closure to use the OAuth2→Kerberos exchange instead (MB720-47),
+// producing a Kerberos credential for a SPNEGO-only backend.
 type perIdentityBackend[B io.Closer] struct {
 	exchanger tokenexchange.Exchanger
 	audience  string
 	dial      func(id subjectid.IssSubID, token string) (B, error)
 
-	// mint, when non-nil, supersedes exchanger+audience: it produces the
-	// per-request credential secret and its expiry directly from the raw subject
-	// token. It is the seam for the second per-identity mechanism (MB720-46/47/48):
-	// the OAuth2→Kerberos path mints a base64 GSSAPI AP-REQ (for Authorization:
-	// Negotiate) where exchanger+audience mints an RFC 8693 access token (for
-	// Authorization: Bearer). The secret it returns is what dial receives; the
-	// expiry bounds the backend cache exactly as the exchanged token's does. When
-	// nil, get falls back to exchanger.Exchange(ctx, raw, audience).
-	mint func(ctx context.Context, raw string) (secret string, expiresAt time.Time, err error)
+	// mintCred and dialCred are the Kerberos DAV seam (MB720-47/59): mintCred
+	// exchanges the raw token for a Kerberos credential (a ccache, cached by the
+	// exchanger) and dialCred builds a backend that mints a fresh SPNEGO token per
+	// HTTP request from it. When mintCred is set it supersedes exchanger+audience,
+	// and dialCred supersedes dial. The credential, not a pre-minted token, is
+	// what a cached backend holds: a single AP-REQ cannot be replayed across
+	// requests against an acceptor with a replay cache.
+	mintCred func(ctx context.Context, raw string) (*kerb.Credential, error)
+	dialCred func(id subjectid.IssSubID, cred *kerb.Credential) (B, error)
 
 	// mailbox and rawToken read the authenticated identity and bearer token from
 	// the request context. They default to auth.Mailbox / auth.RawToken and are
@@ -116,15 +116,17 @@ func newPerIdentityBackend[B io.Closer](exchanger tokenexchange.Exchanger, audie
 
 // newPerIdentityKerberosBackend builds a CACHING per-identity provider whose
 // credential comes from the OAuth2→Kerberos exchange rather than RFC 8693 token
-// exchange (MB720-47 CalDAV/CardDAV over SPNEGO; MB720-48 JMAP). mint returns the
-// per-request credential secret (a base64 GSSAPI AP-REQ) and its expiry; the rest
-// of the machinery — the per-principal backend cache keyed to that expiry — is the
-// same as newPerIdentityBackend. Use it only for backends whose Close is a no-op
-// (stateless HTTP DAV/JMAP); see the type doc.
-func newPerIdentityKerberosBackend[B io.Closer](mint func(ctx context.Context, raw string) (string, time.Time, error), dial func(id subjectid.IssSubID, token string) (B, error)) *perIdentityBackend[B] {
+// exchange (MB720-47 CalDAV/CardDAV over SPNEGO). mintCred returns the exchanged
+// Kerberos credential (a ccache; the exchanger caches it per identity until its
+// expiry) and dial builds a backend from it — one that mints a NEW SPNEGO token
+// per HTTP request, so a replay-cache-enforcing acceptor accepts every request.
+// The per-principal backend cache is keyed to the credential's expiry as in
+// newPerIdentityBackend. Use it only for backends whose Close is a no-op
+// (stateless HTTP DAV); see the type doc.
+func newPerIdentityKerberosBackend[B io.Closer](mintCred func(ctx context.Context, raw string) (*kerb.Credential, error), dial func(id subjectid.IssSubID, cred *kerb.Credential) (B, error)) *perIdentityBackend[B] {
 	return &perIdentityBackend[B]{
-		mint:     mint,
-		dial:     dial,
+		mintCred: mintCred,
+		dialCred: dial,
 		mailbox:  auth.Mailbox,
 		rawToken: auth.RawToken,
 		skew:     identityBackendSkew,
@@ -197,19 +199,33 @@ func newPerIdentityPool[B io.Closer](exchanger tokenexchange.Exchanger, audience
 	}
 }
 
-// exchange mints the per-request credential for raw: via the mint closure when
-// set (the OAuth2→Kerberos path), else the RFC 8693 token exchanger. It returns
-// the secret handed to dial and the expiry that bounds the backend cache. Both
-// sources cache internally, so a re-dial does not re-hit the exchange service.
-func (p *perIdentityBackend[B]) exchange(ctx context.Context, raw string) (string, time.Time, error) {
-	if p.mint != nil {
-		return p.mint(ctx, raw)
+// acquire exchanges raw for a credential and dials a backend with it, returning
+// the backend and the expiry that bounds its cache entry. The Kerberos path
+// (mintCred) dials with the credential; the others with the exchanged access
+// token. Both exchangers cache internally, so a re-dial does not re-hit the
+// exchange service.
+func (p *perIdentityBackend[B]) acquire(ctx context.Context, id subjectid.IssSubID, raw string) (B, time.Time, error) {
+	var zero B
+	if p.mintCred != nil {
+		cred, err := p.mintCred(ctx, raw)
+		if err != nil {
+			return zero, time.Time{}, fmt.Errorf("per-identity backend: credential exchange: %w", err)
+		}
+		backend, err := p.dialCred(id, cred)
+		if err != nil {
+			return zero, time.Time{}, fmt.Errorf("per-identity backend: dial: %w", err)
+		}
+		return backend, cred.Expiry(), nil
 	}
 	tok, err := p.exchanger.Exchange(ctx, raw, p.audience)
 	if err != nil {
-		return "", time.Time{}, err
+		return zero, time.Time{}, fmt.Errorf("per-identity backend: credential exchange: %w", err)
 	}
-	return tok.AccessToken, tok.ExpiresAt, nil
+	backend, err := p.dial(id, tok.AccessToken)
+	if err != nil {
+		return zero, time.Time{}, fmt.Errorf("per-identity backend: dial: %w", err)
+	}
+	return backend, tok.ExpiresAt, nil
 }
 
 // get resolves the request's backend: a cached one for the principal when its
@@ -238,16 +254,7 @@ func (p *perIdentityBackend[B]) get(ctx context.Context) (B, error) {
 	// credential, so a miss does not re-hit the authorization server.
 	if p.pool != nil {
 		return p.pool.get(ctx, issSub, func() (B, time.Time, error) {
-			var zero B
-			secret, expiresAt, err := p.exchange(ctx, raw)
-			if err != nil {
-				return zero, time.Time{}, fmt.Errorf("per-identity backend: credential exchange: %w", err)
-			}
-			backend, err := p.dial(issSub, secret)
-			if err != nil {
-				return zero, time.Time{}, fmt.Errorf("per-identity backend: dial: %w", err)
-			}
-			return backend, expiresAt, nil
+			return p.acquire(ctx, issSub, raw)
 		})
 	}
 
@@ -262,13 +269,9 @@ func (p *perIdentityBackend[B]) get(ctx context.Context) (B, error) {
 
 	// Miss (or no-cache): exchange (the exchange caches the credential) and dial,
 	// outside the lock so a slow backend does not block cache reads for others.
-	secret, expiresAt, err := p.exchange(ctx, raw)
+	backend, expiresAt, err := p.acquire(ctx, issSub, raw)
 	if err != nil {
-		return zero, fmt.Errorf("per-identity backend: credential exchange: %w", err)
-	}
-	backend, err := p.dial(issSub, secret)
-	if err != nil {
-		return zero, fmt.Errorf("per-identity backend: dial: %w", err)
+		return zero, err
 	}
 	// Cache only when caching is enabled and the credential has a known expiry; a
 	// lifetime-less one cannot be invalidated on time, so re-dial each request.
