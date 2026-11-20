@@ -1,9 +1,11 @@
 package davauth
 
 import (
+	"context"
 	"encoding/base64"
 	"fmt"
 	"net/http"
+	"net/url"
 	"sync"
 
 	kerb "github.com/hstern/go-oauth2-kerberos-exchange"
@@ -26,12 +28,21 @@ type TokenSource func() (string, error)
 // mechanism (MB720-47): each request to a SPNEGO/Kerberos-fronted DAV backend
 // carries a GSSAPI credential minted for the authenticated user. The token is
 // presented bearer-style: only the initial token is sent and the server's
-// mutual-auth reply is not processed.
+// mutual-auth reply is not processed, so server authenticity rests on TLS; DAV
+// URLs should be https in production.
 //
 // When c is an *http.Client the token is minted in its Transport, i.e. once per
-// network round trip, so a followed redirect (net/http copies the Authorization
-// header across same-host redirects) gets its own token instead of replaying the
-// first. Any other webdav.HTTPClient is wrapped at Do, once per call.
+// network round trip, so a followed same-host redirect gets its own token rather
+// than replaying the first (a replay-cache acceptor would reject that). To keep
+// tokens from leaking, Do only sets a placeholder "Authorization: Negotiate"
+// header and records the request's origin (scheme and host); net/http's redirect
+// logic then decides whether the header survives (it strips it on a cross-domain
+// redirect), and the Transport mints a real token only when the placeholder is
+// still present AND the round trip targets the original origin. A redirect to
+// another host, or a scheme downgrade such as https to http, therefore carries no
+// Authorization header and no token is minted for it. Any other
+// webdav.HTTPClient is wrapped at Do, minting once per call; its own redirect
+// handling is outside this package's control.
 func NegotiateHTTPClient(c webdav.HTTPClient, src TokenSource) webdav.HTTPClient {
 	if c == nil {
 		c = http.DefaultClient
@@ -43,22 +54,18 @@ func NegotiateHTTPClient(c webdav.HTTPClient, src TokenSource) webdav.HTTPClient
 			rt = http.DefaultTransport
 		}
 		cp.Transport = &negotiateTransport{rt: rt, src: src}
-		return &cp
+		return &negotiateHTTPClient{c: &cp, src: src, perTrip: true}
 	}
 	return &negotiateHTTPClient{c: c, src: src}
 }
 
-// negotiateRequest returns a clone of req carrying a new Negotiate token.
-func negotiateRequest(req *http.Request, src TokenSource) (*http.Request, error) {
-	tok, err := src()
-	if err != nil {
-		return nil, fmt.Errorf("negotiate: mint token: %w", err)
-	}
-	// Clone so the caller's request is not mutated, as RoundTrip requires.
-	req = req.Clone(req.Context())
-	req.Header.Set("Authorization", "Negotiate "+tok)
-	return req, nil
-}
+// placeholderAuth marks a request whose Authorization the Transport should fill
+// with a fresh token. It is never sent to a server.
+const placeholderAuth = "Negotiate"
+
+type originKey struct{}
+
+func originOf(u *url.URL) string { return u.Scheme + "://" + u.Host }
 
 type negotiateTransport struct {
 	rt  http.RoundTripper
@@ -66,23 +73,40 @@ type negotiateTransport struct {
 }
 
 func (n *negotiateTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	req, err := negotiateRequest(req, n.src)
-	if err != nil {
-		return nil, err
+	if req.Header.Get("Authorization") == placeholderAuth {
+		origin, _ := req.Context().Value(originKey{}).(string)
+		req = req.Clone(req.Context()) // RoundTrip must not mutate its argument
+		if origin == originOf(req.URL) {
+			tok, err := n.src()
+			if err != nil {
+				return nil, fmt.Errorf("negotiate: mint token: %w", err)
+			}
+			req.Header.Set("Authorization", "Negotiate "+tok)
+		} else {
+			req.Header.Del("Authorization")
+		}
 	}
 	return n.rt.RoundTrip(req)
 }
 
 type negotiateHTTPClient struct {
-	c   webdav.HTTPClient
-	src TokenSource
+	c       webdav.HTTPClient
+	src     TokenSource
+	perTrip bool // the Transport mints; Do only sets the placeholder
 }
 
 func (n *negotiateHTTPClient) Do(req *http.Request) (*http.Response, error) {
-	req, err := negotiateRequest(req, n.src)
-	if err != nil {
-		return nil, err
+	if n.perTrip {
+		req = req.Clone(context.WithValue(req.Context(), originKey{}, originOf(req.URL)))
+		req.Header.Set("Authorization", placeholderAuth)
+		return n.c.Do(req)
 	}
+	tok, err := n.src()
+	if err != nil {
+		return nil, fmt.Errorf("negotiate: mint token: %w", err)
+	}
+	req = req.Clone(req.Context())
+	req.Header.Set("Authorization", "Negotiate "+tok)
 	return n.c.Do(req)
 }
 

@@ -158,7 +158,9 @@ func dumpDAVLogs(t *testing.T) {
 }
 
 // davRequest issues one request through client and returns the status and body.
-func davRequest(t *testing.T, c *http.Client, method, url, contentType, body string) (int, string) {
+func davRequest(t *testing.T, c interface {
+	Do(*http.Request) (*http.Response, error)
+}, method, url, contentType, body string) (int, string) {
 	t.Helper()
 	req, err := http.NewRequest(method, url, strings.NewReader(body))
 	if err != nil {
@@ -240,7 +242,7 @@ func TestDAVNegotiateMultipleRequests(t *testing.T) {
 	// Seed a calendar, an event, an address book and a contact through the same
 	// token source (each write is its own request, so its own token).
 	raw := &http.Client{Transport: nil}
-	hc := davauth.NegotiateHTTPClient(raw, src).(*http.Client)
+	hc := davauth.NegotiateHTTPClient(raw, src)
 	user := f.base + "/" + testSubject
 	for _, step := range []struct {
 		method, path, ctype, body string

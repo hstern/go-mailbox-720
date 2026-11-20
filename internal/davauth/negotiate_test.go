@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -128,5 +129,65 @@ func TestNegotiateHTTPClientFreshTokenAcrossRedirect(t *testing.T) {
 	_ = resp.Body.Close()
 	if fmt.Sprint(auths) != "[Negotiate tok-1 Negotiate tok-2]" {
 		t.Errorf("Authorization headers = %v, want two distinct tokens", auths)
+	}
+}
+
+// A redirect to a different host must not carry (or cause minting of) a token:
+// the Transport sits below net/http's header stripping, so it must not re-add one.
+func TestNegotiateHTTPClientNoTokenAcrossHosts(t *testing.T) {
+	var bAuth []string
+	b := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		bAuth = append(bAuth, r.Header.Get("Authorization"))
+	}))
+	t.Cleanup(b.Close)
+	// 127.0.0.1 vs localhost are different hosts to net/http's stripping rule.
+	bURL := strings.Replace(b.URL, "127.0.0.1", "localhost", 1)
+	a := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, bURL+"/other", http.StatusFound)
+	}))
+	t.Cleanup(a.Close)
+
+	n := 0
+	c := NegotiateHTTPClient(http.DefaultClient, func() (string, error) { n++; return "tok", nil })
+	req, _ := http.NewRequest("GET", a.URL+"/start", nil)
+	resp, err := c.Do(req)
+	if err != nil {
+		t.Fatalf("Do: %v", err)
+	}
+	_ = resp.Body.Close()
+	if len(bAuth) != 1 || bAuth[0] != "" {
+		t.Errorf("redirect target saw Authorization %q, want none", bAuth)
+	}
+	if n != 1 {
+		t.Errorf("token source called %d times, want 1 (only for the original host)", n)
+	}
+}
+
+// A same-host https -> http redirect (scheme downgrade) must not mint a token
+// either: net/http keeps Authorization across it, so the origin check is needed.
+func TestNegotiateHTTPClientNoTokenOnSchemeDowngrade(t *testing.T) {
+	var plainAuth []string
+	plain := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		plainAuth = append(plainAuth, r.Header.Get("Authorization"))
+	}))
+	t.Cleanup(plain.Close)
+	tls := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, plain.URL+"/down", http.StatusFound)
+	}))
+	t.Cleanup(tls.Close)
+	// Same host (127.0.0.1), different scheme and port.
+	n := 0
+	c := NegotiateHTTPClient(tls.Client(), func() (string, error) { n++; return "tok", nil })
+	req, _ := http.NewRequest("GET", tls.URL+"/start", nil)
+	resp, err := c.Do(req)
+	if err != nil {
+		t.Fatalf("Do: %v", err)
+	}
+	_ = resp.Body.Close()
+	if len(plainAuth) != 1 || plainAuth[0] != "" {
+		t.Errorf("plain-http target saw Authorization %q, want none", plainAuth)
+	}
+	if n != 1 {
+		t.Errorf("token source called %d times, want 1", n)
 	}
 }
