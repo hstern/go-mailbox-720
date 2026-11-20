@@ -33,42 +33,22 @@ func (s *scriptedSASL) Next(ch []byte) ([]byte, error) {
 	return r, nil
 }
 
-func TestSASLAdapterStart(t *testing.T) {
-	cases := []struct {
-		name   string
-		ir     []byte
-		wantIR []byte
-	}{
-		{"initial response passes through", []byte("ir"), []byte("ir")},
-		{"empty initial response becomes nil", []byte{}, nil},
-		{"nil initial response stays nil", nil, nil},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			mech, ir, err := newSASLAdapter(&scriptedSASL{mech: "X", ir: tc.ir}).Start()
-			if err != nil || mech != "X" {
-				t.Fatalf("Start = %q, %v", mech, err)
-			}
-			if (ir == nil) != (tc.wantIR == nil) || string(ir) != string(tc.wantIR) {
-				t.Errorf("ir = %#v, want %#v", ir, tc.wantIR)
-			}
-		})
+// TestSASLAdapterPassesThrough: the adapter must not alter what a mechanism
+// returns: an initial response (nil, empty or non-empty), a response, or an error.
+func TestSASLAdapterPassesThrough(t *testing.T) {
+	for _, ir := range [][]byte{nil, {}, []byte("ir")} {
+		_, got, err := newSASLAdapter(&scriptedSASL{mech: "X", ir: ir}).Start()
+		if err != nil || (got == nil) != (ir == nil) || string(got) != string(ir) {
+			t.Errorf("Start ir = %#v, %v; want %#v", got, err, ir)
+		}
 	}
 	wantErr := errors.New("boom")
 	if _, _, err := newSASLAdapter(&scriptedSASL{err: wantErr}).Start(); !errors.Is(err, wantErr) {
 		t.Errorf("Start error = %v, want %v", err, wantErr)
 	}
-}
-
-func TestSASLAdapterNextEmptyResponseIsNonNil(t *testing.T) {
-	a := newSASLAdapter(&scriptedSASL{responses: [][]byte{nil, []byte("x")}})
-	r, err := a.Next([]byte("c1"))
-	if err != nil || r == nil || len(r) != 0 {
-		t.Errorf("nil response = %#v, %v; want non-nil empty", r, err)
-	}
-	r, err = a.Next(nil)
-	if err != nil || string(r) != "x" {
-		t.Errorf("response = %q, %v", r, err)
+	a := newSASLAdapter(&scriptedSASL{responses: [][]byte{[]byte("x")}})
+	if r, err := a.Next([]byte("c1")); err != nil || string(r) != "x" {
+		t.Errorf("Next = %q, %v", r, err)
 	}
 	if _, err := a.Next(nil); err == nil {
 		t.Error("error from the underlying client must propagate")

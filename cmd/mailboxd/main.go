@@ -78,8 +78,8 @@ func main() {
 	imapTLS := flag.Bool("mail-imap-tls", true, "use implicit TLS for the IMAP connection")
 	mailIMAPAudience := flag.String("mail-imap-audience", "", "RFC 8693 audience to request for the IMAP mail backend (MB720-43). When set together with -tokenexchange-endpoint, IMAP authenticates per-identity via SASL OAUTHBEARER (the OAUTHBEARER username is the authenticated subject) instead of -mail-imap-username/MAILBOXD_IMAP_PASSWORD")
 	mailIMAPSPN := flag.String("mail-imap-spn", "", "Kerberos service principal (SPN, e.g. imap/mail.example.com@EXAMPLE.COM) for the IMAP mail backend (MB720-46). When set together with -kerbexchange-endpoint, IMAP authenticates per-identity via SASL GSSAPI with the user's own Kerberos ticket. Mutually exclusive with -mail-imap-audience")
-	sieveAddr := flag.String("mail-managesieve-addr", "", "ManageSieve server host:port (RFC 5804) for inbox rules on the IMAP tier (empty: mail-filter operations return 501; SASL PLAIN reuses the IMAP username and MAILBOXD_IMAP_PASSWORD)")
-	sieveTLS := flag.Bool("mail-managesieve-starttls", true, "use STARTTLS on the ManageSieve connection (RFC 5804 §2.2); disabling it sends the SASL PLAIN credentials in the clear — for local servers only")
+	sieveAddr := flag.String("mail-managesieve-addr", "", "ManageSieve server host:port (RFC 5804) for inbox rules on the IMAP tier (empty: mail-filter operations return 501; static IMAP: SASL PLAIN reusing the IMAP username and MAILBOXD_IMAP_PASSWORD; per-identity IMAP: SASL OAUTHBEARER or GSSAPI)")
+	sieveTLS := flag.Bool("mail-managesieve-starttls", true, "use STARTTLS on the ManageSieve connection (RFC 5804 §2.2); disabling it sends credentials unprotected (the PLAIN password, or on the per-identity paths the OAUTHBEARER token and the GSSAPI exchange) — for local servers only")
 	sieveSPN := flag.String("mail-managesieve-spn", "", "Kerberos service principal (SPN, e.g. sieve/mail.example.com@EXAMPLE.COM) of the ManageSieve server (MB720-60). Required with -mail-managesieve-addr when the IMAP backend authenticates per-identity via GSSAPI (-mail-imap-spn): ManageSieve then authenticates as the same user with SASL GSSAPI against this SPN. With -mail-imap-audience, ManageSieve uses SASL OAUTHBEARER with the same exchanged token and this flag is unused")
 	jmapSession := flag.String("mail-jmap-session-url", "", "JMAP session resource URL for the mail backend (empty: use IMAP, or return 501 if neither set; access token from MAILBOXD_JMAP_TOKEN). Takes precedence over the IMAP flags when set")
 	mailJMAPAudience := flag.String("mail-jmap-audience", "", "RFC 8693 audience to request for the JMAP mail backend (MB720-42). When set together with -tokenexchange-endpoint, the mail backend authenticates per-identity — exchanging the user's token for a backend-audience token preserving their sub — instead of using the shared MAILBOXD_JMAP_TOKEN")
@@ -188,10 +188,8 @@ func main() {
 			log.Fatalln("mailboxd: -mail-managesieve-spn:", err)
 		}
 	}
-	// Per-identity GSSAPI IMAP with ManageSieve needs the sieve SPN: without it the
-	// inbox rules would silently 501 (or, worse, fall back to a shared account).
-	if *sieveAddr != "" && *mailIMAPSPN != "" && *sieveSPN == "" {
-		log.Fatalln("mailboxd: -mail-managesieve-addr with per-identity GSSAPI IMAP (-mail-imap-spn) requires -mail-managesieve-spn")
+	if err := validateSieveFlags(*sieveAddr, *sieveSPN, *mailIMAPSPN); err != nil {
+		log.Fatalln("mailboxd:", err)
 	}
 	if *smtpSPN != "" {
 		if smtpSPNParsed, err = kerb.ParseServicePrincipal(*smtpSPN); err != nil {
@@ -1055,13 +1053,35 @@ func bearerIMAPOptions(tls bool, token, sieveAddr string, sieveTLS bool) *imap.O
 	return o
 }
 
+// validateSieveFlags rejects ManageSieve flag combinations that would otherwise
+// be silently ignored or fall back to the wrong credentials (MB720-60):
+//   - -mail-managesieve-spn without -mail-managesieve-addr: nothing to authenticate to;
+//   - -mail-managesieve-spn without -mail-imap-spn: the SPN is only used on the
+//     per-identity GSSAPI path (static IMAP uses PLAIN, -mail-imap-audience uses
+//     OAUTHBEARER);
+//   - per-identity GSSAPI IMAP with a ManageSieve address but no SPN: inbox rules
+//     could not authenticate.
+func validateSieveFlags(sieveAddr, sieveSPN, imapSPN string) error {
+	if sieveSPN != "" && sieveAddr == "" {
+		return fmt.Errorf("-mail-managesieve-spn requires -mail-managesieve-addr")
+	}
+	if sieveSPN != "" && imapSPN == "" {
+		return fmt.Errorf("-mail-managesieve-spn only applies with per-identity GSSAPI IMAP (-mail-imap-spn); static IMAP uses SASL PLAIN and -mail-imap-audience uses OAUTHBEARER")
+	}
+	if sieveAddr != "" && imapSPN != "" && sieveSPN == "" {
+		return fmt.Errorf("-mail-managesieve-addr with per-identity GSSAPI IMAP (-mail-imap-spn) requires -mail-managesieve-spn")
+	}
+	return nil
+}
+
 // sieveGSSAPIOptions builds the per-identity ManageSieve options for the GSSAPI
 // IMAP path (MB720-60). A SASL client is single-use and a ManageSieve connection
 // is separate from the IMAP one (and opened per operation), so the options carry a
 // factory that, per connection, exchanges the request's bearer token for a ccache
 // targeting the sieve SPN and builds a fresh GSSAPI client from it. The exchanger
-// caches the credential per identity until its expiry, as for the IMAP/SMTP SPNs,
-// so only the first rule operation after expiry hits the exchange service.
+// caches credentials per raw token and SPN until their expiry, as for the IMAP and
+// SMTP SPNs, so repeated rule operations with the same token do not re-hit the
+// exchange service.
 func sieveGSSAPIOptions(ex kerbexchange.Exchanger, rawToken func(context.Context) (string, bool), addr string, starttls bool, spn kerb.ServicePrincipal, authzID string) *imap.ManageSieveOptions {
 	return &imap.ManageSieveOptions{
 		Addr:     addr,
