@@ -1,46 +1,20 @@
 package imap
 
 import (
-	managesieve "github.com/hstern/go-managesieve"
-
 	"github.com/emersion/go-sasl"
+	managesieve "github.com/hstern/go-managesieve"
 )
 
-// saslAdapter drives an emersion/go-sasl client through go-managesieve's
-// AUTHENTICATE loop (MB720-60). The two interfaces are shaped alike (Start +
-// Next), so the adapter's job is the framing difference: go-managesieve sends an
-// initial response only when it is non-nil and encodes every SASL response as a
-// base64 quoted string (RFC 5804 §2.1), so an empty response goes out as "" —
-// which is exactly the empty continuation GSSAPI sends after the AP-REP (RFC 4752
-// §3.1). The adapter normalises an empty initial response to nil (no inline
-// response, the server then prompts with an empty challenge) and copies nil/empty
-// responses to a non-nil empty slice so they are always framed, never dropped.
-type saslAdapter struct{ c sasl.Client }
-
-var _ managesieve.SASLClient = saslAdapter{}
-
-// newSASLAdapter adapts a (single-use) emersion sasl.Client to a
-// managesieve.SASLClient.
-func newSASLAdapter(c sasl.Client) managesieve.SASLClient { return saslAdapter{c: c} }
-
-func (a saslAdapter) Start() (string, []byte, error) {
-	mech, ir, err := a.c.Start()
-	if err != nil {
-		return "", nil, err
-	}
-	if len(ir) == 0 {
-		ir = nil
-	}
-	return mech, ir, nil
-}
-
-func (a saslAdapter) Next(challenge []byte) ([]byte, error) {
-	resp, err := a.c.Next(challenge)
-	if err != nil {
-		return nil, err
-	}
-	if resp == nil {
-		resp = []byte{}
-	}
-	return resp, nil
-}
+// newSASLAdapter adapts an emersion/go-sasl client to go-managesieve's
+// AUTHENTICATE loop (MB720-60). The two interfaces are structurally identical
+// (Start + Next), and go-managesieve's framing already does what the mechanisms
+// need, so no translation is required:
+//   - an initial response is sent inline only when non-nil, so a mechanism's
+//     nil ("no initial response") is distinguished from an empty one, which goes
+//     out as "" (RFC 5804 §2.1; e.g. EXTERNAL with an empty authzid);
+//   - every Next response, nil or empty included, is base64-quoted, so the empty
+//     continuation GSSAPI sends after the AP-REP (RFC 4752 §3.1) is framed as "".
+//
+// The conversion exists to make that contract explicit and compile-checked; the
+// client is single-use, so callers build a fresh one per connection.
+func newSASLAdapter(c sasl.Client) managesieve.SASLClient { return c }

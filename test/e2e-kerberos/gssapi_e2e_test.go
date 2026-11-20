@@ -437,6 +437,14 @@ func TestDovecotGSSAPIManageSieve(t *testing.T) {
 	if err != nil || len(got) != 1 || got[0].DisplayName != "From boss" {
 		t.Fatalf("ListRules after create = %+v, %v", got, err)
 	}
+	renamed := created
+	renamed.DisplayName = "From the boss"
+	if _, err := cl.UpdateRule(ctx, created.ID, renamed); err != nil {
+		fail("UpdateRule", err)
+	}
+	if got, err = cl.ListRules(ctx); err != nil || len(got) != 1 || got[0].DisplayName != "From the boss" {
+		t.Fatalf("ListRules after update = %+v, %v", got, err)
+	}
 	if err := cl.DeleteRule(ctx, created.ID); err != nil {
 		fail("DeleteRule", err)
 	}
