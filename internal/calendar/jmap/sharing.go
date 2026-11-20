@@ -294,9 +294,11 @@ func roleToRights(role calendar.PermissionRole) *calendarRights {
 		r.MayReadFreeBusy, r.MayReadItems = true, true
 	case calendar.RoleRead:
 		r.MayReadFreeBusy, r.MayReadItems, r.MayRSVP = true, true, true
-	case calendar.RoleWrite, calendar.RoleDelegate:
-		r.MayReadFreeBusy, r.MayReadItems, r.MayWriteAll, r.MayWriteOwn, r.MayRSVP, r.MayDelete = true, true, true, true, true, true
-	case calendar.RoleDelegatePrivate:
+	case calendar.RoleWrite, calendar.RoleDelegate, calendar.RoleDelegatePrivate:
+		// JMAP Calendars: mayWriteAll implies mayWriteOwn, mayUpdatePrivate and
+		// mayRSVP, and Stalwart 1.x rejects a rights object that omits an implied
+		// flag. So write, delegate and delegate-with-private all share one rights
+		// set; JMAP cannot distinguish them.
 		r.MayReadFreeBusy, r.MayReadItems, r.MayWriteAll, r.MayWriteOwn, r.MayRSVP, r.MayDelete, r.MayUpdatePrivate = true, true, true, true, true, true, true
 	default:
 		// "custom" (an unspecified rights combination) and any unrecognized role grant
@@ -312,9 +314,9 @@ func rightsToRole(r *calendarRights) calendar.PermissionRole {
 	switch {
 	case r == nil:
 		return calendar.RoleNone
-	case r.MayWriteAll && r.MayUpdatePrivate:
-		return calendar.RoleDelegatePrivate
 	case r.MayWriteAll:
+		// mayUpdatePrivate is implied by mayWriteAll, so it cannot tell write from
+		// delegate/delegate-private; all read back as write.
 		return calendar.RoleWrite
 	case r.MayReadItems:
 		return calendar.RoleRead

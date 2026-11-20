@@ -169,16 +169,35 @@ func TestJMAPCreatePermissionUnknownPrincipal(t *testing.T) {
 func TestRoleRightsRoundTrip(t *testing.T) {
 	// Roles that map onto a distinct rights set and back to themselves.
 	for _, role := range []calendar.PermissionRole{
-		calendar.RoleNone, calendar.RoleFreeBusyRead, calendar.RoleRead,
-		calendar.RoleWrite, calendar.RoleDelegatePrivate,
+		calendar.RoleNone, calendar.RoleFreeBusyRead, calendar.RoleRead, calendar.RoleWrite,
 	} {
 		if got := rightsToRole(roleToRights(role)); got != role {
 			t.Errorf("role %q round-tripped to %q", role, got)
 		}
 	}
-	// Delegate-without-private collapses to write on read-back (write and delegate
-	// share the same rights bits); that lossiness is expected.
-	if got := rightsToRole(roleToRights(calendar.RoleDelegate)); got != calendar.RoleWrite {
-		t.Errorf("delegate read back as %q, want write (documented lossiness)", got)
+	// Delegate and delegate-private share write's rights (mayWriteAll implies
+	// mayUpdatePrivate in JMAP Calendars), so they read back as write.
+	for _, role := range []calendar.PermissionRole{calendar.RoleDelegate, calendar.RoleDelegatePrivate} {
+		if got := rightsToRole(roleToRights(role)); got != calendar.RoleWrite {
+			t.Errorf("%q read back as %q, want write (documented lossiness)", role, got)
+		}
+	}
+}
+
+// TestRoleToRightsImplications asserts every granted rights set honours the
+// JMAP Calendars rule that mayWriteAll implies mayWriteOwn, mayUpdatePrivate and
+// mayRSVP (enforced by Stalwart 1.x).
+func TestRoleToRightsImplications(t *testing.T) {
+	for _, role := range []calendar.PermissionRole{
+		calendar.RoleNone, calendar.RoleFreeBusyRead, calendar.RoleLimitedRead, calendar.RoleRead,
+		calendar.RoleWrite, calendar.RoleDelegate, calendar.RoleDelegatePrivate,
+	} {
+		r := roleToRights(role)
+		if r.MayWriteAll && !(r.MayWriteOwn && r.MayUpdatePrivate && r.MayRSVP) {
+			t.Errorf("role %q: mayWriteAll without implied flags: %+v", role, *r)
+		}
+	}
+	if r := roleToRights(calendar.RoleWrite); !r.MayUpdatePrivate {
+		t.Errorf("write must set mayUpdatePrivate: %+v", *r)
 	}
 }

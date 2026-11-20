@@ -104,7 +104,8 @@ func (cl *Client) FindEventByUID(ctx context.Context, calendarID, uid string) (c
 // getEvents fetches the CalendarEvents identified by ids and maps each one to a
 // calendar.Event via toCalendarEvent. It is reused by GetEvent, ListInstances,
 // and delta-sync (Tasks 7, 9, 12). The Properties list requests all fields that
-// toCalendarEvent needs, including the UTC-normalised instants utcStart/utcEnd.
+// toCalendarEvent needs. utcStart/utcEnd are deliberately not requested: they are
+// unused, and Stalwart 1.x rejects them alongside recurrenceOverrides.
 func (cl *Client) getEvents(ctx context.Context, ids []gojmap.ID) ([]calendar.Event, error) {
 	gArgs, err := cl.do(ctx, &eventGet{
 		Account: cl.accountID,
@@ -113,7 +114,6 @@ func (cl *Client) getEvents(ctx context.Context, ids []gojmap.ID) ([]calendar.Ev
 			"id", "uid", "calendarIds", "baseEventId",
 			"title", "description", "descriptionContentType",
 			"created", "start", "timeZone", "duration",
-			"utcStart", "utcEnd",
 			"showWithoutTime", "status", "sequence",
 			"locations", "participants",
 			"recurrenceRules", "recurrenceOverrides",
