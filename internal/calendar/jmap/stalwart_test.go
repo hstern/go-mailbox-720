@@ -52,7 +52,7 @@ import (
 // — Stalwart container constants -------------------------------------------
 
 const (
-	jmapStalwartImage = "stalwartlabs/stalwart:latest"
+	jmapStalwartImage = "stalwartlabs/stalwart:v0.16.27" // pinned: v1.x changed the x:Account/set admin schema the harness uses
 	jmapStalwartCtr   = "mailbox-e2e-stalwart-jmap"
 	jmapStalwartAdmin = "admin"
 	jmapStalwartPass  = "adminpass"

@@ -18,7 +18,7 @@ import (
 // iTIP/iMIP itself). It backs the native-scheduling gating e2e with a REAL
 // scheduler, unlike the Radicale+OPTIONS-proxy fake.
 const (
-	stalwartImage = "stalwartlabs/stalwart:latest"
+	stalwartImage = "stalwartlabs/stalwart:v0.16.27" // pinned: v1.x changed the x:Account/set admin schema the harness uses
 	stalwartCtr   = "mailbox-e2e-stalwart"
 	stalwartAdmin = "admin"
 	stalwartPass  = "adminpass"
