@@ -69,6 +69,13 @@ type ManageSieveOptions struct {
 	// STARTTLS upgrades the connection with STARTTLS (RFC 5804 §2.2) after connecting,
 	// the standard way ManageSieve secures port 4190.
 	STARTTLS bool
+	// SASL, when non-nil, supplies a per-connection SASL mechanism that replaces
+	// SASL PLAIN (MB720-60): the per-identity paths authenticate ManageSieve as the
+	// same user as IMAP. It is called once per ManageSieve connection with the
+	// operation's context, because a SASL client is single-use (GSSAPI in
+	// particular carries per-handshake state). When nil, a non-empty
+	// Options.BearerToken selects OAUTHBEARER; otherwise PLAIN is used.
+	SASL func(ctx context.Context) (sasl.Client, error)
 }
 
 // Client is an IMAP-backed mail.Backend over a single authenticated session.
@@ -143,7 +150,7 @@ func Dial(addr, username, password string, o *Options) (*Client, error) {
 		return nil, err
 	}
 	cl.c = c
-	cl.sieve = resolveManageSieve(o.ManageSieve, username, password)
+	cl.sieve = resolveManageSieve(o.ManageSieve, username, password, o.BearerToken)
 	// Enable QRESYNC when the server offers it, so it reports expunges as
 	// uid-based VANISHED responses that Delta turns into deletion tombstones.
 	// Best-effort: a server without QRESYNC still serves every other path (only
