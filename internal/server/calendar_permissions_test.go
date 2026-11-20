@@ -202,3 +202,82 @@ func TestCalendarPermissionsNotImplemented(t *testing.T) {
 		t.Errorf("delete err = %v, want ErrNotImplemented", err)
 	}
 }
+
+// roleNormalizingBackend mimics an adapter whose read-back role differs from the
+// requested one (as the JMAP tier's rights-to-role inference can), and refuses
+// limitedRead like the JMAP adapter.
+type roleNormalizingBackend struct{ permCalendarBackend }
+
+func (b *roleNormalizingBackend) norm(p calendar.Permission) (calendar.Permission, error) {
+	switch p.Role {
+	case calendar.RoleLimitedRead:
+		return p, fmt.Errorf("%w: %q", calendar.ErrRoleNotAllowed, p.Role)
+	case calendar.RoleDelegatePrivate:
+		p.Role = calendar.RoleWrite
+	}
+	return p, nil
+}
+
+func (b *roleNormalizingBackend) CreateCalendarPermission(ctx context.Context, cal string, p calendar.Permission) (calendar.Permission, error) {
+	p, err := b.norm(p)
+	if err != nil {
+		return calendar.Permission{}, err
+	}
+	return b.permCalendarBackend.CreateCalendarPermission(ctx, cal, p)
+}
+
+func (b *roleNormalizingBackend) UpdateCalendarPermission(ctx context.Context, cal, id string, p calendar.Permission) (calendar.Permission, error) {
+	p, err := b.norm(p)
+	if err != nil {
+		return calendar.Permission{}, err
+	}
+	return b.permCalendarBackend.UpdateCalendarPermission(ctx, cal, id, p)
+}
+
+func TestCalendarPermissionsRejectedRoleIs400(t *testing.T) {
+	h := permHandler(&roleNormalizingBackend{})
+	ctx := context.Background()
+	res, err := h.MeCalendarsCreateCalendarPermissions(ctx, grantReq("bob@example.com", api.MicrosoftGraphCalendarRoleTypeLimitedRead), api.MeCalendarsCreateCalendarPermissionsParams{CalendarID: "c"})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if e, ok := res.(*api.ErrorStatusCode); !ok || e.StatusCode != http.StatusBadRequest {
+		t.Errorf("create res = %#v, want 400", res)
+	}
+
+	if _, err := h.MeCalendarsCreateCalendarPermissions(ctx, grantReq("bob@example.com", api.MicrosoftGraphCalendarRoleTypeRead), api.MeCalendarsCreateCalendarPermissionsParams{CalendarID: "c"}); err != nil {
+		t.Fatal(err)
+	}
+	ures, err := h.MeCalendarsUpdateCalendarPermissions(ctx, grantReq("", api.MicrosoftGraphCalendarRoleTypeLimitedRead), api.MeCalendarsUpdateCalendarPermissionsParams{CalendarID: "c", CalendarPermissionID: "perm-1"})
+	if err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	if e, ok := ures.(*api.ErrorStatusCode); !ok || e.StatusCode != http.StatusBadRequest {
+		t.Errorf("update res = %#v, want 400", ures)
+	}
+}
+
+func TestCalendarPermissionsResponseRoleMatchesReadBack(t *testing.T) {
+	b := &roleNormalizingBackend{}
+	h := permHandler(b)
+	ctx := context.Background()
+	res, err := h.MeCalendarsCreateCalendarPermissions(ctx, grantReq("bob@example.com", api.MicrosoftGraphCalendarRoleTypeDelegateWithPrivateEventAccess), api.MeCalendarsCreateCalendarPermissionsParams{CalendarID: "c"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	created := res.(*api.MicrosoftGraphCalendarPermissionStatusCode).Response
+	got, _ := h.MeCalendarsGetCalendarPermissions(ctx, api.MeCalendarsGetCalendarPermissionsParams{CalendarID: "c", CalendarPermissionID: "perm-1"})
+	read := got.(*api.MicrosoftGraphCalendarPermissionStatusCode).Response
+	if created.Role != read.Role || created.Role.Value != api.MicrosoftGraphCalendarRoleTypeWrite {
+		t.Errorf("create role %v vs read-back %v, want both write", created.Role, read.Role)
+	}
+
+	ures, err := h.MeCalendarsUpdateCalendarPermissions(ctx, grantReq("", api.MicrosoftGraphCalendarRoleTypeDelegateWithPrivateEventAccess), api.MeCalendarsUpdateCalendarPermissionsParams{CalendarID: "c", CalendarPermissionID: "perm-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	updated := ures.(*api.MicrosoftGraphCalendarPermissionStatusCode).Response
+	if updated.Role.Value != api.MicrosoftGraphCalendarRoleTypeWrite {
+		t.Errorf("update role = %v, want write (read-back)", updated.Role)
+	}
+}

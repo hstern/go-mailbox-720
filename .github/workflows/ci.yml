@@ -221,6 +221,9 @@ jobs:
       - name: Native-scheduling gating e2e (Stalwart)
         run: go test -tags dockertest -timeout 300s -run "TestStalwart" ./internal/calendar/caldav/
 
+      - name: JMAP calendar adapter + sharing e2e (Stalwart)
+        run: go test -tags dockertest -timeout 300s -run "TestStalwart" ./internal/calendar/jmap/
+
   impersonation-jmap-mail-e2e:
     # Verifies per-identity JMAP mail impersonation: stands up Zitadel in Docker,
     # provisions the impersonator role + token-exchange grant, and asserts that

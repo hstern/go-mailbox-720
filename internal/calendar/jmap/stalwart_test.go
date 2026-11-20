@@ -254,6 +254,9 @@ func jmapStalwartCreate(t *testing.T, root, method, key string, obj map[string]a
 		} `json:"created"`
 		NotCreated json.RawMessage `json:"notCreated"`
 	}
+	if len(call) < 2 {
+		t.Fatalf("%s: malformed method response: %s", method, raw)
+	}
 	_ = json.Unmarshal(call[1], &args)
 	if c, ok := args.Created[key]; ok && c.ID != "" {
 		return c.ID
@@ -334,7 +337,7 @@ func jmapGetState(t *testing.T, apiURL, accountID, login, password string) strin
 
 // jmapGetEventByUID fetches all CalendarEvents (ids:null) from the account
 // and returns the first one whose uid field matches. This bypasses the JMAP
-// CalendarEvent/query inCalendars filter (unsupported in Stalwart v1.0) and
+// CalendarEvent/query inCalendars filter (unsupported in Stalwart v1.1.1) and
 // the FindEventByUID adapter path which also uses inCalendars.
 func jmapGetEventByUID(t *testing.T, apiURL, accountID, login, password, uid string) string {
 	t.Helper()
@@ -384,7 +387,7 @@ func jmapGetEventByUID(t *testing.T, apiURL, accountID, login, password, uid str
 }
 
 // jmapSeedRecurring PUTs a daily-recurring VEVENT into the Stalwart CalDAV
-// endpoint (user@domain/default/<name>.ics). Stalwart v1.0 rejects
+// endpoint (user@domain/default/<name>.ics). Stalwart v1.1.1 rejects
 // recurrenceRules via JMAP CalendarEvent/set (see compatibility note at top),
 // so the only reliable way to create a recurring series is via CalDAV PUT.
 func jmapSeedRecurring(t *testing.T, root, login, password, calDAVPath, uid, summary string) {
@@ -452,13 +455,13 @@ func jmapFreePort(t *testing.T) string {
 //     user JMAP sessions — see auth note above).
 //  2. ListCalendars — expect at least one default calendar.
 //  3. Seed a recurring event via CalDAV PUT (JMAP create with recurrenceRules
-//     is rejected by Stalwart v1.0 — see compatibility notes at top of file).
+//     is rejected by Stalwart v1.1.1 — see compatibility notes at top of file).
 //  4. CreateEvent (non-recurring) via JMAP — verify round-trip of subject/start.
 //  5. ListEvents (bounded range) — find the non-recurring event.
 //  6. GetEvent by opaque ID — assert subject and start.
 //  7. ListInstances (bounded range on the CalDAV-seeded series) — assert ≥ 2.
-//  8. WriteInstanceOverride — attempts the override; asserts that Stalwart v1.0
-//     returns an expected error ("Updating synthetic ids is not yet supported").
+//  8. WriteInstanceOverride — asserts the override succeeds on v1.1.1, then
+//     re-fetches the master via GetEvent and asserts it carries the override.
 //  9. Delta — captures baseline state before CreateEvent, then asserts the
 //     token advances after the create and the event appears in changed.
 //
@@ -503,7 +506,7 @@ func TestStalwartJMAP(t *testing.T) {
 	accountID := jmapPrimaryCalendarAccount(t, sessionURL, login, password)
 
 	// — 2. Seed recurring event via CalDAV PUT --------------------------------
-	// Stalwart v1.0 rejects recurrenceRules in CalendarEvent/set (uses a
+	// Stalwart v1.1.1 rejects recurrenceRules in CalendarEvent/set (uses a
 	// non-standard singular recurrenceRule field internally). We therefore PUT
 	// the recurring series via CalDAV so that ListInstances has something to expand.
 	const recurUID = "daily-standup-recur@jmap-e2e.test"
@@ -564,8 +567,8 @@ func TestStalwartJMAP(t *testing.T) {
 		t.Logf("re-fetched event ID: %s", masterID)
 	}
 
-	// — 5. ListEvents — note: unsupportedFilter in Stalwart v1.0 ----------------
-	// Stalwart v1.0 rejects the inCalendars filter in CalendarEvent/query with
+	// — 5. ListEvents — note: unsupportedFilter in Stalwart v1.1.1 ----------------
+	// Stalwart v1.1.1 rejects the inCalendars filter in CalendarEvent/query with
 	// "unsupportedFilter". The ListEvents adapter method always includes
 	// inCalendars, so it fails against Stalwart. We assert this failure and log
 	// it rather than failing the test — it is a known Stalwart limitation.
@@ -594,7 +597,7 @@ func TestStalwartJMAP(t *testing.T) {
 	// — 7. ListInstances — assert ≥ 2 occurrences -----------------------------
 	// Use the CalDAV-seeded recurring event. Locate its master JMAP ID via a
 	// direct CalendarEvent/get (ids:null) instead of FindEventByUID — the latter
-	// also uses inCalendars which Stalwart v1.0 rejects.
+	// also uses inCalendars which Stalwart v1.1.1 rejects.
 	recurMasterID := jmapGetEventByUID(t, apiURL, accountID, login, password, recurUID)
 	t.Logf("recurring master id from raw get: %s", recurMasterID)
 
@@ -616,32 +619,31 @@ func TestStalwartJMAP(t *testing.T) {
 	}
 	t.Logf("ListInstances returned %d instances", len(instances))
 
-	// — 8. WriteInstanceOverride — exercise and assert Stalwart v1.0 behavior -
-	// Stalwart v1.0 does not support updating synthetic instance IDs
-	// ("Updating synthetic ids is not yet supported."). The adapter surfaces
-	// this as a non-nil error; we assert it is returned and log it.
+	// — 8. WriteInstanceOverride — must succeed, and the master must carry it --
+	// Stalwart v1.1.1 supports updating synthetic instance ids. Re-fetching the
+	// master via GetEvent also exercises the adapter's property list (it must not
+	// request utcStart/utcEnd alongside recurrenceOverrides, which v1.1.1 rejects).
 	iw, ok := interface{}(cl).(calendar.InstanceWriter)
 	if !ok {
 		t.Fatal("*Client does not implement calendar.InstanceWriter")
 	}
 	firstInst := instances[0]
-	if firstInst.RecurrenceID != nil {
-		override := firstInst
-		override.Title = recurSummary + " (rescheduled)"
-		_, overrideErr := iw.WriteInstanceOverride(ctx, recurMasterID, override)
-		if overrideErr == nil {
-			// Stalwart v1.0 should have rejected this; if it succeeds in a future
-			// version, that's fine — log and continue.
-			t.Logf("WriteInstanceOverride succeeded (Stalwart may have gained support for synthetic id updates)")
-		} else {
-			// Expected: Stalwart v1.0 rejects "Updating synthetic ids is not yet supported."
-			t.Logf("WriteInstanceOverride returned expected error for Stalwart v1.0: %v", overrideErr)
-		}
-	} else {
-		// The instance has no RecurrenceID — ListInstances did not expose it.
-		// Log and skip the override step.
-		t.Logf("first instance RecurrenceID is zero; WriteInstanceOverride step skipped (Stalwart may not expose recurrenceId on instances)")
+	if firstInst.RecurrenceID == nil {
+		t.Fatalf("first instance has no RecurrenceID; cannot override: %+v", firstInst)
 	}
+	override := firstInst
+	override.Title = recurSummary + " (rescheduled)"
+	if _, err := iw.WriteInstanceOverride(ctx, recurMasterID, override); err != nil {
+		t.Fatalf("WriteInstanceOverride: %v", err)
+	}
+	master, err := cl.GetEvent(ctx, recurMasterID)
+	if err != nil {
+		t.Fatalf("GetEvent(master) after override: %v", err)
+	}
+	if len(master.RecurrenceOverrides) == 0 {
+		t.Fatalf("master carries no recurrenceOverrides after WriteInstanceOverride: %+v", master)
+	}
+	t.Logf("master carries %d recurrence override(s)", len(master.RecurrenceOverrides))
 
 	// — 9. Delta — confirm token advances after CreateEvent -------------------
 	changed, _, stateAfterCreate, err := dr.Delta(ctx, cal.ID, stateBeforeCreate)
@@ -654,18 +656,18 @@ func TestStalwartJMAP(t *testing.T) {
 	if stateAfterCreate == stateBeforeCreate {
 		t.Errorf("incremental Delta token did not advance: %q", stateAfterCreate)
 	}
-	// The created event and/or the CalDAV-seeded recurring event should appear
-	// in changed (filtered to this calendar).
+	// The event created after the baseline must appear in changed (matched by id,
+	// not by the pre-seeded recurring series, which would make this vacuous).
 	foundInDelta := false
 	for _, ev := range changed {
-		if ev.ID == masterID || ev.Title == eventSubject || ev.UID == recurUID {
+		if ev.ID == masterID {
 			foundInDelta = true
 			break
 		}
 	}
 	if !foundInDelta {
-		t.Errorf("incremental Delta did not report created event %q (id %s) or recurring event (uid %s): changed=%+v",
-			eventSubject, masterID, recurUID, changed)
+		t.Errorf("incremental Delta did not report created event %q (id %s): changed=%+v",
+			eventSubject, masterID, changed)
 	}
 	t.Logf("incremental Delta returned %d changed events, new state %s", len(changed), stateAfterCreate)
 
@@ -673,7 +675,7 @@ func TestStalwartJMAP(t *testing.T) {
 	if err := w.DeleteEvent(ctx, masterID); err != nil {
 		t.Fatalf("DeleteEvent: %v", err)
 	}
-	// ListEvents uses inCalendars (unsupported in Stalwart v1.0), so we assert
+	// ListEvents uses inCalendars (unsupported in Stalwart v1.1.1), so we assert
 	// deletion via GetEvent instead: it should return a not-found error or an
 	// empty event after the delete (JMAP GetEvent on an unknown id returns an
 	// empty list, which our adapter maps to an error).

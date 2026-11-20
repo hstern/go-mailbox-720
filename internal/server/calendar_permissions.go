@@ -88,8 +88,13 @@ func (h Handler) MeCalendarsCreateCalendarPermissions(ctx context.Context, req *
 	if p.Email == "" {
 		return badRequest("calendarPermission requires emailAddress.address"), nil
 	}
+	// The response carries the grant as the backend returns it (the role as it
+	// would be read back), not the requested role.
 	created, err := pw.CreateCalendarPermission(ctx, params.CalendarID, p)
 	if err != nil {
+		if errors.Is(err, calendar.ErrRoleNotAllowed) {
+			return badRequest(err.Error()), nil
+		}
 		return nil, fmt.Errorf("create calendar permission: %w", err)
 	}
 	return &api.MicrosoftGraphCalendarPermissionStatusCode{
@@ -125,6 +130,9 @@ func (h Handler) MeCalendarsUpdateCalendarPermissions(ctx context.Context, req *
 	if err != nil {
 		if errors.Is(err, calendar.ErrPermissionNotFound) {
 			return notFound("calendar permission not found"), nil
+		}
+		if errors.Is(err, calendar.ErrRoleNotAllowed) {
+			return badRequest(err.Error()), nil
 		}
 		return nil, fmt.Errorf("update calendar permission: %w", err)
 	}

@@ -147,6 +147,9 @@ func stalwartCreate(t *testing.T, root, method, key string, obj map[string]any) 
 		} `json:"created"`
 		NotCreated json.RawMessage `json:"notCreated"`
 	}
+	if len(call) < 2 {
+		t.Fatalf("%s: malformed method response: %s", method, raw)
+	}
 	_ = json.Unmarshal(call[1], &args)
 	if c, ok := args.Created[key]; ok && c.ID != "" {
 		return c.ID

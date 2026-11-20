@@ -422,3 +422,9 @@ type PermissionWriter interface {
 // ErrPermissionNotFound is returned by PermissionReader/PermissionWriter when no
 // sharing grant has the requested id.
 var ErrPermissionNotFound = errors.New("calendar: permission not found")
+
+// ErrRoleNotAllowed is returned by a PermissionWriter when the requested role is not
+// one the backend can enforce and read back exactly (Graph's allowedRoles); the HTTP
+// layer maps it to 400, as Graph does for a role outside allowedRoles. It is wrapped
+// with the offending role.
+var ErrRoleNotAllowed = errors.New("calendar: role not allowed")

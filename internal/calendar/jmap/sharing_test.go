@@ -166,38 +166,118 @@ func TestJMAPCreatePermissionUnknownPrincipal(t *testing.T) {
 	}
 }
 
-func TestRoleRightsRoundTrip(t *testing.T) {
-	// Roles that map onto a distinct rights set and back to themselves.
-	for _, role := range []calendar.PermissionRole{
-		calendar.RoleNone, calendar.RoleFreeBusyRead, calendar.RoleRead, calendar.RoleWrite,
-	} {
-		if got := rightsToRole(roleToRights(role)); got != role {
-			t.Errorf("role %q round-tripped to %q", role, got)
+func TestRoleRightsTable(t *testing.T) {
+	cases := []struct {
+		role    calendar.PermissionRole
+		allowed bool
+	}{
+		{calendar.RoleNone, true}, {calendar.RoleFreeBusyRead, true}, {calendar.RoleRead, true}, {calendar.RoleWrite, true},
+		{calendar.RoleLimitedRead, false}, {calendar.RoleDelegate, false}, {calendar.RoleDelegatePrivate, false}, {calendar.RoleCustom, false},
+	}
+	for _, c := range cases {
+		r, err := rightsForRole(c.role)
+		if c.allowed {
+			if err != nil {
+				t.Errorf("%q: unexpected error %v", c.role, err)
+				continue
+			}
+			if got := rightsToRole(r); got != c.role {
+				t.Errorf("%q round-tripped to %q", c.role, got)
+			}
+			if r.MayShare || r.MayDelete {
+				t.Errorf("%q must not grant mayShare/mayDelete: %+v", c.role, *r)
+			}
+			if r.MayWriteAll && !(r.MayWriteOwn && r.MayUpdatePrivate && r.MayRSVP) {
+				t.Errorf("%q: mayWriteAll without implied flags: %+v", c.role, *r)
+			}
+		} else if !errors.Is(err, calendar.ErrRoleNotAllowed) {
+			t.Errorf("%q: err = %v, want ErrRoleNotAllowed", c.role, err)
 		}
 	}
-	// Delegate and delegate-private share write's rights (mayWriteAll implies
-	// mayUpdatePrivate in JMAP Calendars), so they read back as write.
-	for _, role := range []calendar.PermissionRole{calendar.RoleDelegate, calendar.RoleDelegatePrivate} {
-		if got := rightsToRole(roleToRights(role)); got != calendar.RoleWrite {
-			t.Errorf("%q read back as %q, want write (documented lossiness)", role, got)
+	w := roleToRights(calendar.RoleWrite)
+	want := calendarRights{MayReadFreeBusy: true, MayReadItems: true, MayWriteAll: true, MayWriteOwn: true, MayUpdatePrivate: true, MayRSVP: true}
+	if *w != want {
+		t.Errorf("write rights = %+v, want %+v", *w, want)
+	}
+}
+
+func TestRightsToRoleExternalGrants(t *testing.T) {
+	cases := []struct {
+		r    *calendarRights
+		want calendar.PermissionRole
+	}{
+		{nil, calendar.RoleNone},
+		{&calendarRights{}, calendar.RoleNone},
+		{&calendarRights{MayReadFreeBusy: true}, calendar.RoleFreeBusyRead},
+		{&calendarRights{MayReadFreeBusy: true, MayReadItems: true, MayRSVP: true}, calendar.RoleRead},
+		{&calendarRights{MayReadItems: true, MayWriteAll: true, MayDelete: true, MayShare: true}, calendar.RoleWrite},
+	}
+	for _, c := range cases {
+		if got := rightsToRole(c.r); got != c.want {
+			t.Errorf("rightsToRole(%+v) = %q, want %q", c.r, got, c.want)
 		}
 	}
 }
 
-// TestRoleToRightsImplications asserts every granted rights set honours the
-// JMAP Calendars rule that mayWriteAll implies mayWriteOwn, mayUpdatePrivate and
-// mayRSVP (enforced by Stalwart 1.x).
-func TestRoleToRightsImplications(t *testing.T) {
-	for _, role := range []calendar.PermissionRole{
-		calendar.RoleNone, calendar.RoleFreeBusyRead, calendar.RoleLimitedRead, calendar.RoleRead,
-		calendar.RoleWrite, calendar.RoleDelegate, calendar.RoleDelegatePrivate,
-	} {
-		r := roleToRights(role)
-		if r.MayWriteAll && !(r.MayWriteOwn && r.MayUpdatePrivate && r.MayRSVP) {
-			t.Errorf("role %q: mayWriteAll without implied flags: %+v", role, *r)
+func TestJMAPSharingRefusesUnsupportedRoles(t *testing.T) {
+	f := &shareFake{share: map[string]*calendarRights{"bob": {MayReadFreeBusy: true}}, principals: map[string]jmapPrincipal{
+		"bob@example.com": {ID: "bob", Name: "Bob", Email: "bob@example.com"},
+	}}
+	cl := newShareClient(t, f)
+	ctx := context.Background()
+	for _, role := range []calendar.PermissionRole{calendar.RoleLimitedRead, calendar.RoleDelegate, calendar.RoleDelegatePrivate, calendar.RoleCustom} {
+		if _, err := cl.CreateCalendarPermission(ctx, "cal-1", calendar.Permission{Email: "bob@example.com", Role: role}); !errors.Is(err, calendar.ErrRoleNotAllowed) {
+			t.Errorf("create %q: err = %v, want ErrRoleNotAllowed", role, err)
+		}
+		if _, err := cl.UpdateCalendarPermission(ctx, "cal-1", "bob", calendar.Permission{Role: role}); !errors.Is(err, calendar.ErrRoleNotAllowed) {
+			t.Errorf("update %q: err = %v, want ErrRoleNotAllowed", role, err)
 		}
 	}
-	if r := roleToRights(calendar.RoleWrite); !r.MayUpdatePrivate {
-		t.Errorf("write must set mayUpdatePrivate: %+v", *r)
+	if got := f.share["bob"]; got == nil || *got != (calendarRights{MayReadFreeBusy: true}) {
+		t.Errorf("refused roles mutated the backend: %+v", got)
+	}
+}
+
+func TestJMAPSharingAllowedRolesAndReadBack(t *testing.T) {
+	f := &shareFake{share: map[string]*calendarRights{}, principals: map[string]jmapPrincipal{
+		"bob@example.com": {ID: "bob", Name: "Bob", Email: "bob@example.com"},
+	}}
+	cl := newShareClient(t, f)
+	ctx := context.Background()
+	created, err := cl.CreateCalendarPermission(ctx, "cal-1", calendar.Permission{Email: "bob@example.com", Role: calendar.RoleWrite})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if created.Role != calendar.RoleWrite || len(created.AllowedRoles) != 4 {
+		t.Errorf("created = %+v", created)
+	}
+	if f.share["bob"].MayDelete || f.share["bob"].MayShare {
+		t.Errorf("write grant carries mayDelete/mayShare: %+v", *f.share["bob"])
+	}
+	perms, _ := cl.ListCalendarPermissions(ctx, "cal-1")
+	if len(perms) != 1 || len(perms[0].AllowedRoles) != 4 || perms[0].Role != calendar.RoleWrite {
+		t.Errorf("listed = %+v", perms)
+	}
+	updated, err := cl.UpdateCalendarPermission(ctx, "cal-1", "bob", calendar.Permission{Role: calendar.RoleRead})
+	if err != nil || updated.Role != calendar.RoleRead || len(updated.AllowedRoles) != 4 {
+		t.Errorf("updated = %+v, %v", updated, err)
+	}
+}
+
+func TestSetShareNormalizesExistingEntries(t *testing.T) {
+	// An entry made outside the gateway violates the mayWriteAll implication; the
+	// write-back must repair it so the server does not reject the whole map.
+	f := &shareFake{share: map[string]*calendarRights{
+		"eve": {MayReadFreeBusy: true, MayReadItems: true, MayWriteAll: true},
+	}, principals: map[string]jmapPrincipal{
+		"bob@example.com": {ID: "bob", Name: "Bob", Email: "bob@example.com"},
+	}}
+	cl := newShareClient(t, f)
+	if _, err := cl.CreateCalendarPermission(context.Background(), "cal-1", calendar.Permission{Email: "bob@example.com", Role: calendar.RoleRead}); err != nil {
+		t.Fatal(err)
+	}
+	e := f.share["eve"]
+	if e == nil || !(e.MayWriteOwn && e.MayUpdatePrivate && e.MayRSVP) {
+		t.Errorf("existing entry not normalised: %+v", e)
 	}
 }

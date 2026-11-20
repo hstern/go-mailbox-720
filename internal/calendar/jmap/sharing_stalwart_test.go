@@ -11,8 +11,11 @@ package jmap
 
 import (
 	"context"
+	"errors"
 	"os/exec"
 	"testing"
+
+	gojmap "git.sr.ht/~rockorager/go-jmap"
 
 	"github.com/hstern/go-mailbox-720/internal/calendar"
 )
@@ -67,12 +70,31 @@ func TestStalwartCalendarSharing(t *testing.T) {
 		t.Errorf("listed permission = %+v, want email=%s role=read", *found, sharee)
 	}
 
-	// Promote to write, then revoke.
+	if len(created.AllowedRoles) == 0 || len(found.AllowedRoles) == 0 {
+		t.Errorf("AllowedRoles not populated: created=%v listed=%v", created.AllowedRoles, found.AllowedRoles)
+	}
+
+	// Roles the JMAP tier cannot enforce are refused, not downgraded.
+	for _, role := range []calendar.PermissionRole{calendar.RoleDelegatePrivate, calendar.RoleLimitedRead} {
+		if _, err := cl.UpdateCalendarPermission(ctx, calID, created.ID, calendar.Permission{Role: role}); !errors.Is(err, calendar.ErrRoleNotAllowed) {
+			t.Errorf("update to %q: err = %v, want ErrRoleNotAllowed", role, err)
+		}
+	}
+
+	// Promote to write: it must read back as write without mayDelete (which in
+	// JMAP Calendars deletes the calendar itself).
 	if _, err := cl.UpdateCalendarPermission(ctx, calID, created.ID, calendar.Permission{Role: calendar.RoleWrite}); err != nil {
 		t.Fatalf("UpdateCalendarPermission: %v", err)
 	}
 	if got, err := cl.GetCalendarPermission(ctx, calID, created.ID); err != nil || got.Role != calendar.RoleWrite {
 		t.Errorf("after update: %+v, %v; want role=write", got, err)
+	}
+	cal, err := cl.getShared(ctx, calID)
+	if err != nil {
+		t.Fatalf("getShared: %v", err)
+	}
+	if r := cal.ShareWith[gojmap.ID(created.ID)]; r == nil || !r.MayWriteAll || r.MayDelete || r.MayShare {
+		t.Errorf("stored write rights = %+v, want mayWriteAll without mayDelete/mayShare", r)
 	}
 	if err := cl.DeleteCalendarPermission(ctx, calID, created.ID); err != nil {
 		t.Fatalf("DeleteCalendarPermission: %v", err)

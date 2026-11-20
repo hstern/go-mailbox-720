@@ -132,7 +132,7 @@ func (cl *Client) ListCalendarPermissions(ctx context.Context, calendarID string
 	slices.Sort(ids) // deterministic order
 	out := make([]calendar.Permission, 0, len(ids))
 	for _, pid := range ids {
-		p := calendar.Permission{ID: string(pid), Role: rightsToRole(cal.ShareWith[pid]), IsRemovable: true}
+		p := calendar.Permission{ID: string(pid), Role: rightsToRole(cal.ShareWith[pid]), AllowedRoles: allowedRoles(), IsRemovable: true}
 		if pr, err := cl.getPrincipal(ctx, pid); err == nil && pr != nil {
 			p.Email, p.Name = pr.Email, pr.Name
 		}
@@ -158,24 +158,36 @@ func (cl *Client) GetCalendarPermission(ctx context.Context, calendarID, permiss
 // CreateCalendarPermission resolves the grantee email to a principal, then adds it
 // to the calendar's shareWith with the rights for the requested role.
 func (cl *Client) CreateCalendarPermission(ctx context.Context, calendarID string, p calendar.Permission) (calendar.Permission, error) {
+	rights, err := rightsForRole(p.Role)
+	if err != nil {
+		return calendar.Permission{}, err
+	}
 	pid, err := cl.resolvePrincipal(ctx, p.Email)
 	if err != nil {
 		return calendar.Permission{}, err
 	}
-	if err := cl.setShare(ctx, calendarID, pid, roleToRights(p.Role), false); err != nil {
+	if err := cl.setShare(ctx, calendarID, pid, rights, false); err != nil {
 		return calendar.Permission{}, err
 	}
 	p.ID = string(pid)
+	p.Role = rightsToRole(rights)
+	p.AllowedRoles = allowedRoles()
 	p.IsRemovable = true
 	return p, nil
 }
 
 // UpdateCalendarPermission changes the rights of an existing grant (id = principal id).
 func (cl *Client) UpdateCalendarPermission(ctx context.Context, calendarID, permissionID string, p calendar.Permission) (calendar.Permission, error) {
-	if err := cl.setShare(ctx, calendarID, gojmap.ID(permissionID), roleToRights(p.Role), true); err != nil {
+	rights, err := rightsForRole(p.Role)
+	if err != nil {
+		return calendar.Permission{}, err
+	}
+	if err := cl.setShare(ctx, calendarID, gojmap.ID(permissionID), rights, true); err != nil {
 		return calendar.Permission{}, err
 	}
 	p.ID = permissionID
+	p.Role = rightsToRole(rights)
+	p.AllowedRoles = allowedRoles()
 	p.IsRemovable = true
 	return p, nil
 }
@@ -255,6 +267,12 @@ func (cl *Client) setShare(ctx context.Context, calendarID string, pid gojmap.ID
 	if share == nil {
 		share = map[gojmap.ID]*calendarRights{}
 	}
+	// Calendar/set replaces shareWith wholesale and Stalwart 1.x validates every
+	// entry, so one stored entry violating the mayWriteAll implication (e.g. made
+	// directly in Stalwart) would make every sharing change on the calendar fail.
+	for _, r := range share {
+		normalizeRights(r)
+	}
 	if _, ok := share[pid]; requireExisting && !ok {
 		return calendar.ErrPermissionNotFound
 	}
@@ -280,43 +298,61 @@ func (cl *Client) setShare(ctx context.Context, calendarID string, pid gojmap.ID
 	return nil
 }
 
-// roleToRights maps a Graph calendarRoleType onto the JMAP per-principal rights. The
-// mapping is necessarily lossy (Graph's seven roles vs eight independent flags); it
-// is the canonical grant for each role.
+// supportedRoles are the Graph roles the JMAP tier can enforce and read back
+// exactly. JMAP cannot express delegate semantics (meeting-request routing),
+// private-event hiding, or limitedRead (mayReadItems is all-or-nothing), so those
+// roles, and custom, are refused with calendar.ErrRoleNotAllowed rather than
+// silently downgraded.
+var supportedRoles = []calendar.PermissionRole{
+	calendar.RoleNone, calendar.RoleFreeBusyRead, calendar.RoleRead, calendar.RoleWrite,
+}
+
+// allowedRoles returns a fresh copy of supportedRoles for Permission.AllowedRoles.
+func allowedRoles() []calendar.PermissionRole {
+	return slices.Clone(supportedRoles)
+}
+
+// rightsForRole validates role and returns its JMAP rights, or ErrRoleNotAllowed.
+func rightsForRole(role calendar.PermissionRole) (*calendarRights, error) {
+	if !slices.Contains(supportedRoles, role) {
+		return nil, fmt.Errorf("%w: %q (this calendar backend supports %v)", calendar.ErrRoleNotAllowed, role, supportedRoles)
+	}
+	return roleToRights(role), nil
+}
+
+// normalizeRights fills in the flags the JMAP Calendars spec implies: mayWriteAll
+// implies mayWriteOwn, mayUpdatePrivate and mayRSVP.
+func normalizeRights(r *calendarRights) {
+	if r != nil && r.MayWriteAll {
+		r.MayWriteOwn, r.MayUpdatePrivate, r.MayRSVP = true, true, true
+	}
+}
+
+// roleToRights maps a supported Graph role onto JMAP per-principal rights. Write
+// deliberately omits mayDelete (which in JMAP Calendars deletes the calendar
+// itself, not events) and mayShare. Unsupported roles yield no rights; callers
+// validate with rightsForRole first.
 func roleToRights(role calendar.PermissionRole) *calendarRights {
 	r := &calendarRights{}
 	switch role {
-	case calendar.RoleNone:
-		// all false
 	case calendar.RoleFreeBusyRead:
 		r.MayReadFreeBusy = true
-	case calendar.RoleLimitedRead:
-		r.MayReadFreeBusy, r.MayReadItems = true, true
 	case calendar.RoleRead:
-		r.MayReadFreeBusy, r.MayReadItems, r.MayRSVP = true, true, true
-	case calendar.RoleWrite, calendar.RoleDelegate, calendar.RoleDelegatePrivate:
-		// JMAP Calendars: mayWriteAll implies mayWriteOwn, mayUpdatePrivate and
-		// mayRSVP, and Stalwart 1.x rejects a rights object that omits an implied
-		// flag. So write, delegate and delegate-with-private all share one rights
-		// set; JMAP cannot distinguish them.
-		r.MayReadFreeBusy, r.MayReadItems, r.MayWriteAll, r.MayWriteOwn, r.MayRSVP, r.MayDelete, r.MayUpdatePrivate = true, true, true, true, true, true, true
-	default:
-		// "custom" (an unspecified rights combination) and any unrecognized role grant
-		// only read — never silently escalate an unknown role to write.
 		r.MayReadFreeBusy, r.MayReadItems = true, true
+	case calendar.RoleWrite:
+		r.MayReadFreeBusy, r.MayReadItems, r.MayWriteAll, r.MayWriteOwn, r.MayUpdatePrivate, r.MayRSVP = true, true, true, true, true, true
 	}
 	return r
 }
 
-// rightsToRole infers the closest Graph calendarRoleType from a JMAP rights object —
-// the inverse of roleToRights, used when reading shareWith back.
+// rightsToRole infers the role from a JMAP rights object, including grants made
+// outside the gateway: mayWriteAll is write, else mayReadItems is read, else
+// mayReadFreeBusy is freeBusyRead, else none.
 func rightsToRole(r *calendarRights) calendar.PermissionRole {
 	switch {
 	case r == nil:
 		return calendar.RoleNone
 	case r.MayWriteAll:
-		// mayUpdatePrivate is implied by mayWriteAll, so it cannot tell write from
-		// delegate/delegate-private; all read back as write.
 		return calendar.RoleWrite
 	case r.MayReadItems:
 		return calendar.RoleRead
