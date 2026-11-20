@@ -161,7 +161,26 @@ jobs:
           cache: true
 
       - name: Per-identity SASL GSSAPI e2e (real Dovecot)
-        run: go test -tags dockertest -timeout 300s ./test/e2e-kerberos/
+        run: go test -tags dockertest -timeout 300s -run TestDovecot ./test/e2e-kerberos/
+
+  kerberos-dav-e2e:
+    # Exercises the per-identity CalDAV/CardDAV SPNEGO path (MB720-47, MB720-59)
+    # against a REAL replay-cache-enforcing acceptor: Apache httpd + mod_auth_gssapi
+    # (keytab-based, default replay cache) fronting Radicale. Several requests per
+    # identity must all succeed, which requires a fresh Negotiate token per HTTP
+    # request; a control test proves the acceptor 401s a replayed AP-REQ. kerbexchanged
+    # and Apache share one service keytab; no KDC. The test builds the Apache+Radicale
+    # image from a Debian base (apt), so it needs network access on the runner.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Per-identity CalDAV/CardDAV SPNEGO e2e (Apache mod_auth_gssapi + Radicale)
+        run: go test -tags dockertest -timeout 900s -v -run TestDAV ./test/e2e-kerberos/
 
   mail-imap-e2e:
     # Runs the IMAP adapter against a real Dovecot server in Docker (build tag

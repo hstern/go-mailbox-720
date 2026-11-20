@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	kerb "github.com/hstern/go-oauth2-kerberos-exchange"
 	subjectid "github.com/hstern/go-subjectid"
 
 	"github.com/hstern/go-mailbox-720/internal/smtp"
@@ -348,21 +349,26 @@ func TestSchedulingIdentityMailboxAddress(t *testing.T) {
 	})
 }
 
-// newPerIdentityKerberosBackend mints via the closure (not the RFC 8693
-// exchanger), hands the minted secret to dial, and caches per principal to the
-// minted expiry — the MB720-47 CalDAV/CardDAV SPNEGO path.
+// newPerIdentityKerberosBackend exchanges via the mintCred closure (not the
+// RFC 8693 exchanger), hands the credential to dial, and caches per principal to
+// the credential's expiry — the MB720-47 CalDAV/CardDAV SPNEGO path.
 func TestPerIdentityKerberosMintsAndDials(t *testing.T) {
 	base := time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC)
 	now := base
 	var mintCalls int
 	var gotRaw []string
-	mint := func(_ context.Context, raw string) (string, time.Time, error) {
+	cred := kerb.NewCredential("alice", kerb.ServicePrincipal{Service: "HTTP", Host: "dav.example.com", Realm: "EXAMPLE.COM"}, base.Add(time.Hour), []byte("ccache"), nil)
+	mint := func(_ context.Context, raw string) (*kerb.Credential, error) {
 		mintCalls++
 		gotRaw = append(gotRaw, raw)
-		return "negotiate-apreq", base.Add(time.Hour), nil
+		return cred, nil
 	}
-	dr := &dialRecorder{}
-	p := newPerIdentityKerberosBackend[*fakeBackend](mint, dr.dial)
+	var dialed []*kerb.Credential
+	dial := func(_ subjectid.IssSubID, c *kerb.Credential) (*fakeBackend, error) {
+		dialed = append(dialed, c)
+		return &fakeBackend{id: len(dialed)}, nil
+	}
+	p := newPerIdentityKerberosBackend[*fakeBackend](mint, dial)
 	configure(p, testID("alice"), true, testRaw, true, func() time.Time { return now })
 
 	first, err := p.get(context.Background())
@@ -372,8 +378,8 @@ func TestPerIdentityKerberosMintsAndDials(t *testing.T) {
 	if len(gotRaw) != 1 || gotRaw[0] != testRaw {
 		t.Errorf("mint raw = %v, want [%s]", gotRaw, testRaw)
 	}
-	if len(dr.tokens) != 1 || dr.tokens[0] != "negotiate-apreq" {
-		t.Errorf("dial secret = %v, want [negotiate-apreq]", dr.tokens)
+	if len(dialed) != 1 || dialed[0] != cred {
+		t.Errorf("dial credential = %v, want the minted one", dialed)
 	}
 
 	now = base.Add(30 * time.Minute) // well within the hour
@@ -384,22 +390,26 @@ func TestPerIdentityKerberosMintsAndDials(t *testing.T) {
 	if first != second {
 		t.Error("cache miss: got a different backend within the credential lifetime")
 	}
-	if mintCalls != 1 || dr.callCount() != 1 {
-		t.Errorf("mint=%d dial=%d, want 1 each (cache hit)", mintCalls, dr.callCount())
+	if mintCalls != 1 || len(dialed) != 1 {
+		t.Errorf("mint=%d dial=%d, want 1 each (cache hit: no exchange per request)", mintCalls, len(dialed))
 	}
 }
 
 func TestPerIdentityKerberosMintError(t *testing.T) {
 	sentinel := errors.New("mint boom")
-	mint := func(context.Context, string) (string, time.Time, error) { return "", time.Time{}, sentinel }
-	dr := &dialRecorder{}
-	p := newPerIdentityKerberosBackend[*fakeBackend](mint, dr.dial)
+	mint := func(context.Context, string) (*kerb.Credential, error) { return nil, sentinel }
+	dialed := false
+	dial := func(subjectid.IssSubID, *kerb.Credential) (*fakeBackend, error) {
+		dialed = true
+		return &fakeBackend{}, nil
+	}
+	p := newPerIdentityKerberosBackend[*fakeBackend](mint, dial)
 	configure(p, testID("alice"), true, testRaw, true, nil)
 
 	if _, err := p.get(context.Background()); !errors.Is(err, sentinel) {
 		t.Errorf("error = %v, want it to wrap %v", err, sentinel)
 	}
-	if dr.callCount() != 0 {
+	if dialed {
 		t.Error("dial must not run when mint fails")
 	}
 }

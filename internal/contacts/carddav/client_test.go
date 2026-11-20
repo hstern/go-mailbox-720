@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/emersion/go-vcard"
@@ -145,24 +146,42 @@ func newTestClientWithBackend(t *testing.T, b *memBackend) *Client {
 // Dial with Options.NegotiateToken authenticates every backend request with
 // Authorization: Negotiate, not Basic — the second per-identity path (MB720-47).
 func TestDialNegotiateAuth(t *testing.T) {
-	var gotAuth string
+	var mu sync.Mutex
+	var auths []string
 	h := &gocarddav.Handler{Backend: newMemBackend(t)}
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotAuth = r.Header.Get("Authorization")
+		mu.Lock()
+		auths = append(auths, r.Header.Get("Authorization"))
+		mu.Unlock()
 		h.ServeHTTP(w, r)
 	}))
 	t.Cleanup(ts.Close)
 
+	var n int
 	cl, err := Dial(ts.URL+"/.well-known/carddav", "ignored-user", "ignored-pass",
-		&Options{NegotiateToken: "apreq-b64"})
+		&Options{NegotiateToken: func() (string, error) { n++; return fmt.Sprintf("apreq-%d", n), nil }})
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
 	if _, err := cl.ListAddressBooks(context.Background()); err != nil {
 		t.Fatalf("ListAddressBooks: %v", err)
 	}
-	if gotAuth != "Negotiate apreq-b64" {
-		t.Errorf("Authorization = %q, want %q (Negotiate, not Basic)", gotAuth, "Negotiate apreq-b64")
+	// Discovery issues several requests; every one must carry Negotiate (not
+	// Basic) and a token not seen before (MB720-59: no AP-REQ replay).
+	mu.Lock()
+	defer mu.Unlock()
+	if len(auths) < 2 {
+		t.Fatalf("saw %d requests, want >= 2", len(auths))
+	}
+	seen := map[string]bool{}
+	for _, a := range auths {
+		if !strings.HasPrefix(a, "Negotiate apreq-") {
+			t.Errorf("Authorization = %q, want a Negotiate token (not Basic)", a)
+		}
+		if seen[a] {
+			t.Errorf("Authorization %q repeated across requests", a)
+		}
+		seen[a] = true
 	}
 }
 
