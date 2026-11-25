@@ -28,6 +28,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/emersion/go-sasl"
 	kerb "github.com/hstern/go-oauth2-kerberos-exchange"
 	saslgssapi "github.com/hstern/go-sasl-gssapi"
 	"github.com/hstern/krb5/credentials"
@@ -35,11 +36,15 @@ import (
 	"github.com/hstern/krb5/keytab"
 
 	"github.com/hstern/go-mailbox-720/internal/kerbexchange"
+	"github.com/hstern/go-mailbox-720/internal/mail"
 	"github.com/hstern/go-mailbox-720/internal/mail/imap"
 	"github.com/hstern/go-mailbox-720/internal/smtp"
 )
 
-const submissionService = "submission"
+const (
+	submissionService = "submission"
+	sieveService      = "sieve"
+)
 
 const (
 	realm       = "EXAMPLE.COM"
@@ -68,6 +73,8 @@ func writeKeytab(t *testing.T, dir string) string {
 		// Dovecot's submission service derives its acceptor principal from the
 		// protocol name ("submission"), so seed that too.
 		"submission/" + mailHost,
+		// ManageSieve (Pigeonhole) acceptor, MB720-60.
+		sieveService + "/" + mailHost,
 		// The CalDAV/CardDAV (Apache mod_auth_gssapi) acceptor's HTTP service key.
 		httpService + "/" + davHost,
 		"krbtgt/" + realm,
@@ -89,7 +96,7 @@ func writeKeytab(t *testing.T, dir string) string {
 	return path
 }
 
-const dovecotConf = `protocols = imap submission
+const dovecotConf = `protocols = imap submission sieve
 ssl = no
 disable_plaintext_auth = no
 log_path = /dev/stderr
@@ -111,6 +118,14 @@ service imap-login {
   inet_listener imap {
     port = 143
   }
+}
+service managesieve-login {
+  inet_listener sieve {
+    port = 4190
+  }
+}
+plugin {
+  sieve = file:/srv/mail/%u/sieve;active=/srv/mail/%u/.dovecot.sieve
 }
 service submission-login {
   inet_listener submission {
@@ -139,10 +154,11 @@ const krb5Conf = `[libdefaults]
 `
 
 // startDovecotGSSAPI writes the config + keytab into dir, starts a Dovecot
-// container serving GSSAPI-authenticated IMAP (143) and submission/SMTP (587),
-// waits for IMAP to listen, and returns the two host:port addresses. The
+// container serving GSSAPI-authenticated IMAP (143), submission/SMTP (587) and
+// ManageSieve (4190), waits for IMAP to listen, and returns the three host:port
+// addresses. The
 // container is removed on cleanup.
-func startDovecotGSSAPI(t *testing.T, dir, keytabPath string) (imapAddr, smtpAddr string) {
+func startDovecotGSSAPI(t *testing.T, dir, keytabPath string) (imapAddr, smtpAddr, sieveAddr string) {
 	t.Helper()
 	confPath := filepath.Join(dir, "dovecot.conf")
 	if err := os.WriteFile(confPath, []byte(dovecotConf), 0o644); err != nil {
@@ -153,7 +169,7 @@ func startDovecotGSSAPI(t *testing.T, dir, keytabPath string) (imapAddr, smtpAdd
 		t.Fatalf("write krb5.conf: %v", err)
 	}
 
-	imapPort, smtpPort := freePort(t), freePort(t)
+	imapPort, smtpPort, sievePort := freePort(t), freePort(t), freePort(t)
 	_ = exec.Command("docker", "rm", "-f", dovecotCtr).Run()
 	out, err := exec.Command("docker", "run", "-d", "--name", dovecotCtr,
 		"--hostname", mailHost,
@@ -162,6 +178,7 @@ func startDovecotGSSAPI(t *testing.T, dir, keytabPath string) (imapAddr, smtpAdd
 		"-v", krbPath+":/etc/krb5.conf:ro",
 		"-p", "127.0.0.1:"+imapPort+":143",
 		"-p", "127.0.0.1:"+smtpPort+":587",
+		"-p", "127.0.0.1:"+sievePort+":4190",
 		dovecotImage).CombinedOutput()
 	if err != nil {
 		t.Fatalf("docker run dovecot: %v\n%s", err, out)
@@ -170,8 +187,9 @@ func startDovecotGSSAPI(t *testing.T, dir, keytabPath string) (imapAddr, smtpAdd
 
 	imapAddr = "127.0.0.1:" + imapPort
 	smtpAddr = "127.0.0.1:" + smtpPort
+	sieveAddr = "127.0.0.1:" + sievePort
 	waitForIMAP(t, imapAddr)
-	return imapAddr, smtpAddr
+	return imapAddr, smtpAddr, sieveAddr
 }
 
 // waitForIMAP blocks until the IMAP greeting is served or the deadline passes.
@@ -224,7 +242,7 @@ func TestDovecotGSSAPICapability(t *testing.T) {
 	dockerAvailable(t)
 	dir := t.TempDir()
 	kt := writeKeytab(t, dir)
-	addr, _ := startDovecotGSSAPI(t, dir, kt)
+	addr, _, _ := startDovecotGSSAPI(t, dir, kt)
 
 	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
 	if err != nil {
@@ -288,7 +306,7 @@ func TestDovecotGSSAPIAuth(t *testing.T) {
 	kt := writeKeytab(t, dir)
 	issuer := newJWKSIssuer(t)
 	endpoint := startKerbexchanged(t, kt, issuer.jwksURL)
-	addr, _ := startDovecotGSSAPI(t, dir, kt)
+	addr, _, _ := startDovecotGSSAPI(t, dir, kt)
 
 	userJWT := issuer.mint(t, testSubject, time.Now().Add(10*time.Minute))
 	spn := kerb.ServicePrincipal{Service: imapService, Host: mailHost, Realm: realm}
@@ -327,7 +345,7 @@ func TestDovecotGSSAPISMTPAuth(t *testing.T) {
 	kt := writeKeytab(t, dir)
 	issuer := newJWKSIssuer(t)
 	endpoint := startKerbexchanged(t, kt, issuer.jwksURL)
-	_, smtpAddr := startDovecotGSSAPI(t, dir, kt)
+	_, smtpAddr, _ := startDovecotGSSAPI(t, dir, kt)
 
 	userJWT := issuer.mint(t, testSubject, time.Now().Add(10*time.Minute))
 	spn := kerb.ServicePrincipal{Service: submissionService, Host: mailHost, Realm: realm}
@@ -346,4 +364,94 @@ func TestDovecotGSSAPISMTPAuth(t *testing.T) {
 		t.Fatalf("smtp.Dial with GSSAPI against real Dovecot submission: %v", err)
 	}
 	_ = cl.Close()
+}
+
+// TestDovecotGSSAPIManageSieve exercises per-identity ManageSieve (MB720-60)
+// against Dovecot's real Pigeonhole ManageSieve service: IMAP authenticates with
+// one GSSAPI credential (imap SPN) while ManageSieve authenticates, per connection,
+// with a fresh GSSAPI client built from a second credential minted for the sieve
+// SPN. Create/list/update/delete of a messageRule then round-trips a real Sieve
+// script over the adapter, including the empty-continuation GSSAPI framing.
+func TestDovecotGSSAPIManageSieve(t *testing.T) {
+	dockerAvailable(t)
+	dir := t.TempDir()
+	kt := writeKeytab(t, dir)
+	issuer := newJWKSIssuer(t)
+	endpoint := startKerbexchanged(t, kt, issuer.jwksURL)
+	imapAddr, _, sieveAddr := startDovecotGSSAPI(t, dir, kt)
+
+	userJWT := issuer.mint(t, testSubject, time.Now().Add(10*time.Minute))
+	ex := kerbexchange.New(endpoint, nil)
+	ctx := context.Background()
+	imapSPN := kerb.ServicePrincipal{Service: imapService, Host: mailHost, Realm: realm}
+	sieveSPN := kerb.ServicePrincipal{Service: sieveService, Host: mailHost, Realm: realm}
+	imapCred, err := ex.Exchange(ctx, userJWT, imapSPN, kerb.OutputCCache)
+	if err != nil {
+		t.Fatalf("kerbexchange (imap): %v", err)
+	}
+
+	var sieveClients int
+	cl, err := imap.Dial(imapAddr, testSubject, "", &imap.Options{
+		TLS:          false,
+		GSSAPIClient: gssapiClientFor(t, imapCred, imapSPN, testSubject),
+		ManageSieve: &imap.ManageSieveOptions{
+			Addr: sieveAddr, STARTTLS: false,
+			// A fresh GSSAPI client per ManageSieve connection, as cmd/mailboxd does.
+			SASL: func(ctx context.Context) (sasl.Client, error) {
+				cred, err := ex.Exchange(ctx, userJWT, sieveSPN, kerb.OutputCCache)
+				if err != nil {
+					return nil, err
+				}
+				sieveClients++
+				return gssapiClientFor(t, cred, sieveSPN, testSubject), nil
+			},
+		},
+	})
+	if err != nil {
+		dumpDovecotLogs(t)
+		t.Fatalf("imap.Dial: %v", err)
+	}
+	defer func() { _ = cl.Close() }()
+
+	fail := func(what string, err error) {
+		t.Helper()
+		dumpDovecotLogs(t)
+		t.Fatalf("%s over GSSAPI ManageSieve: %v", what, err)
+	}
+	rules, err := cl.ListRules(ctx)
+	if err != nil {
+		fail("ListRules", err)
+	}
+	if len(rules) != 0 {
+		t.Fatalf("fresh mailbox has rules: %+v", rules)
+	}
+	created, err := cl.CreateRule(ctx, mail.MessageRule{
+		DisplayName: "From boss", Enabled: true,
+		Conditions: mail.RuleConditions{SubjectContains: []string{"urgent"}},
+		Actions:    mail.RuleActions{MoveToFolder: "Priority", MarkAsRead: true},
+	})
+	if err != nil {
+		fail("CreateRule", err)
+	}
+	got, err := cl.ListRules(ctx)
+	if err != nil || len(got) != 1 || got[0].DisplayName != "From boss" {
+		t.Fatalf("ListRules after create = %+v, %v", got, err)
+	}
+	renamed := created
+	renamed.DisplayName = "From the boss"
+	if _, err := cl.UpdateRule(ctx, created.ID, renamed); err != nil {
+		fail("UpdateRule", err)
+	}
+	if got, err = cl.ListRules(ctx); err != nil || len(got) != 1 || got[0].DisplayName != "From the boss" {
+		t.Fatalf("ListRules after update = %+v, %v", got, err)
+	}
+	if err := cl.DeleteRule(ctx, created.ID); err != nil {
+		fail("DeleteRule", err)
+	}
+	if got, err = cl.ListRules(ctx); err != nil || len(got) != 0 {
+		t.Fatalf("ListRules after delete = %+v, %v", got, err)
+	}
+	if sieveClients < 5 {
+		t.Errorf("only %d GSSAPI clients built; every ManageSieve operation must build its own", sieveClients)
+	}
 }
